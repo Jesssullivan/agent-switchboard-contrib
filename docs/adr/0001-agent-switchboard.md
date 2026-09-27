@@ -402,3 +402,20 @@ Estate rulings this design depends on:
   Hygiene, ratified 2026-09-03). SWB-R15 permits comments only.
 - **GloriousFlywheel runners only** (lab `AGENTS.md`, 2026-09-06), and no
   hosted runners (site.scaffold `docs/CI-SCHEMA.md` §5).
+
+## History
+
+- **Unsigned root commit on `main`.**
+  - `main`'s root commit is `89bfa39e0177128358a5a3931746382164471ac5`,
+    "chore: initialize main". It was made through the GitHub contents API on
+    2026-09-25, per SWB-R22, before the ruleset that requires signed
+    commits existed. It was needed because a local pre-push hook refuses
+    creating `main` directly.
+  - GitHub reports it `unsigned`, because contents-API commits made with a
+    personal token are not signed by GitHub.
+  - Every commit after it is signed: the scaffold commit `2cff51d`, its
+    GitHub-signed merge `2a11acb`, and every later commit, which the ruleset
+    enforces.
+  - **SWB-R24** (operator interview 2026-09-25): "Accept it, record why
+    (Recommended)". The root commit stays as it is. Replacing it would need a
+    force-push and a ruleset change, and neither is authorized.
