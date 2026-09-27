@@ -95,14 +95,16 @@ fn sql_err(e: rusqlite::Error) -> String {
 }
 
 impl Store {
-    fn prune(&self) -> Result<(), String> {
+    pub fn prune(&self) -> Result<(), String> {
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
         db.execute("DELETE FROM messages WHERE (state='acked' AND acked_at<=unixepoch()-604800) OR (state!='acked' AND created_at<=unixepoch()-2592000)", []).map_err(sql_err)?;
         Ok(())
     }
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let db = Connection::open(path).map_err(sql_err)?;
-        Self::init(db)
+        let store = Self::init(db)?;
+        store.prune()?;
+        Ok(store)
     }
     pub fn memory() -> Result<Self, String> {
         Self::init(Connection::open_in_memory().map_err(sql_err)?)
@@ -613,6 +615,60 @@ mod tests {
             .send(&json!({"from":from,"to":to,"ticket":"none","body":"three","thread_id":thread}))
             .unwrap();
         assert_eq!(third.envelope["seq"], 3);
+    }
+
+    #[test]
+    fn reopening_prunes_old_bodies_without_mailbox_traffic() {
+        let path = std::env::temp_dir().join(format!("swb-retention-{}.sqlite3", Ulid::new()));
+        let from = "claude:honey:1:a";
+        let to = "pi:sting:2:b";
+        let retained;
+        {
+            let store = Store::open(&path).unwrap();
+            let send = |body| {
+                store
+                    .send(&json!({"from":from,"to":to,"ticket":"none","body":body}))
+                    .unwrap()
+                    .envelope["msg_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            let old_acked = send("old acked body");
+            let old_unacked = send("old unacked body");
+            retained = send("recent body");
+            store.ack(to, &old_acked).unwrap();
+            let db = store.0.lock().unwrap();
+            db.execute(
+                "UPDATE messages SET acked_at=unixepoch()-604801 WHERE msg_id=?1",
+                [&old_acked],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE messages SET created_at=unixepoch()-2592001 WHERE msg_id=?1",
+                [&old_unacked],
+            )
+            .unwrap();
+        }
+        let reopened = Store::open(&path).unwrap();
+        let db = reopened.0.lock().unwrap();
+        let bodies: Vec<String> = db
+            .prepare("SELECT body FROM messages ORDER BY created_at")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(bodies, vec!["recent body"]);
+        let surviving: String = db
+            .query_row("SELECT msg_id FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(surviving, retained);
+        drop(db);
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]

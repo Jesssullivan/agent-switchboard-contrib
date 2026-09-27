@@ -1,5 +1,5 @@
 {
-  "checksum": "9d2fd3e47581dc7b070884852e4aafb800dd58d6a6ff2e2cf7b0e5af6e8d83c7",
+  "checksum": "736a729b78aa91d26324dbd951726f97e0a837c23de803fa5d16bf7293fa9607",
   "crates": {
     "android_system_properties 0.1.6": {
       "name": "android_system_properties",
@@ -1249,6 +1249,81 @@
         "version": "1.0.2"
       },
       "license": "Apache-2.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "errno 0.3.14": {
+      "name": "errno",
+      "version": "0.3.14",
+      "package_url": "https://github.com/lambda-fairy/rust-errno",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/errno/0.3.14/download",
+          "sha256": "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "errno",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "errno",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [],
+          "selects": {
+            "cfg(target_os = \"hermit\")": [
+              {
+                "id": "libc 0.2.189",
+                "target": "libc"
+              }
+            ],
+            "cfg(target_os = \"wasi\")": [
+              {
+                "id": "libc 0.2.189",
+                "target": "libc"
+              }
+            ],
+            "cfg(unix)": [
+              {
+                "id": "libc 0.2.189",
+                "target": "libc"
+              }
+            ],
+            "cfg(windows)": [
+              {
+                "id": "windows-sys 0.61.2",
+                "target": "windows_sys"
+              }
+            ]
+          }
+        },
+        "edition": "2018",
+        "version": "0.3.14"
+      },
+      "license": "MIT OR Apache-2.0",
       "license_ids": [
         "Apache-2.0",
         "MIT"
@@ -5955,6 +6030,58 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "signal-hook-registry 1.4.8": {
+      "name": "signal-hook-registry",
+      "version": "1.4.8",
+      "package_url": "https://github.com/vorner/signal-hook",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/signal-hook-registry/1.4.8/download",
+          "sha256": "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "signal_hook_registry",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "signal_hook_registry",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "errno 0.3.14",
+              "target": "errno"
+            },
+            {
+              "id": "libc 0.2.189",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2015",
+        "version": "1.4.8"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "slab 0.4.12": {
       "name": "slab",
       "version": "0.4.12",
@@ -6324,6 +6451,10 @@
         },
         "deps_dev": {
           "common": [
+            {
+              "id": "rusqlite 0.37.0",
+              "target": "rusqlite"
+            },
             {
               "id": "tower 0.5.2",
               "target": "tower"
@@ -6803,6 +6934,8 @@
             "net",
             "rt",
             "rt-multi-thread",
+            "signal",
+            "signal-hook-registry",
             "socket2",
             "sync",
             "time",
@@ -6827,6 +6960,10 @@
             {
               "id": "pin-project-lite 0.2.17",
               "target": "pin_project_lite"
+            },
+            {
+              "id": "signal-hook-registry 1.4.8",
+              "target": "signal_hook_registry"
             },
             {
               "id": "socket2 0.6.5",
@@ -8831,6 +8968,7 @@
     ],
     "cfg(target_os = \"android\")": [],
     "cfg(target_os = \"haiku\")": [],
+    "cfg(target_os = \"hermit\")": [],
     "cfg(target_os = \"netbsd\")": [],
     "cfg(target_os = \"solaris\")": [],
     "cfg(target_os = \"vxworks\")": [],
@@ -8839,6 +8977,12 @@
     "cfg(target_vendor = \"apple\")": [
       "aarch64-apple-darwin",
       "x86_64-apple-darwin"
+    ],
+    "cfg(unix)": [
+      "aarch64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(windows)": [],
     "wasm32-unknown-unknown": [],

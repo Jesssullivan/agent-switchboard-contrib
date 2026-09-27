@@ -24,7 +24,7 @@ hmac = "=0.12.1"
 sha2 = "=0.10.9"
 rmcp = { version = "=3.4.1", default-features = false, features = ["server", "transport-streamable-http-server"] }
 axum = "=0.8.8"
-tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 tower = "=0.5.2"
 
 [profile.release]
