@@ -256,8 +256,8 @@ registered once on the tailnet so that new harness instances spawn nothing.
 
   It has no bypass actors.
 - **Fork (SWB-R08, SWB-R13):** `Jesssullivan/agent-switchboard`, private. It
-  requires the xoxd-ai org setting that allows forks of private repositories,
-  which SWB-R13 authorizes.
+  requires the xoxd-ai org setting that allows forks of private repositories.
+  SWB-R13 authorizes it, and the operator sets it in the GitHub UI (SWB-R23).
 - **Remotes:** `origin` is the fork, and agents push only there. `upstream` is
   xoxd-ai, with its push URL set to `DISABLED` (`just fork-setup`).
 - **Branches** are named `<type>/tin-####-<slug>-<yyyymmdd>`. PRs go from the
@@ -386,6 +386,8 @@ Operator questions and asides are not rulings (R-N13).
 | SWB-R19 | 2026-09-25 | same | "Message bodies in Loki". Retention and access follow Loki's. |
 | SWB-R20 | 2026-09-25 | same | Unchanged: Codex push waits for a recorded live-thread proof. |
 | SWB-R21 | 2026-09-25 | Operator interview, relayed to the P1a lane by the orchestrating session; durable carrier: the P1a receipt comment on TIN-4655 | "Yes, start P1a now." |
+| SWB-R22 | 2026-09-25 | Operator interview, relayed by the orchestrating session after the pre-push hook refused a direct push to `main` (R-N12 stop) | "Yes, root commit via API, then PR". One GitHub-side root commit through the contents API is the only direct write to `main`. The scaffold then lands by PR before the ruleset is applied. |
+| SWB-R23 | 2026-09-25 | same | "You flip it in the GitHub UI". The operator turns on forking of private repositories for xoxd-ai. Agents do not change org settings or switch gh logins. |
 
 Estate rulings this design depends on:
 

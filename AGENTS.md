@@ -6,7 +6,7 @@ also holds the per-host push adapter (`swb agentd`) and the hook client
 (`swb hook`). Linear: TIN-4655.
 
 **Read first:** [ADR-0001](docs/adr/0001-agent-switchboard.md). It is the
-design and the rulings list (`SWB-R01`..`SWB-R21`). A design change needs a
+design and the rulings list (`SWB-R01`..`SWB-R23`). A design change needs a
 new ruling, recorded as a dated TIN-4655 comment, and then an ADR update. An
 operator question or aside is not a ruling.
 

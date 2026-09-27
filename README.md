@@ -51,3 +51,6 @@ just lock              # regenerate all three lock files together (linux x86_64)
 CI is `xoxd-ai/ci-templates` `rust-bazel-application.yml`, pinned by commit,
 on GloriousFlywheel runners. `ci-ok` is the required check, and changes land
 through the merge queue. See [AGENTS.md](AGENTS.md).
+
+Contributions arrive as pull requests from a private fork (`just fork-setup`)
+into `xoxd-ai/agent-switchboard` `main`.
