@@ -10,8 +10,10 @@ session, or another host after `git pull`, would need goes here:
 - plans, checklists and unpushed-work manifests.
 
 Distilled rulings do not go here. They belong in a dated TIN-4655 comment and
-then in [ADR-0001](../adr/0001-agent-switchboard.md). Secret-bearing scratch
-goes to `~/.claude/agent-notes-rescue/YYYY-MM-DD/` and never enters the repo.
+then in the ADR that owns the area: [ADR-0001](../adr/0001-agent-switchboard.md)
+for the broker (`SWB-R01`..`SWB-R24`) or [ADR-0002](../adr/0002-lgtm-plane.md)
+for the LGTM plane (`SWB-R25`..`SWB-R48`, including the September 26 cross-plane amendments). Secret-bearing scratch goes to
+`~/.claude/agent-notes-rescue/YYYY-MM-DD/` and never enters the repo.
 
 ## Naming
 
