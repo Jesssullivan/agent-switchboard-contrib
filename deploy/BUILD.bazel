@@ -1,32 +1,39 @@
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_push")
 
 package(default_visibility = ["//visibility:public"])
 
-# The swb binary as an image layer. This is the CI package target today and
-# the input layer of the P1b image.
+_linux_amd64 = [
+    "@platforms//os:linux",
+    "@platforms//cpu:x86_64",
+]
+
+# The swb binary as an image layer.
 pkg_tar(
     name = "swb_layer",
     srcs = ["//crates/swb:swb"],
     mode = "0755",
     package_dir = "/usr/local/bin",
+    target_compatible_with = _linux_amd64,
 )
 
-# TODO(P1b, TIN-4655): the rules_oci image. Deferred from P1a because it needs
-# an `oci.pull` of a distroless base pinned by digest plus the crane/regctl
-# toolchains, a network image pull on every CI run for no P1a benefit.
-# Planned shape:
-#
-#   bazel_dep(name = "rules_oci", version = "2.3.0")        # MODULE.bazel
-#   oci.pull(name = "distroless_cc", digest = "sha256:...", # pinned by digest
-#            image = "gcr.io/distroless/cc-debian12",
-#            platforms = ["linux/amd64"])
-#
-#   oci_image(
-#       name = "image",
-#       base = "@distroless_cc",
-#       entrypoint = ["/usr/local/bin/swb", "serve"],
-#       tars = [":swb_layer"],
-#   )
-#
-# The image is published by digest from main only; blahaj consumes the digest
-# (tofu/stacks/agent-switchboard). No push happens from pull requests.
+# SWB-R04: a pinned Linux/amd64 runtime. The nonroot base runs as UID 65532;
+# blahaj owns the PVC's writable directory and the exact tailnet Host gate.
+oci_image(
+    name = "image",
+    base = "@distroless_cc_amd64_linux_amd64",
+    entrypoint = ["/usr/local/bin/swb"],
+    cmd = ["serve"],
+    tars = [":swb_layer"],
+    target_compatible_with = _linux_amd64,
+)
+
+# SWB-R04, R-N13: explicit digest-only publication. `oci_push` uploads by
+# digest without a mutable tag; the matching :image.digest is the blahaj input.
+# Run only from a reviewed main commit, never as part of PR CI.
+oci_push(
+    name = "push",
+    image = ":image",
+    repository = "ghcr.io/xoxd-ai/agent-switchboard",
+    target_compatible_with = _linux_amd64,
+)

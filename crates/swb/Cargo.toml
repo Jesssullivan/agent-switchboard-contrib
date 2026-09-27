@@ -16,3 +16,5 @@ swb-agentd = { path = "../swb-agentd" }
 swb-broker = { path = "../swb-broker" }
 swb-proto = { path = "../swb-proto" }
 swb-store = { path = "../swb-store" }
+tokio.workspace = true
+serde_json.workspace = true

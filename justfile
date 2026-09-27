@@ -17,7 +17,7 @@ check:
 
 # Build the application and package targets CI builds.
 build:
-    {{clean_bazel_env}} bazelisk build --lockfile_mode=error //:build //deploy:swb_layer
+    {{clean_bazel_env}} bazelisk build --lockfile_mode=error //:build //deploy:image //deploy:image.digest
 
 # Commit all three. Run on linux x86_64 (sting or honey), the platform CI
 # checks the locks on.
@@ -66,10 +66,10 @@ branch type tin slug:
     git fetch upstream
     git switch -c "{{type}}/tin-{{tin}}-{{slug}}-$(date -u +%Y%m%d)" upstream/main
 
-# Stub (P1b): build the rules_oci image (see deploy/BUILD.bazel).
+# Build the immutable Linux/amd64 OCI image and print the exact manifest digest.
 image:
-    @echo "image: not yet wired; lands in P1b with rules_oci (deploy/BUILD.bazel)" >&2
-    @exit 1
+    {{clean_bazel_env}} bazelisk build --lockfile_mode=error //deploy:image //deploy:image.digest
+    @digest="$(cat bazel-bin/deploy/image.json.sha256)" && printf 'ghcr.io/xoxd-ai/agent-switchboard@%s\n' "$digest"
 
 # Stub (P1b): end-to-end round trip against a live broker.
 e2e:

@@ -9,7 +9,7 @@ rust_library(
     aliases = aliases(),
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    deps = all_crate_deps(normal = True) + ["//crates/swb-proto:swb_proto"],
+    deps = all_crate_deps(normal = True) + ["//crates/swb-proto:swb_proto", "//crates/swb-store:swb_store"],
 )
 
 rust_test(
@@ -34,8 +34,9 @@ rust_test(
     ),
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
-    deps = all_crate_deps(normal_dev = True) + [
+    deps = [
         ":swb_broker",
         "//crates/swb-proto:swb_proto",
+        "@crates//:serde_json",
     ],
 )

@@ -45,7 +45,7 @@ jobs:
       build_targets_json: '["//:build"]'
       unit_test_targets_json: '["//:unit_tests"]'
       integration_test_targets_json: '["//:integration_tests"]'
-      package_targets_json: '["//deploy:swb_layer"]'
+      package_targets_json: '["//deploy:image", "//deploy:image.digest"]'
       timeout_minutes: 60
       max_parallel: 1
 

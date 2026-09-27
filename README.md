@@ -46,7 +46,7 @@ pass (SWB-R33, SWB-R34, SWB-R48).
 | `crates/swb-agentd` | Per-host push adapter |
 | `crates/swb` | The single `swb` binary |
 | `schemas/` | Envelope v3 JSON schema (draft) |
-| `deploy/` | Image layer; rules_oci image in P1b |
+| `deploy/` | Digest-addressed Linux/amd64 OCI image and explicit GHCR push target |
 | `docs/adr/`, `docs/agent-notes/` | Decisions and durable working notes |
 
 ## Develop
@@ -55,7 +55,8 @@ pass (SWB-R33, SWB-R34, SWB-R48).
 nix develop            # bazelisk, just, cargo (diagnostic), gh, jq
 just fork-setup        # origin = your fork, upstream = xoxd-ai (push disabled)
 just check             # rustfmt, clippy, unit + integration tests (Bazel)
-just build             # swb binary and its image layer
+just build             # swb binary and OCI image
+just image             # build image and print its immutable GHCR reference
 just remote-check      # from neo: run `just check` on sting
 just lock              # regenerate all three lock files together (linux x86_64)
 ```
@@ -66,3 +67,11 @@ through the merge queue. See [AGENTS.md](AGENTS.md).
 
 Contributions arrive as pull requests from a private fork (`just fork-setup`)
 into `xoxd-ai/agent-switchboard` `main`.
+
+After a reviewed main build, the explicit `bazelisk run //deploy:push` target
+publishes the image by digest without a mutable tag. Run `just image` on that
+same Linux/amd64 source revision and hand its `ghcr.io/xoxd-ai/agent-switchboard@sha256:…`
+reference to the blahaj owner. PR CI only builds the image and digest target;
+it does not publish. The rollout must supply the measured tailnet
+`SWB_MCP_ALLOWED_HOSTS` and a writable PVC directory for the image's nonroot
+UID 65532.

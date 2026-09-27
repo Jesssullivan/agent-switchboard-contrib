@@ -9,6 +9,12 @@ publish.workspace = true
 
 [dependencies]
 swb-proto = { path = "../swb-proto" }
+swb-store = { path = "../swb-store" }
+serde_json.workspace = true
+rmcp.workspace = true
+axum.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tower.workspace = true

@@ -35,6 +35,11 @@
       "minimum": 1,
       "description": "Per-thread sequence, assigned by the broker inside the write transaction. Absent on a client submission, present on every delivered message."
     },
+    "delivery_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Broker delivery attempts. Present in inbox results; absent from the submitted and stored envelope."
+    },
     "in_reply_to": {
       "$ref": "#/$defs/ulid"
     },
