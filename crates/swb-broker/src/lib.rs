@@ -388,7 +388,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    include!("../tests/service_roundtrip.rs");
+    include!("service_roundtrip_tests.rs");
     use super::*;
     use axum::{
         body::{Body, to_bytes},

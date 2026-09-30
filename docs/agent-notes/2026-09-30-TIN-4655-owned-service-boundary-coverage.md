@@ -56,7 +56,7 @@ These results must not be called a cross-harness working MVP.
 
 ## New actionable service fixture
 
-The cfg(test) module includes crates/swb-broker/tests/service_roundtrip.rs.
+The cfg(test) module includes crates/swb-broker/src/service_roundtrip_tests.rs.
 Case tests::owned_http_round_trip_survives_graceful_service_reopen runs the
 production serve_bound on owned loopback listeners with an owned temporary
 SQLite file. No public production API changes. It sends real HTTP register,
@@ -65,7 +65,8 @@ oneshot futures, no OS processes or signals. Assertions cover peer authority,
 idempotent retry, persistent registered sessions, unacked redelivery counts,
 ack durability after reopen, and monotonic thread sequence after reopen.
 Claude, Pi and Codex identities are explicitly synthetic owned fixture records;
-the second message comes from synthetic Codex to Pi, never a live harness.
+the first is synthetic Neo Claude to Sting Codex; its linked reply is
+synthetic Sting Codex to Sting Pi, never a live harness.
 The existing //crates/swb-broker:swb_broker_test target declares the included
 source; the driver owner will require the exact case result.
 
@@ -91,3 +92,18 @@ without waiting for GF or production custody.
 Owned HTTP/SQLite service reopen proof does not establish a deployed pod/PVC
 restart, host delivery, live Pi/Junie cross-host acceptance, real credential
 custody, or production transport. Those remain distinct operational exits.
+
+Independent review corrections (LAB-TAKEOVER-20260930, R-N13): the initial
+include fragment lived under tests/, which Cargo auto-discovers as an
+integration crate without the private unit-module context. It is now under
+src/ with the include and Bazel source registration corrected; stamp.rs remains
+Cargo's existing integration test. The HTTP reader now shares a true absolute
+two-second deadline across connection, each write and each read, and enforces
+a 64 KiB response cap; continuously arriving data cannot extend the deadline.
+No subprocess timeout cleanup or OS process signals are used.
+
+The flow now includes explicit synthetic Neo Claude to Sting Codex delivery
+and acknowledgement, then a Sting Codex to Sting Pi reply with in_reply_to
+set to the first message. A third graceful reopen proves the acknowledged
+Codex inbox remains empty and the Pi reply linkage and sequence persist.
+These refinements are source-only pending the owner's remote fixture run.
