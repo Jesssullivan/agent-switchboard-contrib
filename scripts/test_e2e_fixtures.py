@@ -52,6 +52,10 @@ class ReceiptTests(unittest.TestCase):
         self.assertIn("--local_resources=cpu=1", receipt["command"])
         self.assertIn("--legacy_globbing_threads=1", receipt["command"])
         self.assertIn("--loading_phase_threads=1", receipt["command"])
+        self.assertIn("--action_env=MALLOC_ARENA_MAX=2", receipt["command"])
+        self.assertIn("--test_env=MALLOC_ARENA_MAX=2", receipt["command"])
+        self.assertIn("//crates/swb-broker:swb_broker_test", receipt["command"])
+        self.assertTrue(receipt["cases"]["crates/swb-broker:swb_broker_test"]["rmcp_streamable_http_initialize_and_tools"])
         self.assertIn("--host_jvm_args=-XX:ActiveProcessorCount=1", receipt["command"])
 
     def test_same_head_dirty_source_refuses(self):

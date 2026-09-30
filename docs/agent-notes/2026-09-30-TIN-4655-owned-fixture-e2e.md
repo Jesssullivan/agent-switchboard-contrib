@@ -169,3 +169,36 @@ Fresh post-correction capacity sample load31.19/42.59/42.04, busy53.1%,
 available97259452kB, CPU PSI some23.64%/full0. No heavy launch followed:
 pressure exceeds root's prior admission envelope, and fresh admission
 is pending. Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
+
+Functional audit correction: CLI explicit_broker_round_trip_and_session_identity
+uses a canned owned TcpListener response, not a real broker. Existing store
+fixtures prove SQLite semantics, not broker lifecycle. Driver now includes
+//crates/swb-broker:swb_broker_test and requires existing
+rmcp_streamable_http_initialize_and_tools and conflict_is_opaque_over_rest
+cases. The former executes real Axum/RMCP initialization, register, peers,
+send, inbox and ack against Store::memory with synthetic identities. It
+proves in-process service routing, not native harness registration or wire
+transport. A peer is preparing an owned production serve_bound+SQLite reopen
+fixture separately; no duplicate fixture or heavy run is being launched here.
+
+Selected failed JVM metadata: outputbase/install points to installbase
+3e6f3b7d6fdac67aed908160850e082b; embedded_tools/jdk/bin/java requests
+/lib64/ld-linux-x86-64.so.2 and libc.so.6, with RPATH only local bin/lib.
+Neither RPATH directory contains libc.so.6. /usr/lib64/libc.so.6 embedded
+version metadata says stable2.39; current LD_PRELOAD/LD_LIBRARY_PATH are absent,
+and no corresponding prior client_env keys appeared in the allowlisted
+failed Java log inspection. This supports host2.39 linkage without launching
+Java, but is metadata inference rather than a captured JVM process map.
+
+Bazelisk1.28.1 is an ELF executable at the selected Nix profile path. Its
+versioned primary source makeBazelCmd preserves os.Environ when launching
+Bazel. Driver supplies arena2 to both task test and batch info invocations.
+Bazel action/test environments are separately declared: fixed
+--action_env=MALLOC_ARENA_MAX=2 and --test_env=MALLOC_ARENA_MAX=2 plus empty
+GLIBC_TUNABLES for actions/tests ensure hermetic compiler/test children receive
+the same bound. This touches only owned subprocesses, not host configuration.
+Three meaningful driver mocks pass with the expanded real broker requirement
+and arena override checks. Heavy retry remains held.
+Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
+Source: https://raw.githubusercontent.com/bazelbuild/bazelisk/v1.28.1/core/core.go
+(makeBazelCmd, environment propagation).
