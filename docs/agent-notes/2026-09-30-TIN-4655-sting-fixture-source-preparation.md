@@ -78,3 +78,33 @@ that existing outer boundary through actual rendered hooks; this is acceptance
 coverage, not a duplicate product fix. Root received the correction before
 any corresponding source or runtime action. Source/build remains inert under
 the existing capacity hold. Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
+
+
+## Actual bounded execution — 08:26 UTC
+
+Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13. Root reserved the Sting slot
+following native fixture natural exit. Fresh admission measured load5.30,
+CPU busy12.0%, PSI some avg10=2.48 and MemAvailable26997476kB. Nonblocking
+shared heavy lock `/srv/fast-local/jess/tmp/lab-takeover-sting-heavy.lock`
+covered task40486; it naturally exited0 at08:26:11.244111Z and released the lock.
+Exact clean source24c03ab90cfe6139531c58c93084192e33a7e228 passed all nine
+required named Rust cases across all three targets. This includes genuine
+production TCP/SQLite graceful service reopen and actual RMCP router coverage;
+CLI registration fixture remains explicitly mocked. Source stayed unchanged
+and clean. CPU affinity[0], per-process6GiB AS, JVM512MiB and arena2 remained.
+No signals, shared Bazel server, live harness or live broker actions occurred.
+
+Remote external receipt:
+`/srv/fast-local/jess/tmp/swb-e2e-receipts-24c03ab-20260930/receipt.json`.
+Neo durable copies of receipt and log:
+`/Users/jess/.claude/agent-notes-rescue/2026-09-30/swb-e2e-24c03ab/`.
+Log SHA256 eaba02569856a6a594d30b3530ad754025b04ce2311f14a9f37c322232c5665b.
+Compiled CLI `artifacts/swb` SHA256
+43428ec0299535e2deebfca9ed495baff9fa372b9fc6ad7044ddf5614edf6720.
+ELF metadata requires GLIBC_2.39 and /lib64/ld-linux-x86-64.so.2;
+NEEDED libc,libm,libgcc_s and loader; no RPATH. The OCI renderer owner received
+this compatibility requirement before any renderer launch. Managed-hook18cases
+remain unexecuted pending bounded local-store realization and provenance.
+Custody, live native session identity, host registry convergence and operator
+PVC restart acceptance remain separate unfulfilled gates. No live acceptance
+is claimed by this owned-fixture receipt.
