@@ -157,3 +157,15 @@ and confirms fixed2 bound; the three driver regression cases pass. No Bazel
 retry is part of this mutation or diagnostic; fresh root capacity admission
 is required before another heavy launch. Authority LAB-TAKEOVER-20260930/
 SWB-R49/R-N13.
+
+Version precision correction: getconf GNU_LIBC_VERSION reported2.39 for
+that host utility, while the diagnostic Python's direct libc
+gnu_get_libc_version reports2.42. The observed allocator comparison
+therefore belongs to Python-linked glibc2.42. Diagnostic source now records
+that direct library version in future observations. The historical JVM's
+linked library version was not established. The official current glibc
+contract applies to this diagnostic; do not label it a2.39 JVM reproduction.
+Fresh post-correction capacity sample load31.19/42.59/42.04, busy53.1%,
+available97259452kB, CPU PSI some23.64%/full0. No heavy launch followed:
+pressure exceeds root's prior admission envelope, and fresh admission
+is pending. Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.

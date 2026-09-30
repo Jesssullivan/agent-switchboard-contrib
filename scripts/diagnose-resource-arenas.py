@@ -25,6 +25,8 @@ def child():
     os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
     threading.stack_size(512 * 1024)
     libc = ctypes.CDLL(None)
+    libc.gnu_get_libc_version.restype = ctypes.c_char_p
+    linked_glibc = libc.gnu_get_libc_version().decode()
     libc.malloc.argtypes = [ctypes.c_size_t]
     libc.malloc.restype = ctypes.c_void_p
     libc.free.argtypes = [ctypes.c_void_p]
@@ -58,7 +60,7 @@ def child():
             key, _, value = line.partition(':')
             if key in {'VmPeak', 'VmSize', 'VmRSS', 'Threads'}:
                 values[key] = value.strip()
-        result = dict(memory_limit_bytes=limit, threads_started=len(started),
+        result = dict(memory_limit_bytes=limit, linked_glibc=linked_glibc, threads_started=len(started),
                       requested_threads=128, thread_stack_bytes=512*1024,
                       allocation_bytes_per_thread=4096,
                       allocation_failures=len(allocation_failures),
