@@ -46,6 +46,8 @@ class ReceiptTests(unittest.TestCase):
         self.assertTrue(receipt["source_clean"])
         self.assertEqual(receipt["memory_limit_bytes_per_process"], 6 * 1024**3)
         self.assertFalse(receipt["live_acceptance"])
+        self.assertIn("--local_resources=cpu=1", receipt["command"])
+        self.assertIn("--host_jvm_args=-XX:ActiveProcessorCount=1", receipt["command"])
 
     def test_same_head_dirty_source_refuses(self):
         code, receipt = self.exercise(dirty=True)

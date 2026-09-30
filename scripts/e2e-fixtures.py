@@ -28,8 +28,8 @@ def main():
     repo = Path(__file__).resolve().parents[1]
     sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
     output_base = str(a.output.resolve() / "bazel-output-base") if a.output else "<run-output>/bazel-output-base"
-    startup = ["bazelisk", "--batch", "--ignore_all_rc_files", "--host_jvm_args=-Xmx512m", "--output_base=" + output_base]
-    command = [*startup, "test", "--lockfile_mode=error", "--jobs=1", "--local_cpu_resources=1", "--local_test_jobs=1", "--test_output=all", "--test_arg=--test-threads=1", *TARGETS]
+    startup = ["bazelisk", "--batch", "--ignore_all_rc_files", "--host_jvm_args=-Xmx512m", "--host_jvm_args=-XX:ActiveProcessorCount=1", "--host_jvm_args=-Xss512k", "--output_base=" + output_base]
+    command = [*startup, "test", "--lockfile_mode=error", "--jobs=1", "--local_resources=cpu=1", "--local_test_jobs=1", "--test_output=all", "--test_arg=--test-threads=1", *TARGETS]
     plan = {"schema": "swb.owned-fixture-receipt.v1", "source_sha": sha, "command": command, "expected_cases": EXPECTED, "qualification": "owned-fixtures-only", "live_acceptance": False, "process_actions": False, "rulings": ["LAB-TAKEOVER-20260930", "TIN-4655", "SWB-R49", "R-N13"]}
     if a.plan:
         print(json.dumps(plan, indent=2, sort_keys=True))
@@ -61,6 +61,8 @@ def main():
         with (output / "bazel.log").open("x") as log:
             result = subprocess.run(command, cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
         plan["exit_code"] = result.returncode
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, command)
         # Batch info uses no persistent server and no process lifecycle action.
         testlogs = Path(subprocess.check_output([*startup, "info", "bazel-testlogs"], cwd=repo, env=env, text=True).strip())
         for target, names in EXPECTED.items():

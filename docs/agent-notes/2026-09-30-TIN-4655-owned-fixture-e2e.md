@@ -60,3 +60,18 @@ The first mock run used Linux's numeric RLIM_INFINITY on Darwin, causing one
 assertion failure; the mock now uses the executing platform's resource
 constant. Corrected three-case run passed. This was test fixture portability,
 not a runtime-limit change; the initial commit preserved the failed attempt.
+
+First actual attempt at exact signed33bc253 on Honey ended naturally with a
+failed receipt at07:02:25Z: test exit2 rejected old --local_cpu_resources;
+following info exit134 reported native std::bad_alloc. No fixture ran and
+no root cause beyond that native allocation failure was established. The
+Bazel9.2 ExecutionOptions source declares --local_resources=cpu=1; the driver
+now uses it, caps JVM visible processors1 and thread stacks512KiB in addition
+to the existing512MiB heap and6GiB address-space bound. A failed test command
+no longer starts a second JVM for info. Root authorized this source-supported
+correction and a new bounded attempt; no command spelling evades a guard.
+
+Source references: https://raw.githubusercontent.com/bazelbuild/bazel/9.2.0/src/main/java/com/google/devtools/build/lib/exec/ExecutionOptions.java
+(Bazel local_resources option, lines308–347). Java ActiveProcessorCount and
+-Xss are standard supported JVM resource options; allocation cause remains
+unproved and these settings do not raise the memory ceiling.
