@@ -36,7 +36,7 @@ class ReceiptTests(unittest.TestCase):
                     return str(logs) + "\n"
                 raise AssertionError(command)
             output = base / "receipt"
-            with patch.object(sys, "argv", ["e2e", "--output", str(output)]), patch.object(e2e.platform, "system", return_value="Linux"), patch.object(e2e.resource, "getrlimit", return_value=(-1, -1)), patch.object(e2e.resource, "setrlimit"), patch.object(e2e.subprocess, "check_output", side_effect=check_output), patch.object(e2e.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(sys, "argv", ["e2e", "--output", str(output)]), patch.object(e2e.platform, "system", return_value="Linux"), patch.object(e2e.resource, "getrlimit", return_value=(e2e.resource.RLIM_INFINITY, e2e.resource.RLIM_INFINITY)), patch.object(e2e.resource, "setrlimit"), patch.object(e2e.subprocess, "check_output", side_effect=check_output), patch.object(e2e.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(io.StringIO()):
                 result = e2e.main()
             return result, json.loads((output / "receipt.json").read_text())
 

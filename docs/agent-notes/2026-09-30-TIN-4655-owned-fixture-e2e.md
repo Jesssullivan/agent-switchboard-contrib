@@ -55,3 +55,8 @@ pass without builds. Every execution lowers its inherited per-process address
 space limit to at most 6 GiB; the unique run output-base uses batch mode and a
 512 MiB JVM heap, avoiding any shared server. These are per-process bounds,
 not an aggregate cgroup limit. One-job/one-CPU execution remains owner-admitted.
+
+The first mock run used Linux's numeric RLIM_INFINITY on Darwin, causing one
+assertion failure; the mock now uses the executing platform's resource
+constant. Corrected three-case run passed. This was test fixture portability,
+not a runtime-limit change; the initial commit preserved the failed attempt.
