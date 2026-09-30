@@ -202,3 +202,11 @@ and arena override checks. Heavy retry remains held.
 Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
 Source: https://raw.githubusercontent.com/bazelbuild/bazelisk/v1.28.1/core/core.go
 (makeBazelCmd, environment propagation).
+
+Execution-configuration actions receive matching fixed host_action_env
+arena2/emptytunables settings as well as target action/test environments.
+The real broker target requirement has a negative driver fixture: existing
+CLI/store successes with missing real broker cases cannot qualify. Four
+mock receipt tests pass; no compilation. Authority LAB-TAKEOVER-20260930/
+SWB-R49/R-N13. Option contracts: https://raw.githubusercontent.com/bazelbuild/bazel/9.2.0/src/main/java/com/google/devtools/build/lib/analysis/config/CoreOptions.java
+(action_env and host_action_env).

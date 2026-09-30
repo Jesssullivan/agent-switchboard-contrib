@@ -15,14 +15,14 @@ e2e = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(e2e)
 
 class ReceiptTests(unittest.TestCase):
-    def exercise(self, dirty=False, info_error=False):
+    def exercise(self, dirty=False, info_error=False, broker_missing=False):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             logs = base / "testlogs"
             for target, names in e2e.EXPECTED.items():
                 path = logs / target.replace(":", "/") / "test.log"
                 path.parent.mkdir(parents=True)
-                path.write_text("\n".join(f"test tests::{name} ... ok" for name in names))
+                path.write_text("" if broker_missing and "swb-broker" in target else "\n".join(f"test tests::{name} ... ok" for name in names))
             status_calls = [0]
             def check_output(command, **kwargs):
                 if "rev-parse" in command:
@@ -54,9 +54,16 @@ class ReceiptTests(unittest.TestCase):
         self.assertIn("--loading_phase_threads=1", receipt["command"])
         self.assertIn("--action_env=MALLOC_ARENA_MAX=2", receipt["command"])
         self.assertIn("--test_env=MALLOC_ARENA_MAX=2", receipt["command"])
+        self.assertIn("--host_action_env=MALLOC_ARENA_MAX=2", receipt["command"])
         self.assertIn("//crates/swb-broker:swb_broker_test", receipt["command"])
         self.assertTrue(receipt["cases"]["crates/swb-broker:swb_broker_test"]["rmcp_streamable_http_initialize_and_tools"])
         self.assertIn("--host_jvm_args=-XX:ActiveProcessorCount=1", receipt["command"])
+
+    def test_missing_real_broker_cases_refuses(self):
+        code, receipt, env = self.exercise(broker_missing=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt["verdict"], "failed")
+        self.assertFalse(receipt["cases"]["crates/swb-broker:swb_broker_test"]["rmcp_streamable_http_initialize_and_tools"])
 
     def test_same_head_dirty_source_refuses(self):
         code, receipt, env = self.exercise(dirty=True)

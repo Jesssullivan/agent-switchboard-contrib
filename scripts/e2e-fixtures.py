@@ -30,7 +30,7 @@ def main():
     sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
     output_base = str(a.output.resolve() / "bazel-output-base") if a.output else "<run-output>/bazel-output-base"
     startup = ["bazelisk", "--batch", "--ignore_all_rc_files", "--host_jvm_args=-Xmx512m", "--host_jvm_args=-XX:ActiveProcessorCount=1", "--host_jvm_args=-Xss512k", "--output_base=" + output_base]
-    command = [*startup, "test", "--lockfile_mode=error", "--jobs=1", "--local_resources=cpu=1", "--legacy_globbing_threads=1", "--loading_phase_threads=1", "--local_test_jobs=1", "--test_output=all", "--test_arg=--test-threads=1", "--action_env=MALLOC_ARENA_MAX=2", "--action_env=GLIBC_TUNABLES=", "--test_env=MALLOC_ARENA_MAX=2", "--test_env=GLIBC_TUNABLES=", *TARGETS]
+    command = [*startup, "test", "--lockfile_mode=error", "--jobs=1", "--local_resources=cpu=1", "--legacy_globbing_threads=1", "--loading_phase_threads=1", "--local_test_jobs=1", "--test_output=all", "--test_arg=--test-threads=1", "--action_env=MALLOC_ARENA_MAX=2", "--action_env=GLIBC_TUNABLES=", "--host_action_env=MALLOC_ARENA_MAX=2", "--host_action_env=GLIBC_TUNABLES=", "--test_env=MALLOC_ARENA_MAX=2", "--test_env=GLIBC_TUNABLES=", *TARGETS]
     plan = {"schema": "swb.owned-fixture-receipt.v1", "source_sha": sha, "command": command, "expected_cases": EXPECTED, "qualification": "owned-fixtures-only", "live_acceptance": False, "process_actions": False, "rulings": ["LAB-TAKEOVER-20260930", "TIN-4655", "SWB-R49", "R-N13"]}
     if a.plan:
         print(json.dumps(plan, indent=2, sort_keys=True))
