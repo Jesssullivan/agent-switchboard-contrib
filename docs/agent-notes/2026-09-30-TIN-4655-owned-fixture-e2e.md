@@ -210,3 +210,26 @@ CLI/store successes with missing real broker cases cannot qualify. Four
 mock receipt tests pass; no compilation. Authority LAB-TAKEOVER-20260930/
 SWB-R49/R-N13. Option contracts: https://raw.githubusercontent.com/bazelbuild/bazel/9.2.0/src/main/java/com/google/devtools/build/lib/analysis/config/CoreOptions.java
 (action_env and host_action_env).
+
+Final metadata analysis and revised retry proposal (execution held): Bazel9.2
+POSIX ExecuteServerJvm calls execv, preserving the task-local environment;
+versioned Bazelisk preserves environment too. Version-specific glibc2.39
+contract confirms MALLOC_ARENA_MAX and default64-bit limit8xonlinecores,
+which may differ from JVM visibleCPU count. Scope inference remains distinct
+from observed Python2.42 diagnostic. No Java executable was launched.
+Sources: https://raw.githubusercontent.com/bazelbuild/bazel/9.2.0/src/main/cpp/blaze_util_posix.cc
+(ExecuteServerJvm/ExecuteProgram);
+https://sourceware.org/glibc/manual/2.39/html_node/Malloc-Tunable-Parameters.html
+(M_ARENA_MAX).
+
+One fresh capacity sample after this useful analysis showed Honey
+load43.66/44.81/44.36, busy87.8%, available106376440kB, CPU PSI
+some41.34%/full0; no heavy-lock holder observed. This exceeds the earlier
+admitted pressure envelope. No command was spawned for heavy execution;
+root coordinates an owner window, and no pressure polling loop follows.
+The proposed later retry retains per-process6GiBAS (not an aggregate
+memory bound), JVM512MiB, jobs/localCPU/loading/globbing/tests1, fixed
+arena2 JVM/action/host-action/test environments, clean signed exact source,
+private batch outputbase and shared heavy lock. It will include the real
+broker tests plus the peer's owned wire/SQLite lifecycle fixture after
+independent source review. Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
