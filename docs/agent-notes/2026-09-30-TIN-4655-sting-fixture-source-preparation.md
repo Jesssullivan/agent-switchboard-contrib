@@ -191,3 +191,33 @@ requiring read-only diagnosis of actual Bash interpreter and file mode before
 attributing SELinux. Root assigned that diagnosis to the worker owner. This
 failure belongs to the runtime worker startup boundary, not hook product tests
 or admission-pressure refusal. Existing successful Rust9case evidence stands.
+
+
+## Second managed-hook worker attempt — unlocalized early failure
+
+Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13. Root-authorized task-only
+loader-mode repair completed0555 with originalSHA unchanged; remaininglibs
+0444. Runtime-receipt-v2 SHA256
+74fbcdd58b4ca843df04291e7145472faf2ebd8e87b0cece7943ab6a455b8219
+preserves the original receipt. Independently reviewed r2 worker recipe
+bbcd496d630a45548de6ad7b348d21259981520ef531987452af1773d6017f07
+checks modes/hashes before and inside the worker. Owner reports one admitted
+launch09:44:54:16568760KiB available,parentPSI0.02/OOM0,nonblockinglock.
+
+Actual terminal collector independently read:
+container a8c0e702d9cda42ee8442389f60ef7b1785b08198cdce77d1ee70f508cc6efec
+exited/runningfalse/exit1/OOMfalse. stdout and stderr are both zero bytes.
+worker.limits and hook-cases.json are absent. Host runtime mode/hash receipt
+exists and matches the repaired inputs. The early failure is not localized
+by available receipts; no Bash/Nix/renderer/hook execution qualification is
+claimed. Observability-only r3 source is being authored and reviewed by other
+owners; this ledger action authorizes no worker launch, retry or security
+change. No image phase, rollout, custody or registry acceptance changed.
+
+Remote evidence:
+`/srv/fast-local/jess/tin5148-fallback-20260930/swb-hooks-1774c17-r2-output`.
+Neo rescue:
+`/Users/jess/.claude/agent-notes-rescue/2026-09-30/swb-hooks-1774c17-r2-failed/`.
+Acceptance ledger still has actual24c Rust9cases/3targets/compiledCLI passed;
+actual18managed-hookcases and expected12observedcalls remain pending. Neither
+startup failure falsifies the product-hook tests, since they did not run.
