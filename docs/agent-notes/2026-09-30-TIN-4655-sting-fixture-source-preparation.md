@@ -108,3 +108,22 @@ remain unexecuted pending bounded local-store realization and provenance.
 Custody, live native session identity, host registry convergence and operator
 PVC restart acceptance remain separate unfulfilled gates. No live acceptance
 is claimed by this owned-fixture receipt.
+
+
+## Runtime input preparation for actual managed-hook cases
+
+Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13. At root request, copied
+and dereferenced four ELF runtime libraries into task-owned
+`/srv/fast-local/jess/tmp/swb-hook-runtime-24c03ab-20260930/lib64`, mode0444.
+No host library paths changed. Exact hashes and readelf dependency closure are
+in adjacent `runtime-receipt.json`, SHA256
+722c9ee976c6686dcf1153833a699b2b41f707ef27cf14af1b89f3fae89ebbaa;
+a Neo rescue copy accompanies the successful Rust receipt. ELF needs only
+loader,libc,libm,libgcc_s, with maximum GLIBC_2.39. These task-owned copies
+supply preparation evidence, not a sameUID security boundary or runtime proof.
+Private OCI worker review and fresh capacity admission remain required before
+realization/execution. Current197 actual runner already requires actual POST
+requests on stalled cases and actual second-call GET inbox on delayed cases,
+so suppressed loader errors cannot qualify those cases. Requested additive
+sanitized observed-call metadata from the owning author for direct receipt
+review; no request payload export and no live harness actions.
