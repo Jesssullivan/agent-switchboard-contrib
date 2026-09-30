@@ -75,3 +75,10 @@ image:
 e2e:
     @echo "e2e: lands with the P1b broker MVP (ADR-0001, phase P1b exit)" >&2
     @exit 1
+
+# LAB-TAKEOVER-20260930 / TIN-4655: owned fixtures, Linux only; no live broker.
+e2e-fixtures output:
+    python3 scripts/e2e-fixtures.py --output {{ quote(output) }}
+
+e2e-fixtures-plan:
+    python3 scripts/e2e-fixtures.py --plan
