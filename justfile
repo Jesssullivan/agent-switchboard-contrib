@@ -86,3 +86,7 @@ e2e-fixtures-plan:
 # Mock-only fixture driver receipts; no compilation or endpoint.
 e2e-fixture-driver-test:
     python3 scripts/test_e2e_fixtures.py
+
+# LAB-TAKEOVER-20260930/SWB-R49: small owned Linux allocator comparison only.
+e2e-resource-diagnostic output:
+    python3 scripts/diagnose-resource-arenas.py --output {{ quote(output) }}

@@ -116,3 +116,26 @@ peer was informed. Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
 
 Pool source: https://raw.githubusercontent.com/bazelbuild/bazel/9.2.0/src/main/java/com/google/devtools/build/lib/skyframe/IncrementalPackageRoots.java
 (lines60–108).
+
+Allocator diagnosis authorized separately, not a Bazel retry. Honey glibc2.39;
+RLIMIT_NPROC898890; user cgroup pids.max593267/current558/events.max0;
+SSH scope PID maximum unlimited/current9. Observed user130processes/1072threads
+and kernel thread maximum1797781 do not show PID-limit pressure at sampling.
+These are later metadata, not historical proof of the failed JVM's limits.
+No hs_err numerical resource receipt was found. No raw environment exported.
+
+Prepared Linux-only small diagnostic compares two sequential processes:
+default glibc arena selection versus process-start MALLOC_ARENA_MAX2, oneCPU
+affinity,6GiB AS,128threads maximum,512KiB stacks, one4KiB libc malloc/free
+per thread. Owned Event release and join in finally; no deadlines or signals.
+Sequential startup/ready wait ensures each allocation completed before the
+numeric snapshot; it does not simulate JVM allocation patterns or malloc
+contention, so a difference supports mechanism plausibility rather than
+proving the earlier Bazel failure. No compilation or broker action.
+Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13; root explicitly authorized
+this tiny diagnostic only, with Bazel retry still held. Linux gate refused
+on Neo before output creation; Python syntax check passed.
+Official contract: https://sourceware.org/glibc/manual/latest/html_node/Malloc-Tunable-Parameters.html
+(M_ARENA_MAX/startup environment parameter);
+https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html
+(glibc.malloc.arena_max supersedes MALLOC_ARENA_MAX).
