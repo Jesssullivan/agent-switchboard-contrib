@@ -75,3 +75,18 @@ Source references: https://raw.githubusercontent.com/bazelbuild/bazel/9.2.0/src/
 (Bazel local_resources option, lines308–347). Java ActiveProcessorCount and
 -Xss are standard supported JVM resource options; allocation cause remains
 unproved and these settings do not raise the memory ceiling.
+
+Second actual attempt a968969 ended07:05:58Z exit33 during package loading:
+globbing-pool pthread_create returned EAGAIN. No Rust fixture ran. Bazel9.2
+PackageOptions names legacy_globbing_threads with default100, independent of
+JVM visible processors. Source correction now sets legacy_globbing_threads1
+and loading_phase_threads1 as well as action/test limits. Memory ceiling
+is unchanged. Raw receipt and bazel log copies from both attempts were
+preserved under ~/.claude/agent-notes-rescue/2026-09-30/swb-e2e-<sha>/ on Neo.
+The second clone's fresh post-attempt HEAD remained a968969 and tracked/
+untracked status was clean; failure receipt false source fields mean the
+postcheck was not reached, not established source mutation. Heavy execution
+remains held pending root's fresh release; no new attempt followed this edit.
+
+Globbing flag reference: https://raw.githubusercontent.com/bazelbuild/bazel/9.2.0/src/main/java/com/google/devtools/build/lib/pkgcache/PackageOptions.java
+(lines132–143). Supported JVM resource options: https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html
