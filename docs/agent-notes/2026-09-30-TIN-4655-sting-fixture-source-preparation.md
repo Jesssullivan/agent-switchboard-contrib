@@ -168,3 +168,26 @@ explicitx86_64-linux, registered five factory attrs plus Python/source and
 1774helper invocation match reviewed interfaces. Independent reviewer
 confirmed source mechanics; root fresh capacity/slot admission still required.
 No worker has launched at this note. Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
+
+
+## Actual managed-hook worker attempt — startup failure
+
+Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13. Owner launched exact frozen
+worker d0cb once, handle51591, after immediate09:36:52 capacity admission:
+15769016KiB available, worker-parent PSI0.00avg10/OOM0 and nonblocking lock.
+It naturally exited1 before Bash/Nix/renderer/hooks. OCI stderr verbatim:
+`exec container process `/bin/bash`: Permission denied`.
+Collector confirms exited/runningfalse/exit1/OOMfalse. hook-cases.json absent.
+No18cases, registered renderer or managed-hook result exists. No next image
+phase admission, retry, cleanup, security weakening or relabel occurred.
+Raw external output:
+`/srv/fast-local/jess/tin5148-fallback-20260930/swb-hooks-1774c17-output`.
+Neo rescue copies:
+`/Users/jess/.claude/agent-notes-rescue/2026-09-30/swb-hooks-1774c17-failed51591/`.
+
+My runtime preparation made all four copied files0444, including the dynamic
+loader. Missing executable loader permission is a concrete preparation defect
+requiring read-only diagnosis of actual Bash interpreter and file mode before
+attributing SELinux. Root assigned that diagnosis to the worker owner. This
+failure belongs to the runtime worker startup boundary, not hook product tests
+or admission-pressure refusal. Existing successful Rust9case evidence stands.
