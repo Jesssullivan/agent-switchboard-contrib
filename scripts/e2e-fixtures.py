@@ -16,7 +16,7 @@ import sys
 
 TARGETS = ["//crates/swb:swb_test", "//crates/swb-store:swb_store_test", "//crates/swb-broker:swb_broker_test"]
 EXPECTED = {
-    "crates/swb-broker:swb_broker_test": ["rmcp_streamable_http_initialize_and_tools", "conflict_is_opaque_over_rest"],
+    "crates/swb-broker:swb_broker_test": ["rmcp_streamable_http_initialize_and_tools", "conflict_is_opaque_over_rest", "owned_http_round_trip_survives_graceful_service_reopen"],
     "crates/swb:swb_test": ["explicit_broker_round_trip_and_session_identity", "stalled_resolution_worker_cannot_hold_caller", "stalled_http_read_cannot_hold_caller"],
     "crates/swb-store:swb_store_test": ["round_trip_and_opaque_conflict", "wal_survives_reopen_and_sequences_thread", "end_requires_matching_process_start"],
 }

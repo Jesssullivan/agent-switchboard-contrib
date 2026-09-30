@@ -247,3 +247,18 @@ Five mock receipt tests pass, including affinity-denied/no child/no output,
 missing real broker proof, dirty source and failed log discovery. Memory
 remains6GiB per process, not aggregate. Heavy hold unchanged.
 Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
+
+Integrated peer signed fixture chain ae9492a9 then1d33d298 after independent
+portable_image_review cleared all remainingP0–P2 and this lane read actual
+HTTP/server/SQLite code. cfg(test) fragment lives under src/ to avoid Cargo
+autodiscovery; production API stays private. Connect/write/read share finite
+absolute2s deadline and64KiB response cap. Driver requires
+tests::owned_http_round_trip_survives_graceful_service_reopen in existing
+swb_broker_test. This executes production serve_bound with owned loopback
+listeners across3graceful oneshot lifecycles and sameSQLite, synthetic
+NeoClaude→StingCodex thenCodex→StingPi reply linkage, persisted sessions,
+unacked redelivery, idempotent sequence, ack durability and next sequence.
+No live harness/native identity/PVC/pod restart or telemetry proof follows
+from this fixture. Five driver mocks pass; Rust compilation remains queued
+under root's fresh resource admission. No heavy command started.
+Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
