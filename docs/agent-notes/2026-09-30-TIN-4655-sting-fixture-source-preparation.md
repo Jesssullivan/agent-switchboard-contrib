@@ -127,3 +127,18 @@ requests on stalled cases and actual second-call GET inbox on delayed cases,
 so suppressed loader errors cannot qualify those cases. Requested additive
 sanitized observed-call metadata from the owning author for direct receipt
 review; no request payload export and no live harness actions.
+
+
+The independently cleared additive hook receipt source is now
+1774c17b8e49e2a0af6c3cd967a03c40324a53f6 (signedG;20guardtests).
+Staged four-file archive separately, preserving197:
+`/srv/fast-local/jess/tmp/swb-hook-source-1774c17.tar`, SHA256
+1acb2c4cd37248da86c7202253db7c3c62b5631af3f5484a68ed110019d36618.
+Extracted tasksourceNAR, measured by read-only nix hash path:
+sha256-IS52GMmkUtNK9l6Ml0v3gnpO8KpFs1Qyd/+qitmDtCs=.
+RunnerSHA2564e0118d434f96fbbe535936c0abc539a637ec43880b15bdcd08abd4c99575532.
+Receipt now retains request_count and method/path category only; raw request
+payload and query values are discarded. Expected18cases include12observed
+calls across positive stalled/delayed variants; this remains an expectation,
+not runtime success. Factory/renderer/flake.lock unchanged. Authority remains
+LAB-TAKEOVER-20260930/SWB-R49/R-N13; no worker launched during staging.
