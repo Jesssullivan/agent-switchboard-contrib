@@ -36,30 +36,33 @@ class ReceiptTests(unittest.TestCase):
                     return str(logs) + "\n"
                 raise AssertionError(command)
             output = base / "receipt"
-            with patch.object(sys, "argv", ["e2e", "--output", str(output)]), patch.object(e2e.platform, "system", return_value="Linux"), patch.object(e2e.resource, "getrlimit", return_value=(e2e.resource.RLIM_INFINITY, e2e.resource.RLIM_INFINITY)), patch.object(e2e.resource, "setrlimit"), patch.object(e2e.subprocess, "check_output", side_effect=check_output), patch.object(e2e.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(io.StringIO()):
+            with patch.dict(e2e.os.environ, {"MALLOC_ARENA_MAX": "256", "GLIBC_TUNABLES": "glibc.malloc.arena_max=256"}), patch.object(sys, "argv", ["e2e", "--output", str(output)]), patch.object(e2e.platform, "system", return_value="Linux"), patch.object(e2e.resource, "getrlimit", return_value=(e2e.resource.RLIM_INFINITY, e2e.resource.RLIM_INFINITY)), patch.object(e2e.resource, "setrlimit"), patch.object(e2e.subprocess, "check_output", side_effect=check_output), patch.object(e2e.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, contextlib.redirect_stdout(io.StringIO()):
                 result = e2e.main()
-            return result, json.loads((output / "receipt.json").read_text())
+            return result, json.loads((output / "receipt.json").read_text()), run.call_args.kwargs["env"]
 
     def test_complete_clean_source_passes(self):
-        code, receipt = self.exercise()
+        code, receipt, env = self.exercise()
         self.assertEqual(code, 0)
         self.assertTrue(receipt["source_clean"])
         self.assertEqual(receipt["memory_limit_bytes_per_process"], 6 * 1024**3)
         self.assertFalse(receipt["live_acceptance"])
+        self.assertEqual(receipt["glibc_malloc_arena_max"], 2)
+        self.assertEqual(env["MALLOC_ARENA_MAX"], "2")
+        self.assertNotIn("GLIBC_TUNABLES", env)
         self.assertIn("--local_resources=cpu=1", receipt["command"])
         self.assertIn("--legacy_globbing_threads=1", receipt["command"])
         self.assertIn("--loading_phase_threads=1", receipt["command"])
         self.assertIn("--host_jvm_args=-XX:ActiveProcessorCount=1", receipt["command"])
 
     def test_same_head_dirty_source_refuses(self):
-        code, receipt = self.exercise(dirty=True)
+        code, receipt, env = self.exercise(dirty=True)
         self.assertEqual(code, 1)
         self.assertTrue(receipt["source_unchanged"])
         self.assertFalse(receipt["source_clean"])
         self.assertEqual(receipt["verdict"], "failed")
 
     def test_log_discovery_failure_preserves_failed_receipt(self):
-        code, receipt = self.exercise(info_error=True)
+        code, receipt, env = self.exercise(info_error=True)
         self.assertEqual(code, 1)
         self.assertEqual(receipt["exit_code"], 0)
         self.assertEqual(receipt["verdict"], "failed")

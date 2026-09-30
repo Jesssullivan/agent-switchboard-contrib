@@ -139,3 +139,21 @@ Official contract: https://sourceware.org/glibc/manual/latest/html_node/Malloc-T
 (M_ARENA_MAX/startup environment parameter);
 https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html
 (glibc.malloc.arena_max supersedes MALLOC_ARENA_MAX).
+
+Owned allocator comparison exact5739ef1885c5454d11b5cf7530bd38dd3d9daed5
+completed naturally07:25:27Z, parent and both children exit0,128requested and
+128created threads each,129total live threads, zero allocation failures.
+Default VmSize/VmPeak6276948kB and RSS19612kB; arena2 VmSize/VmPeak378228kB
+and RSS18920kB. This confirms a large virtual reservation difference in
+this fixture. It neither proves historical JVM causality nor rules out
+transient historical PID or other pressure. Receipt preserved under
+~/.claude/agent-notes-rescue/2026-09-30/swb-allocator-5739ef1-20260930.json.
+
+Meaningful runner resource correction now sets task-child MALLOC_ARENA_MAX2
+and removes ambient GLIBC_TUNABLES so an inherited arena override cannot
+weaken it. No host-wide environment change; AS6GiB/JVM512MiB/oneCPU limits
+remain unchanged. Mock acceptance includes inherited256arena/tunable override
+and confirms fixed2 bound; the three driver regression cases pass. No Bazel
+retry is part of this mutation or diagnostic; fresh root capacity admission
+is required before another heavy launch. Authority LAB-TAKEOVER-20260930/
+SWB-R49/R-N13.

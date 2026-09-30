@@ -51,7 +51,12 @@ def main():
     resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
     plan["memory_limit_bytes_per_process"] = memory_limit
     plan["jvm_heap_limit_mib"] = 512
+    plan["glibc_malloc_arena_max"] = 2
     env = dict(os.environ)
+    # Fixed internal Bazel pools can reserve many glibc arenas despite jobs=1.
+    # Scope this bound to task children; ambient tunables must not override it.
+    env.pop("GLIBC_TUNABLES", None)
+    env["MALLOC_ARENA_MAX"] = "2"
     for key in list(env):
         if key.startswith("SWB_") or key in {"CARGO_BAZEL_DEBUG", "CARGO_BAZEL_GENERATOR_SHA256", "CARGO_BAZEL_GENERATOR_URL", "CARGO_BAZEL_ISOLATED", "CARGO_BAZEL_REPIN", "CARGO_BAZEL_REPIN_ONLY", "CARGO_BAZEL_TIMEOUT", "REPIN"}:
             env.pop(key)
