@@ -90,3 +90,29 @@ remains held pending root's fresh release; no new attempt followed this edit.
 
 Globbing flag reference: https://raw.githubusercontent.com/bazelbuild/bazel/9.2.0/src/main/java/com/google/devtools/build/lib/pkgcache/PackageOptions.java
 (lines132–143). Supported JVM resource options: https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html
+
+Third actual attempt exact51ba55875db77afc4d64d33a2910177d0c263681
+started07:12:55Z after root health clearance and ended naturally07:13:25Z
+exit33. Analysis reached322packages/10061targets, then native thread creation
+failed at Non-eager Symlink planter50. No Rust fixture executed. Official
+Bazel9.2 IncrementalPackageRoots has fixed symlink parallelism200, so the
+globbing/loading limits did not bound this separate pool. No further heavy
+execution is authorized pending root capacity decision.
+
+Admission lapse: the fresh probe immediately before this third launch showed
+load52.67/38.68/32.24, CPU PSI some40.87%, full0%, available memory101872184kB,
+materially changed from root's earlier healthy sample. I launched instead of
+pausing for the changed pressure. Root was notified promptly. Future launches
+must evaluate the fresh probe as a separate conditional decision before
+spawning, and pause when it exceeds the admitted envelope. No signals,
+deadlines, shared-server intervention, or live harness action occurred.
+
+Third raw receipt/log preserved in the same durable rescue tree under
+swb-e2e-51ba558; logSHA256
+528f9f00aeeae57dbf81942e7184ec355241352065f3d953b6c3e65dcb157260.
+Fresh post-run tracked/untracked status was clean. Tool handle12594 ended
+naturally and the shared heavy lock was released; the queued devcontainer
+peer was informed. Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
+
+Pool source: https://raw.githubusercontent.com/bazelbuild/bazel/9.2.0/src/main/java/com/google/devtools/build/lib/skyframe/IncrementalPackageRoots.java
+(lines60–108).
