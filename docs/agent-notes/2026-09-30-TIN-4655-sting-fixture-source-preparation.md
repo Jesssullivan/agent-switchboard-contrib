@@ -52,3 +52,29 @@ and the shared host heavy lock. No deadline or signal controls a process;
 owned socket deadlines are local I/O bounds. Root must supply the Sting lock
 path and reserve the slot before execution; the prepared checkout alone is
 not admission.
+
+## Revised executable snapshot and exact-source review correction
+
+Root subsequently authorized including existing //crates/swb:swb in the same
+invocation to supply the actual managed-hook artifact without duplicate
+compilation. Prepared executable snapshot is now signed
+24c03ab90cfe6139531c58c93084192e33a7e228, with clean detached Sting checkout
+`/srv/fast-local/jess/tmp/swb-e2e-source-24c03ab-20260930`.
+The adjacent Git bundle and Neo durable rescue copy agree on SHA256
+ec2a66f3e8cc98dbf0b94dcc50b4af262847a3d328ed5391cabd10e4e4f96c4d.
+The older5ce2ab4 preparation above remains historical, not the queued snapshot.
+Driver copies the successful compiled executable into external
+`artifacts/swb`, verifies ELF/executable status, applies0500 permissions and
+records exact artifact/source hashes. Permissions are not a sameUID security
+barrier; the hash is the acceptance binding. No binary exists yet.
+
+An inner-hook-only read led me to incorrectly report a missing invocation-wide
+hook deadline. I promptly retracted that false positive after reading main
+and the peer's exact-source check: main.rs256–266 already wraps the entire
+hook in bounded(HOOK_LIMIT1800ms), covering stdin and both broker calls.
+Individual calls use LIMIT1500ms. No Rust source was changed. The managed-hook
+peer is adding delayed-register followed by stalled-inbox cases to verify
+that existing outer boundary through actual rendered hooks; this is acceptance
+coverage, not a duplicate product fix. Root received the correction before
+any corresponding source or runtime action. Source/build remains inert under
+the existing capacity hold. Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
