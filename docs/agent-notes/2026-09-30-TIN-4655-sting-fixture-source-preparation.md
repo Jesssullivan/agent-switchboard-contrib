@@ -142,3 +142,29 @@ payload and query values are discarded. Expected18cases include12observed
 calls across positive stalled/delayed variants; this remains an expectation,
 not runtime success. Factory/renderer/flake.lock unchanged. Authority remains
 LAB-TAKEOVER-20260930/SWB-R49/R-N13; no worker launched during staging.
+
+
+## Published-source comparison and frozen renderer review
+
+Root-requested read-only comparison of published candidate
+b5158729355e836a3a98ade90d7649690e7a6900 against tested24c shows no production
+Rust logic, lockfile, module/toolchain or image input changes. The broker
+lib only adds cfg(test) include of the owned service fixture; BUILDsrcs adds
+that fragment. Remaining diffs are just/driver/tests/docs. Exact unchanged
+main.rs blob2bacb49cd67d7f363a585409b3e0606ca12d3804,
+Cargo.lockc85f7bd667c37b37ebfd01b6996c6c59157a01fd,
+MODULE.bazel.lockf29665cc063544c93ca64df6b88d829e0ae2fb52.
+Production source semantics therefore match, while artifact digest/image
+publication and deployment equivalence are not established by this source
+comparison. Exact24c compiled receipt must not be relabelled published-image
+or live acceptance evidence.
+
+Reviewed frozen worker script d0cbe0012c01e8482a02a567f9f9ba38235f5ffb78f196c52e0f430d9f4053ae
+at /Users/jess/tmp/tin5148-qualified-f247ea3/sting-hooks-1774.REVIEW.sh.
+Earlier version flag and missing runtime hash checks corrected: version
+subcommand now matches exactsource; four runtimefiles hashchecked both before
+launch and inside readonly mounts. Source/binary NAR sealing, pinnedNixpkgs,
+explicitx86_64-linux, registered five factory attrs plus Python/source and
+1774helper invocation match reviewed interfaces. Independent reviewer
+confirmed source mechanics; root fresh capacity/slot admission still required.
+No worker has launched at this note. Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
