@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import resource
 import subprocess
 import sys
 
@@ -26,7 +27,9 @@ def main():
     a = p.parse_args()
     repo = Path(__file__).resolve().parents[1]
     sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-    command = ["bazelisk", "--ignore_all_rc_files", "test", "--lockfile_mode=error", "--jobs=1", "--local_cpu_resources=1", "--local_test_jobs=1", "--test_output=all", "--test_arg=--test-threads=1", *TARGETS]
+    output_base = str(a.output.resolve() / "bazel-output-base") if a.output else "<run-output>/bazel-output-base"
+    startup = ["bazelisk", "--batch", "--ignore_all_rc_files", "--host_jvm_args=-Xmx512m", "--output_base=" + output_base]
+    command = [*startup, "test", "--lockfile_mode=error", "--jobs=1", "--local_cpu_resources=1", "--local_test_jobs=1", "--test_output=all", "--test_arg=--test-threads=1", *TARGETS]
     plan = {"schema": "swb.owned-fixture-receipt.v1", "source_sha": sha, "command": command, "expected_cases": EXPECTED, "qualification": "owned-fixtures-only", "live_acceptance": False, "process_actions": False, "rulings": ["LAB-TAKEOVER-20260930", "TIN-4655", "SWB-R49", "R-N13"]}
     if a.plan:
         print(json.dumps(plan, indent=2, sort_keys=True))
@@ -41,24 +44,36 @@ def main():
     if output == repo or repo in output.parents:
         p.error("receipt output must be outside source")
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
+    memory_limit = 6 * 1024 ** 3
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if hard != resource.RLIM_INFINITY:
+        memory_limit = min(memory_limit, hard)
+    resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+    plan["memory_limit_bytes_per_process"] = memory_limit
+    plan["jvm_heap_limit_mib"] = 512
     env = dict(os.environ)
     for key in list(env):
         if key.startswith("SWB_") or key in {"CARGO_BAZEL_DEBUG", "CARGO_BAZEL_GENERATOR_SHA256", "CARGO_BAZEL_GENERATOR_URL", "CARGO_BAZEL_ISOLATED", "CARGO_BAZEL_REPIN", "CARGO_BAZEL_REPIN_ONLY", "CARGO_BAZEL_TIMEOUT", "REPIN"}:
             env.pop(key)
     plan["started_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    with (output / "bazel.log").open("x") as log:
-        result = subprocess.run(command, cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
-    # Fresh case readback prevents a cached/empty target from masquerading as
-    # the requested owned-fixture proof. These are Rust harness test logs.
-    testlogs = Path(subprocess.check_output(["bazelisk", "--ignore_all_rc_files", "info", "bazel-testlogs"], cwd=repo, env=env, text=True).strip())
-    cases = {}
-    for target, names in EXPECTED.items():
-        logpath = testlogs / target.replace(":", "/") / "test.log"
-        text = logpath.read_text() if logpath.is_file() else ""
-        cases[target] = {name: f"test tests::{name} ... ok" in text for name in names}
-    plan.update(exit_code=result.returncode, cases=cases, finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
-    plan["source_unchanged"] = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == sha
-    plan["verdict"] = "passed" if result.returncode == 0 and plan["source_unchanged"] and all(all(items.values()) for items in cases.values()) else "failed"
+    plan.update(exit_code=None, cases={}, source_unchanged=False, source_clean=False, verdict="failed")
+    try:
+        with (output / "bazel.log").open("x") as log:
+            result = subprocess.run(command, cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
+        plan["exit_code"] = result.returncode
+        # Batch info uses no persistent server and no process lifecycle action.
+        testlogs = Path(subprocess.check_output([*startup, "info", "bazel-testlogs"], cwd=repo, env=env, text=True).strip())
+        for target, names in EXPECTED.items():
+            logpath = testlogs / target.replace(":", "/") / "test.log"
+            text = logpath.read_text() if logpath.is_file() else ""
+            plan["cases"][target] = {name: f"test tests::{name} ... ok" in text for name in names}
+        plan["source_unchanged"] = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == sha
+        plan["source_clean"] = not subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"], text=True).strip()
+        if result.returncode == 0 and plan["source_unchanged"] and plan["source_clean"] and all(all(items.values()) for items in plan["cases"].values()):
+            plan["verdict"] = "passed"
+    except (OSError, subprocess.CalledProcessError) as exc:
+        plan["error"] = str(exc)
+    plan["finished_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     plan["bazel_log_sha256"] = hashlib.sha256((output / "bazel.log").read_bytes()).hexdigest()
     (output / "receipt.json").write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n")
     print(json.dumps(plan, sort_keys=True))

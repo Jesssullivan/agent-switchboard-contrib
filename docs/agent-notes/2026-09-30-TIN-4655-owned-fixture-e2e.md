@@ -46,3 +46,12 @@ Honey heavy admission was held by root at 06:46Z (load31/32cores); Sting's
 heavy slot is occupied. Executed Rust-fixture receipt remains pending a
 separately approved slot. The fixture driver is ready to run on exact signed
 source, not reported as a fixture pass.
+
+Root review follow-up (LAB-TAKEOVER-20260930/R-N13): post-run tracked and
+untracked source cleanliness is required even when HEAD remains identical.
+Bazel testlog-discovery errors now retain a failed receipt. Three mock cases
+cover clean completion, same-HEAD source dirt and testlog-query failure; all
+pass without builds. Every execution lowers its inherited per-process address
+space limit to at most 6 GiB; the unique run output-base uses batch mode and a
+512 MiB JVM heap, avoiding any shared server. These are per-process bounds,
+not an aggregate cgroup limit. One-job/one-CPU execution remains owner-admitted.

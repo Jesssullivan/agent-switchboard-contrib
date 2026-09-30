@@ -82,3 +82,7 @@ e2e-fixtures output:
 
 e2e-fixtures-plan:
     python3 scripts/e2e-fixtures.py --plan
+
+# Mock-only fixture driver receipts; no compilation or endpoint.
+e2e-fixture-driver-test:
+    python3 scripts/test_e2e_fixtures.py
