@@ -11,14 +11,34 @@ async fn fixture_http(
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Write};
-        let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let remaining = || {
+            deadline.checked_duration_since(std::time::Instant::now())
+                .filter(|value| !value.is_zero())
+                .expect("owned HTTP absolute deadline exceeded")
+        };
+        let mut stream = std::net::TcpStream::connect_timeout(&address, remaining())
             .expect("owned broker connection");
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
         let body = body.map(|value| value.to_string()).unwrap_or_default();
-        write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let mut pending = request.as_bytes();
+        while !pending.is_empty() {
+            stream.set_write_timeout(Some(remaining())).unwrap();
+            let count = stream.write(pending).unwrap();
+            assert!(count > 0, "owned HTTP request write stalled");
+            pending = &pending[count..];
+        }
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
+        loop {
+            stream.set_read_timeout(Some(remaining())).unwrap();
+            let mut chunk = [0u8; 4096];
+            let count = stream.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            assert!(response.len() + count <= 65536, "owned HTTP response exceeds 64 KiB");
+            response.extend_from_slice(&chunk[..count]);
+        }
         let split = response.windows(4).position(|value| value == b"\r\n\r\n").unwrap();
         let header = std::str::from_utf8(&response[..split]).unwrap();
         assert!(header.starts_with("HTTP/1.1 200"), "{header}");
@@ -63,17 +83,17 @@ async fn owned_http_round_trip_survives_graceful_service_reopen() {
             .unwrap()
             .as_nanos()
     ));
-    let from = "claude:honey:1001:owned-source";
-    let to = "pi:sting:1002:owned-target";
-    let codex = "codex:honey:1003:owned-codex";
+    let from = "claude:macbook-neo:1001:owned-source";
+    let to = "codex:sting:1002:owned-target";
+    let pi = "pi:sting:1003:owned-pi";
     let thread = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     let first_id = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
     let second_id = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
     let (address, done, server) = fixture_service(&path).await;
     for (harness, host, pid, session, expected) in [
-        ("claude", "honey", 1001, "owned-source", from),
-        ("pi", "sting", 1002, "owned-target", to),
-        ("codex", "honey", 1003, "owned-codex", codex),
+        ("claude", "macbook-neo", 1001, "owned-source", from),
+        ("codex", "sting", 1002, "owned-target", to),
+        ("pi", "sting", 1003, "owned-pi", pi),
     ] {
         let result = fixture_http(
             address,
@@ -128,12 +148,13 @@ async fn owned_http_round_trip_survives_graceful_service_reopen() {
         "POST",
         "/v1/send",
         Some(json!({
-            "from":codex,"to":to,"ticket":"none","body":"next",
-            "thread_id":thread,"msg_id":second_id
+            "from":to,"to":pi,"ticket":"none","body":"reply",
+            "thread_id":thread,"msg_id":second_id,"in_reply_to":first_id
         })),
     )
     .await;
     assert_eq!(next["seq"], 2);
+    assert_eq!(next["in_reply_to"], first_id);
     done.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), server)
         .await
@@ -143,11 +164,16 @@ async fn owned_http_round_trip_survives_graceful_service_reopen() {
 
     // Prove ack state and sequence remain durable through another reopen.
     let (address, done, server) = fixture_service(&path).await;
-    let final_inbox = fixture_http(address, "GET", &inbox_path, None).await;
+    let codex_empty = fixture_http(address, "GET", &inbox_path, None).await;
+    assert!(codex_empty["messages"].as_array().unwrap().is_empty());
+    let final_inbox = fixture_http(address, "GET", &format!("/v1/inbox?me={pi}"), None).await;
     let messages = final_inbox["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["msg_id"], second_id);
     assert_eq!(messages[0]["seq"], 2);
+    assert_eq!(messages[0]["in_reply_to"], first_id);
+    assert_eq!(messages[0]["from"], to);
+    assert_eq!(messages[0]["to"], pi);
     done.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), server)
         .await
