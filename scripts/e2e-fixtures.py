@@ -44,6 +44,18 @@ def main():
     output = a.output.resolve()
     if output == repo or repo in output.parents:
         p.error("receipt output must be outside source")
+    try:
+        allowed_cpus = os.sched_getaffinity(0)
+        if not allowed_cpus:
+            raise RuntimeError("empty allowed CPU set")
+        selected_cpu = min(allowed_cpus)
+        os.sched_setaffinity(0, {selected_cpu})
+        admitted_cpus = os.sched_getaffinity(0)
+        if admitted_cpus != {selected_cpu} or not admitted_cpus.issubset(allowed_cpus):
+            raise RuntimeError("single allowed CPU affinity readback mismatch")
+    except (OSError, RuntimeError) as exc:
+        p.error(f"owned CPU affinity admission failed: {exc}")
+    plan["cpu_affinity"] = sorted(admitted_cpus)
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
     memory_limit = 6 * 1024 ** 3
     soft, hard = resource.getrlimit(resource.RLIMIT_AS)

@@ -233,3 +233,17 @@ arena2 JVM/action/host-action/test environments, clean signed exact source,
 private batch outputbase and shared heavy lock. It will include the real
 broker tests plus the peer's owned wire/SQLite lifecycle fixture after
 independent source review. Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
+
+CPU bound precision correction: Bazel local_resources/jobs and JVM visibleCPU
+flags are scheduler inputs, not a strict compiler affinity limit. Root
+authorized task-local inherited singleCPU affinity to make the proposed
+<=oneCPU bound concrete. Driver selects one CPU from its existing nonempty
+allowed set, sets only its own affinity, then verifies exact singleCPU
+readback is a subset of original permissions before output creation or
+child launch. Failure produces a clear admission error and no Bazel/output.
+No host-wide change or signal. Earlier attempts used scheduler inputs only;
+this correction does not relabel their historical bounds as strict affinity.
+Five mock receipt tests pass, including affinity-denied/no child/no output,
+missing real broker proof, dirty source and failed log discovery. Memory
+remains6GiB per process, not aggregate. Heavy hold unchanged.
+Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
