@@ -23,6 +23,11 @@ class ReceiptTests(unittest.TestCase):
                 path = logs / target.replace(":", "/") / "test.log"
                 path.parent.mkdir(parents=True)
                 path.write_text("" if broker_missing and "swb-broker" in target else "\n".join(f"test tests::{name} ... ok" for name in names))
+            bindir = base / "bin"
+            binary = bindir / "crates/swb/swb"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"\x7fELFmock-owned-binary")
+            binary.chmod(0o700)
             status_calls = [0]
             def check_output(command, **kwargs):
                 if "rev-parse" in command:
@@ -34,6 +39,8 @@ class ReceiptTests(unittest.TestCase):
                     if info_error:
                         raise subprocess.CalledProcessError(7, command)
                     return str(logs) + "\n"
+                if "bazel-bin" in command:
+                    return str(bindir) + "\n"
                 raise AssertionError(command)
             output = base / "receipt"
             with patch.dict(e2e.os.environ, {"MALLOC_ARENA_MAX": "256", "GLIBC_TUNABLES": "glibc.malloc.arena_max=256"}), patch.object(sys, "argv", ["e2e", "--output", str(output)]), patch.object(e2e.platform, "system", return_value="Linux"), patch.object(e2e.resource, "getrlimit", return_value=(e2e.resource.RLIM_INFINITY, e2e.resource.RLIM_INFINITY)), patch.object(e2e.resource, "setrlimit"), patch.object(e2e.os, "sched_getaffinity", side_effect=[{12, 13}, {12}], create=True), patch.object(e2e.os, "sched_setaffinity", side_effect=OSError("fixture affinity denial") if affinity_error else None, create=True) as affinity, patch.object(e2e.subprocess, "check_output", side_effect=check_output), patch.object(e2e.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
@@ -66,6 +73,10 @@ class ReceiptTests(unittest.TestCase):
         self.assertIn("--test_env=MALLOC_ARENA_MAX=2", receipt["command"])
         self.assertIn("--host_action_env=MALLOC_ARENA_MAX=2", receipt["command"])
         self.assertIn("//crates/swb-broker:swb_broker_test", receipt["command"])
+        self.assertIn("//crates/swb:swb", receipt["command"])
+        self.assertEqual(receipt["compiled_binary"]["source_sha"], receipt["source_sha"])
+        self.assertEqual(receipt["compiled_binary"]["mode"], "0500")
+        self.assertEqual(receipt["compiled_binary"]["target"], "//crates/swb:swb")
         self.assertTrue(receipt["cases"]["crates/swb-broker:swb_broker_test"]["rmcp_streamable_http_initialize_and_tools"])
         self.assertIn("--host_jvm_args=-XX:ActiveProcessorCount=1", receipt["command"])
 

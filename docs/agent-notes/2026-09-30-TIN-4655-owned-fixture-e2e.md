@@ -262,3 +262,15 @@ No live harness/native identity/PVC/pod restart or telemetry proof follows
 from this fixture. Five driver mocks pass; Rust compilation remains queued
 under root's fresh resource admission. No heavy command started.
 Authority LAB-TAKEOVER-20260930/SWB-R49/R-N13.
+
+Root authorized adding existing //crates/swb:swb executable to the same
+Bazel invocation so actual managed-hook acceptance can reuse the compiled
+source without a duplicate build. Driver verifies regular executable ELF,
+copies it into owned external receipt artifacts/swb, freezes artifact/file
+permissions0500, and records sourceSHA,target,originalBazelpath,copySHA256.
+This is hash-bound owner-readable/executable output, not a sameUID security
+barrier or a Nix closure/signature admission claim. Nine required Rustcases
+and source cleanliness still govern qualification. Source changes only; no
+compiler launch. Hook peer receives the copied artifact path and hash only
+after actual owned execution passes. Authority LAB-TAKEOVER-20260930/
+SWB-R49/R-N13.

@@ -11,10 +11,11 @@ import os
 from pathlib import Path
 import platform
 import resource
+import shutil
 import subprocess
 import sys
 
-TARGETS = ["//crates/swb:swb_test", "//crates/swb-store:swb_store_test", "//crates/swb-broker:swb_broker_test"]
+TARGETS = ["//crates/swb:swb_test", "//crates/swb-store:swb_store_test", "//crates/swb-broker:swb_broker_test", "//crates/swb:swb"]
 EXPECTED = {
     "crates/swb-broker:swb_broker_test": ["rmcp_streamable_http_initialize_and_tools", "conflict_is_opaque_over_rest", "owned_http_round_trip_survives_graceful_service_reopen"],
     "crates/swb:swb_test": ["explicit_broker_round_trip_and_session_identity", "stalled_resolution_worker_cannot_hold_caller", "stalled_http_read_cannot_hold_caller"],
@@ -83,6 +84,28 @@ def main():
             raise subprocess.CalledProcessError(result.returncode, command)
         # Batch info uses no persistent server and no process lifecycle action.
         testlogs = Path(subprocess.check_output([*startup, "info", "bazel-testlogs"], cwd=repo, env=env, text=True).strip())
+        bindir = Path(subprocess.check_output([*startup, "info", "bazel-bin"], cwd=repo, env=env, text=True).strip())
+        binary = bindir / "crates/swb/swb"
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise OSError("required compiled swb executable is missing")
+        with binary.open("rb") as compiled:
+            if compiled.read(4) != b"\x7fELF":
+                raise OSError("required compiled swb executable is not ELF")
+        artifacts = output / "artifacts"
+        artifacts.mkdir(mode=0o700)
+        admitted_binary = artifacts / "swb"
+        shutil.copyfile(binary, admitted_binary)
+        admitted_binary.chmod(0o500)
+        artifacts.chmod(0o500)
+        plan["compiled_binary"] = {
+            "path": str(admitted_binary),
+            "sha256": hashlib.sha256(admitted_binary.read_bytes()).hexdigest(),
+            "source_sha": sha,
+            "target": "//crates/swb:swb",
+            "format": "ELF",
+            "mode": "0500",
+            "original_bazel_path": str(binary.resolve()),
+        }
         for target, names in EXPECTED.items():
             logpath = testlogs / target.replace(":", "/") / "test.log"
             text = logpath.read_text() if logpath.is_file() else ""
