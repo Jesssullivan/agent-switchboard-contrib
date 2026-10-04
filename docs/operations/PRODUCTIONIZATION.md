@@ -72,6 +72,18 @@ cover a different image.
   then v0.1.0 ships the clock-seam image. SWB-R53 is never published. Until
   the successor record lands, merging this change makes `release-check`
   fail against SWB-R53, so it merges together with that record.
+- **Build determinism (R-C268).** SWB-R53 `b0633ecb` cannot be rebuilt:
+  libsqlite3-sys compiles SQLite with `-g`, and gcc recorded the build
+  script's sandbox directory (output-base hash plus sandbox counter) in the
+  debug info, which rules_rust does not remap. `//crates/swb:swb` now links
+  with `-Cstrip=debuginfo`, and `//deploy:swb_checked` refuses a binary that
+  contains `/execroot/`, `/sandbox/` or `/nix/store/` (a Nix C compiler from
+  `nix develop` leaking into rules_cc). The image carries
+  `org.opencontainers.image.source` and an `org.opencontainers.image.revision`
+  label from `--embed_label=<sha>` (`just image` passes HEAD; without it the
+  value is `unstamped`). Build the release image outside `nix develop`, or
+  from a `mkShellNoCC` shell. These change the protected inputs; the file set
+  stays at 27 paths.
 - **Ruling ID: SWB-R55.** R-C262 and R-C268 named the successor release
   `SWB-R54`, but ADR-0001 already uses SWB-R54 for state custody
   (2026-09-27). R-C274 (operator interview 2026-10-04, TIN-4655 comment
