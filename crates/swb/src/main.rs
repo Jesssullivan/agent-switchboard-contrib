@@ -395,66 +395,128 @@ fn fail(detail: impl Into<String>, fix: impl Into<String>) -> Check {
     }
 }
 
-/// The identity `register` would mint, from the hook variables alone.
-fn predicted_identity(lookup: Lookup) -> Result<(Value, String), Check> {
-    let missing = [
-        "SWB_HARNESS",
-        "SWB_HOST",
-        "SWB_SESSION_PID",
-        "SWB_PROC_START",
-        "SWB_SESSION_ID",
-    ]
-    .into_iter()
-    .filter(|name| need(lookup, name).is_err())
-    .collect::<Vec<_>>();
+/// The launcher-exported variables (R-C273). Harness and session are not in
+/// this list: a harness hook supplies its own session id at SessionStart, so
+/// a freshly launched session legitimately has neither yet.
+const LAUNCHER_VARS: [&str; 3] = ["SWB_HOST", "SWB_SESSION_PID", "SWB_PROC_START"];
+
+/// Where `swb whoami` users and send/ack/inbox callers get their agent id.
+const AGENT_ID_FIX: &str = "export SWB_AGENT_ID as the agent_id the broker returned at register \
+     (`swb whoami` with SWB_HARNESS and SWB_SESSION_ID set, or this host:pid row in `swb peers`)";
+
+/// What doctor can predict about this session's identity.
+#[derive(Debug)]
+enum Identity {
+    /// Every part is known: the exact `register` payload and the agent id
+    /// the broker would mint.
+    Full { payload: Value, agent_id: String },
+    /// The launcher variables are valid, but the harness or session id is
+    /// not known yet; the harness hook supplies them when it registers.
+    Partial {
+        prefix: String,
+        unknown: Vec<&'static str>,
+    },
+}
+
+/// A valid `SWB_AGENT_ID`, split into (harness, host, pid, session).
+fn agent_id_parts(lookup: Lookup) -> Option<[String; 4]> {
+    let me = lookup("SWB_AGENT_ID").filter(|v| valid_agent_id(v))?;
+    let parts: Vec<String> = me.split(':').map(str::to_owned).collect();
+    parts.try_into().ok()
+}
+
+/// The identity `register` would mint. `SWB_HOST`, `SWB_SESSION_PID` and
+/// `SWB_PROC_START` are required (the R-C273 launchers export them).
+/// `SWB_HARNESS` falls back to the kind in a valid `SWB_AGENT_ID`, and
+/// `SWB_SESSION_ID` falls back to its session part; when neither source has
+/// them the identity is partial, which is not a failure.
+fn predicted_identity(lookup: Lookup) -> Result<Identity, Check> {
+    let missing = LAUNCHER_VARS
+        .into_iter()
+        .filter(|name| need(lookup, name).is_err())
+        .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(fail(
             format!("unset: {}", missing.join(", ")),
             "the lab harness launcher exports these (R-C273); enable tinyland.switchboard \
-             or export them from the launcher, never by walking process ancestry",
+             or start the harness through its lab launcher, never by walking process ancestry",
         ));
     }
     let get = |name: &str| need(lookup, name).unwrap_or_default();
-    let (harness, host, pid, proc_start, session) = (
-        get("SWB_HARNESS"),
+    let (host, pid, proc_start) = (
         get("SWB_HOST"),
         get("SWB_SESSION_PID"),
         get("SWB_PROC_START"),
-        get("SWB_SESSION_ID"),
     );
-    if !HARNESSES.contains(&harness.as_str()) {
-        return Err(fail(
-            format!("SWB_HARNESS={harness:?} is not a known harness"),
-            format!("set SWB_HARNESS to one of {}", HARNESSES.join(", ")),
-        ));
-    }
+    let from_id = agent_id_parts(lookup);
+    let harness = match need(lookup, "SWB_HARNESS") {
+        Ok(h) => {
+            if !HARNESSES.contains(&h.as_str()) {
+                return Err(fail(
+                    format!("SWB_HARNESS={h:?} is not a known harness"),
+                    format!(
+                        "set SWB_HARNESS to one of {}, or unset it to take the kind from SWB_AGENT_ID",
+                        HARNESSES.join(", ")
+                    ),
+                ));
+            }
+            Some(h)
+        }
+        Err(_) => from_id.as_ref().map(|p| p[0].clone()),
+    };
+    let session = match need(lookup, "SWB_SESSION_ID") {
+        Ok(s) => {
+            if !valid_part(&s) {
+                return Err(fail(
+                    "SWB_SESSION_ID has characters outside [A-Za-z0-9._-]",
+                    "set SWB_SESSION_ID to the harness's own session id, or unset it",
+                ));
+            }
+            Some(s)
+        }
+        Err(_) => from_id.as_ref().map(|p| p[3].clone()),
+    };
     let pid_num = pid.parse::<u32>().ok().filter(|p| *p > 0);
     let Some(pid_num) = pid_num else {
         return Err(fail(
             format!("SWB_SESSION_PID={pid:?} is not a positive integer"),
-            "export the launcher's own $$ before it execs the harness",
+            "the launcher exports its own $$ before it execs the harness; start the \
+             harness through its lab launcher (R-C273)",
         ));
     };
-    for (name, value) in [("SWB_HOST", &host), ("SWB_SESSION_ID", &session)] {
-        if !valid_part(value) {
-            return Err(fail(
-                format!("{name} has characters outside [A-Za-z0-9._-]"),
-                format!("use the short host or session name for {name}"),
-            ));
-        }
+    if !valid_part(&host) {
+        return Err(fail(
+            "SWB_HOST has characters outside [A-Za-z0-9._-]",
+            "the launcher exports the short host name; check SWB_HOST in the launcher (R-C273)",
+        ));
     }
+    let (Some(harness), Some(session)) = (harness.clone(), session.clone()) else {
+        let mut unknown = Vec::new();
+        if harness.is_none() {
+            unknown.push("harness");
+        }
+        if session.is_none() {
+            unknown.push("session id");
+        }
+        let kind = harness.unwrap_or_else(|| "<harness>".into());
+        let tail = session.unwrap_or_else(|| "<session>".into());
+        return Ok(Identity::Partial {
+            prefix: format!("{kind}:{host}:{pid}:{tail}"),
+            unknown,
+        });
+    };
     let agent_id = format!("{harness}:{host}:{pid}:{session}");
     if !valid_agent_id(&agent_id) {
         return Err(fail(
             "derived agent id is invalid or over 512 bytes",
-            "shorten SWB_HOST or SWB_SESSION_ID",
+            "shorten SWB_HOST or the session id",
         ));
     }
     let payload = json!({
         "harness":harness, "host":host, "pid":pid_num,
         "session_id":session, "proc_start":proc_start
     });
-    Ok((payload, agent_id))
+    Ok(Identity::Full { payload, agent_id })
 }
 
 fn http_get_text(name: &str, url: &str, path: &str) -> Result<(u16, String), String> {
@@ -491,7 +553,13 @@ fn doctor_checks(lookup: Lookup, live_register: bool) -> Vec<(&'static str, Chec
     checks.push((
         "env identity",
         match &identity {
-            Ok((_, id)) => Check::Ok(format!("would register as {id}")),
+            Ok(Identity::Full { agent_id, .. }) => {
+                Check::Ok(format!("would register as {agent_id}"))
+            }
+            Ok(Identity::Partial { prefix, unknown }) => Check::Ok(format!(
+                "launcher identity present ({prefix}); {} supplied by the harness hook at register",
+                unknown.join(" and ")
+            )),
             Err(Check::Fail { detail, fix }) => fail(detail.clone(), fix.clone()),
             Err(other) => fail(format!("{other:?}"), ""),
         },
@@ -502,11 +570,13 @@ fn doctor_checks(lookup: Lookup, live_register: bool) -> Vec<(&'static str, Chec
             (None, _) => Check::Skip("unset; send, ack and inbox need it".into()),
             (Some(me), _) if !valid_agent_id(&me) => fail(
                 format!("{me:?} is not <harness>:<host>:<pid>:<session>"),
-                "set SWB_AGENT_ID to the agent_id printed by `swb whoami`",
+                AGENT_ID_FIX,
             ),
-            (Some(me), Ok((_, id))) if &me != id => fail(
-                format!("{me} differs from the registered identity {id}"),
-                "re-export SWB_AGENT_ID from `swb whoami` in this session",
+            (Some(me), Ok(Identity::Full { agent_id, .. })) if &me != agent_id => fail(
+                format!("{me} differs from the launcher identity {agent_id}"),
+                format!(
+                    "{AGENT_ID_FIX}; it must carry this session's SWB_HOST and SWB_SESSION_PID"
+                ),
             ),
             (Some(me), _) => Check::Ok(me),
         },
@@ -559,25 +629,35 @@ fn doctor_checks(lookup: Lookup, live_register: bool) -> Vec<(&'static str, Chec
         "register",
         match (&identity, live_register, broker_ok) {
             (Err(_), _, _) => Check::Skip("identity incomplete".into()),
-            (Ok((_, id)), false, _) => Check::Ok(format!(
+            (Ok(Identity::Partial { unknown, .. }), _, _) => Check::Skip(format!(
+                "{} unknown; the harness hook registers this session itself \
+                 (set SWB_AGENT_ID, or SWB_HARNESS and SWB_SESSION_ID, to exercise register here)",
+                unknown.join(" and ")
+            )),
+            (Ok(Identity::Full { agent_id: id, .. }), false, _) => Check::Ok(format!(
                 "dry run: payload valid for {id}; rerun with --register for a live round trip"
             )),
             (Ok(_), true, false) => Check::Skip("no valid SWB_BROKER_URL".into()),
-            (Ok((payload, id)), true, true) => {
-                match call_with(lookup, "POST", "/v1/register", Some(payload)) {
-                    Ok(v) if v.get("agent_id").and_then(Value::as_str) == Some(id.as_str()) => {
-                        Check::Ok(format!("POST /v1/register returned {id}"))
-                    }
-                    Ok(v) => fail(
-                        format!("broker returned agent_id {}", v["agent_id"]),
-                        "client and broker disagree on identity; upgrade both to one release",
-                    ),
-                    Err(e) => fail(
-                        format!("POST /v1/register: {e}"),
-                        "see the broker REST check",
-                    ),
+            (
+                Ok(Identity::Full {
+                    payload,
+                    agent_id: id,
+                }),
+                true,
+                true,
+            ) => match call_with(lookup, "POST", "/v1/register", Some(payload)) {
+                Ok(v) if v.get("agent_id").and_then(Value::as_str) == Some(id.as_str()) => {
+                    Check::Ok(format!("POST /v1/register returned {id}"))
                 }
-            }
+                Ok(v) => fail(
+                    format!("broker returned agent_id {}", v["agent_id"]),
+                    "client and broker disagree on identity; upgrade both to one release",
+                ),
+                Err(e) => fail(
+                    format!("POST /v1/register: {e}"),
+                    "see the broker REST check",
+                ),
+            },
         },
     ));
     checks
@@ -1204,7 +1284,9 @@ mod tests {
         assert!(!render_doctor(&checks, &mut out));
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("FAIL  env SWB_BROKER_URL: SWB_BROKER_URL is unset"));
-        assert!(text.contains("FAIL  env identity: unset: SWB_HARNESS, SWB_HOST, SWB_SESSION_PID, SWB_PROC_START, SWB_SESSION_ID"));
+        assert!(
+            text.contains("FAIL  env identity: unset: SWB_HOST, SWB_SESSION_PID, SWB_PROC_START\n")
+        );
         assert!(text.contains("fix: the lab harness launcher exports these (R-C273)"));
         assert!(text.contains("skip  broker REST"));
         assert!(text.contains("skip  register: identity incomplete"));
@@ -1308,6 +1390,119 @@ mod tests {
             json!({"harness":"claude","host":"neo","pid":41,"session_id":"s-1","proc_start":"start-41"})
         );
         assert!(metrics.join().unwrap()[0].starts_with("GET /metrics "));
+    }
+
+    /// Exactly what lab's R-C273 launchers export: no harness, no session id.
+    fn launcher_env(url: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("SWB_BROKER_URL", url.to_owned()),
+            ("SWB_HOST", "sting".into()),
+            ("SWB_SESSION_PID", "4242".into()),
+            ("SWB_PROC_START", "start-4242".into()),
+        ]
+    }
+
+    #[test]
+    fn doctor_passes_a_launcher_only_session_without_registering() {
+        let (url, server) = mock(vec![(200, "application/json", r#"{"peers":[]}"#)]);
+        let pairs = launcher_env(&url);
+        let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        // Even --register must not register a session it cannot name.
+        let checks = doctor_checks(&lookup_of(&borrowed), true);
+        let mut out = Vec::new();
+        let healthy = render_doctor(&checks, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(healthy, "{text}");
+        assert!(text.contains(
+            "ok    env identity: launcher identity present (<harness>:sting:4242:<session>); \
+             harness and session id supplied by the harness hook at register"
+        ));
+        assert!(text.contains("skip  env SWB_AGENT_ID: unset"));
+        assert!(text.contains("skip  register: harness and session id unknown"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /v1/peers "));
+    }
+
+    #[test]
+    fn doctor_reports_only_the_session_id_when_harness_is_known() {
+        let mut pairs = launcher_env("http://127.0.0.1:1");
+        pairs.push(("SWB_HARNESS", "kimi".into()));
+        let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let checks = doctor_checks(&lookup_of(&borrowed), false);
+        assert!(
+            matches!(&checks[1].1, Check::Ok(d) if d.contains("(kimi:sting:4242:<session>); session id supplied"))
+        );
+        assert!(matches!(&checks[5].1, Check::Skip(d) if d.starts_with("session id unknown")));
+    }
+
+    #[test]
+    fn doctor_derives_harness_and_session_from_agent_id() {
+        let (url, server) = mock(vec![
+            (200, "application/json", r#"{"peers":[]}"#),
+            (
+                200,
+                "application/json",
+                r#"{"agent_id":"codex:sting:4242:t-9","lease_seconds":900}"#,
+            ),
+        ]);
+        let mut pairs = launcher_env(&url);
+        pairs.push(("SWB_AGENT_ID", "codex:sting:4242:t-9".into()));
+        let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let checks = doctor_checks(&lookup_of(&borrowed), true);
+        let mut out = Vec::new();
+        let healthy = render_doctor(&checks, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(healthy, "{text}");
+        assert!(text.contains("ok    env identity: would register as codex:sting:4242:t-9"));
+        assert!(text.contains("ok    env SWB_AGENT_ID: codex:sting:4242:t-9"));
+        assert!(text.contains("ok    register: POST /v1/register returned codex:sting:4242:t-9"));
+        let requests = server.join().unwrap();
+        assert_eq!(
+            request_json(&requests[1]),
+            json!({"harness":"codex","host":"sting","pid":4242,"session_id":"t-9","proc_start":"start-4242"})
+        );
+    }
+
+    #[test]
+    fn doctor_agent_id_from_another_process_points_at_the_launcher_vars() {
+        let mut pairs = launcher_env("http://127.0.0.1:1");
+        pairs.push(("SWB_AGENT_ID", "claude:sting:99:s-1".into()));
+        let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let checks = doctor_checks(&lookup_of(&borrowed), false);
+        assert!(matches!(
+            &checks[2].1,
+            Check::Fail { detail, fix }
+                if detail == "claude:sting:99:s-1 differs from the launcher identity claude:sting:4242:s-1"
+                    && fix.contains("SWB_SESSION_PID")
+                    && fix.contains("`swb peers`")
+        ));
+    }
+
+    #[test]
+    fn doctor_fix_hints_name_the_variable_that_is_wrong() {
+        let mut bad_session = launcher_env("http://127.0.0.1:1");
+        bad_session.push(("SWB_SESSION_ID", "has space".into()));
+        let borrowed: Vec<(&str, &str)> =
+            bad_session.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert!(matches!(
+            &doctor_checks(&lookup_of(&borrowed), false)[1].1,
+            Check::Fail { detail, fix }
+                if detail.starts_with("SWB_SESSION_ID ") && fix.contains("or unset it")
+        ));
+        let mut bad_harness = launcher_env("http://127.0.0.1:1");
+        bad_harness.push(("SWB_HARNESS", "bash".into()));
+        let borrowed: Vec<(&str, &str)> =
+            bad_harness.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert!(matches!(
+            &doctor_checks(&lookup_of(&borrowed), false)[1].1,
+            Check::Fail { fix, .. } if fix.contains("unset it to take the kind from SWB_AGENT_ID")
+        ));
+        let partial = lookup_of(&[("SWB_HOST", "sting")]);
+        assert!(matches!(
+            &doctor_checks(&partial, false)[1].1,
+            Check::Fail { detail, .. } if detail == "unset: SWB_SESSION_PID, SWB_PROC_START"
+        ));
     }
 
     #[test]
