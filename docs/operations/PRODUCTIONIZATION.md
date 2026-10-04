@@ -66,14 +66,15 @@ cover a different image.
   recomputed `file_sha256` for all 27 paths, and the image digest, manifest
   size and registry readback from the Sting build. The digest is recorded
   after that build, in the Land step, never before.
-- **Sequencing with v0.1.0.** `v0.1.0` releases the SWB-R53 image, and its
-  workflow runs `release-check` against main. Merging this change first would
-  make that check fail. Per R-C262, if v0.1.0 has already shipped on SWB-R53,
-  the seam goes out in the next release. Hold this change until v0.1.0 is
-  tagged, or get a ruling to fold it into v0.1.0 with the new record.
-- **Ruling ID.** R-C262 names the successor release `SWB-R54`, but ADR-0001
-  already uses SWB-R54 for state custody (2026-09-27). The successor needs a
-  free ID from the operator before its record is written.
+- **Sequencing with v0.1.0.** R-C268 (operator interview 2026-10-04,
+  TIN-4655 comment `67ebf4f4`) supersedes R-C262's fallback: fix build
+  determinism first, so two clean builds of one source give one digest,
+  then v0.1.0 ships the clock-seam image. SWB-R53 is never published. Until
+  the successor record lands, merging this change makes `release-check`
+  fail against SWB-R53, so it merges together with that record.
+- **Ruling ID.** R-C262 and R-C268 name the successor release `SWB-R54`,
+  but ADR-0001 already uses SWB-R54 for state custody (2026-09-27). The
+  successor needs a free ID from the operator before its record is written.
 
 ## Secrets scan and CODEOWNERS
 
