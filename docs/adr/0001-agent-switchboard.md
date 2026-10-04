@@ -24,12 +24,9 @@
 
 This ADR is the approved plan with every P0 ruling applied. Where a P0 ruling
 changed the draft, the text below states the ruled design and cites the
-ruling ID. [Deltas from the draft](#deltas-from-the-draft) lists each change.
-[Rulings](#rulings) gives the source and quote for every ID. Where the R0
-round changed a line, the earlier text stays in a dated supersession note
-next to the new one; nothing is silently rewritten (R-N13).
-[Deltas from the R0 LGTM round](#deltas-from-the-r0-lgtm-round-2026-09-25)
-lists those changes.
+ruling ID. [Rulings](#rulings) gives the source and quote for every ID.
+Where the R0 round changed a line, the earlier text stays in a dated
+supersession note next to the new one; nothing is silently rewritten (R-N13).
 
 ## Context
 
@@ -475,56 +472,6 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
 3. Any harness: a Linear comment on the ticket, written by the agent itself
    (`transport: linear`).
 4. Otherwise: the operator.
-
-## Deltas from the draft
-
-| Area | Approved draft | Ruled design | Ruling |
-| --- | --- | --- | --- |
-| Authority | The broker never emits `operator`; `operator_directed` is shown as the sender's claim | Unchanged stamping (`authority: peer` always). `operator_directed` now requires a `ruling` pointer, which receivers check and never treat as authority | SWB-R14 |
-| Linear | The broker holds no Linear credential and never reads or writes Linear | It reads title, state and assignee, and posts handoff receipts as comments. It never moves state or edits descriptions. Token as a blahaj-side sops leaf | SWB-R15 |
-| Claims | Advisory, never refused | Advisory by default. An optional `exclusive` flag makes a second exclusive claim return `held_by` without recording | SWB-R16 |
-| Push on neo | neo stays pull-only | agentd also runs on neo as a launchd agent: tiny, long-poll, at most one notice per 60 s, no bodies | SWB-R17 |
-| Pi | Deferred to P4, "if ratified" | An `agents` Pi MCP profile ships in v1 | SWB-R18 |
-| Audit | Metadata only, no bodies | The audit stream includes bodies. Retention and access follow Loki's | SWB-R19 |
-| Retention | Proposed 7 d / 30 d / 72 h | Accepted as proposed | SWB-R09 |
-| Hooks | Proposed 2 s, exit 0 | Accepted as proposed | SWB-R10 |
-| Registry | Proposed claude_code, codex, opencode; no VS Code | Accepted as proposed | SWB-R11 |
-| Junie | Proposed `tracker`, never `mux` | Accepted as proposed | SWB-R12 |
-| Forks | Proposed private forks, queue-only CI for fork PRs | Accepted as proposed | SWB-R13 |
-| Codex push | Only after a live-thread proof | Unchanged | SWB-R20 |
-
-## Deltas from the R0 LGTM round (2026-09-25)
-
-Source: TIN-4655 comment `73f1ce72`, and for the rows marked SWB-R33 to
-SWB-R36 the amendment comment `f870729e` (2026-09-25T19:11Z). The new
-ruling IDs are recorded, with their quotes, in
-[ADR-0002 → Rulings](0002-lgtm-plane.md#rulings).
-
-| Area | P0 text | R0 design | Ruling |
-| --- | --- | --- | --- |
-| Source of truth | "self-registration is authoritative; LGTM is a view" | Reworded: the broker writes through; LGTM is the read/query/context plane and never the commit path. Acks, claims, sequence and leases stay in the broker | SWB-R02 (reworded) |
-| Retention | 7 d acked / 30 d unacked / TTL 72 h, in the broker | Unchanged in the broker. Tempo and Loki keep 7 d; only the broker keeps 30 d unacked | SWB-R25 |
-| Bodies | In Loki, shipped by Alloy | Never Tempo span attributes; broker stdout → Alloy with a tinyland.dev `loki.process` stage | SWB-R26 |
-| Bodies, gate | (none) | Out of stdout until a named body-read ACL audit is decided, before P1b | SWB-R27 |
-| Phases | P0, P1a, P1b, P2, P3 ("Junie and LGTM"), P4 | L0–L5 interleaved with the broker phases; P3's LGTM items move to L3 | SWB-R28 |
-| Dashboards and alerts | Both blahaj's | Dashboards: tinyland.dev owner release. Paging alerts: blahaj prometheus-mail | SWB-R28 |
-| L0 gate | (none) | The mcp-grafana bump starts only after a Host-header canary | SWB-R29 |
-| ADR revision | (none) | A Fable lane revises ADR-0001 and adds ADR-0002 with every critique fix; Opus refutes; PR through the fork | SWB-R30 |
-| Harness-native telemetry | Out of scope | L5: all on, full content, scrubbed at the collector | SWB-R31 |
-| Telemetry ingest | (none) | A tailnet OTLP/HTTP endpoint on the existing collector, requested as TIN-4668; lab exporters gated off until **the scrubbed endpoint** (`otlp-harness-http-tailscale`, 4318 → 14318) exists, and never pointed at the retained `otlp-observability-http:4318` (`1001c0fb`) | SWB-R32 |
-| agentd (September 25 proposal; superseded by SWB-R40/SWB-R47) | Tiny on neo | Never emits OTLP anywhere; census only; `/nix` exec proof before P2 exits | Design constraint, not ruled (ADR-0002 → Open rulings 1, formerly 5); the `/nix` proof is a critique fix |
-| Codex identity | `notify` hook | `swb whoami`; `notify` stays runtime-owned; no new table | Critique fix (R0 ruling 3) |
-| Claude/Kimi enrollment | (unstated) | registry → export-registries → `tinyland.mcp` → `~/.claude.json` | Critique fix |
-| Claude hooks | (unstated priority) | Merged at `mkDefault`, with a contract test that the three fail-closed guards survive | Critique fix |
-| Junie and Pi lookup (September 25 gap; resolved by SWB-R41) | (unstated) | One Junie server, one Pi profile: a switchboard session has no LGTM lookup | Critique fix |
-| Projection loss | (n/a) | Transactional outbox plus a reconciliation gauge; "absent" means expired or not projected | Critique fix |
-| Lifecycle spans | (n/a) | Each lifecycle step is its own trace, linked back to the send span | Critique fix |
-| Thread enumeration | (n/a) | Broker-only | Critique fix |
-| Citations | (n/a) | tinyland.dev re-pinned to main `68a16f65` | Critique fix |
-| Bodies, gate (amendment) | Out of stdout until the body-read ACL is decided | The TIN-4668 answer "A: tailnet ACL, admins + MCP" is SWB-R27's decision; bodies ship only once TIN-4670 has applied ACL A and a raw Loki read from a non-admin tailnet node is refused | SWB-R33 |
-| Bodies, redaction (amendment) | The broker does not redact; no scrubber on the stdout path | A redaction step in the broker namespace's `loki.process` stage, with the TIN-4668 collector scrubber's pattern set | SWB-R34 |
-| Harness telemetry in Tempo (amendment) | (unstated; content kept in Loki by design) | Tempo is the harness recency index: tool names, file paths and ticket IDs as span attributes; bodies and full content stay in Loki | SWB-R35 |
-| L5 timing (amendment) | Last, after P4 (the adopted order) | Independent of P4; starts once the scrubbed endpoint, the scrubber and the enforced ACL all exist | SWB-R36 |
 
 ## Phases
 
