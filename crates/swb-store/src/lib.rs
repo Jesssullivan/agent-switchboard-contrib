@@ -159,8 +159,8 @@ impl Store {
         self.1.now()
     }
     pub fn prune(&self) -> Result<(), String> {
-        let now = self.now();
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let now = self.now();
         db.execute("DELETE FROM messages WHERE (state='acked' AND acked_at<=?1-604800) OR (state!='acked' AND created_at<=?1-2592000)", [now]).map_err(sql_err)?;
         Ok(())
     }
@@ -248,8 +248,8 @@ impl Store {
         if !valid_agent_id(&id) {
             return Err("invalid agent id".into());
         }
-        let now = self.now();
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let now = self.now();
         db.execute("INSERT INTO sessions(agent_id,harness,host,proc_start,last_seen) VALUES(?1,?2,?3,?4,?5)
                     ON CONFLICT(agent_id) DO UPDATE SET proc_start=excluded.proc_start,last_seen=excluded.last_seen,ended=0",
             params![id,harness,host,proc_start,now]).map_err(sql_err)?;
@@ -266,8 +266,8 @@ impl Store {
         Ok(json!({"agent_id":me,"state":if changed == 1 {"ended"} else {"unknown"}}))
     }
     pub fn peers(&self, me: Option<&str>) -> Result<Value, String> {
-        let now = self.now();
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let now = self.now();
         if let Some(me) = me {
             if !valid_agent_id(me) {
                 return Err("invalid me".into());
@@ -422,8 +422,8 @@ impl Store {
                 .and_then(Value::as_u64)
                 .map(|n| n.min(u32::MAX as u64) as u32),
         );
-        let now = self.now();
         let mut db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let now = self.now();
         if let Some(value) = input.get("reply_expires") {
             let stamp = value
                 .as_str()
@@ -538,8 +538,8 @@ impl Store {
         if !valid_agent_id(me) {
             return Err("invalid agent id".into());
         }
-        let now = self.now();
         let mut db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let now = self.now();
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
@@ -581,8 +581,8 @@ impl Store {
         if !valid_agent_id(me) || !valid_ulid(msg_id) {
             return Err("invalid identity or msg_id".into());
         }
-        let now = self.now();
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let now = self.now();
         let n = db.execute("UPDATE messages SET state='acked',acked_at=?3 WHERE msg_id=?1 AND recipient=?2 AND expires_at>?3 AND state IN ('queued','notified','fetched')",params![msg_id,me,now]).map_err(sql_err)?;
         if n == 0 {
             let prior: Option<String> = db
@@ -605,8 +605,8 @@ impl Store {
         Ok(json!({"msg_id":msg_id,"state":"acked"}))
     }
     pub fn metrics(&self) -> Result<String, String> {
-        let now = self.now();
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let now = self.now();
         let sent: i64 = db
             .query_row(
                 "SELECT COALESCE(value,0) FROM counters WHERE name='messages_total'",
