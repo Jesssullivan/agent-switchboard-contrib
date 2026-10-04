@@ -8,6 +8,14 @@ rust_binary(
     srcs = ["src/main.rs"],
     aliases = aliases(),
     edition = crate_edition(),
+    # R-C268: link without debug info. libsqlite3-sys compiles SQLite through
+    # the cc crate with -g, and gcc records the build script's sandbox
+    # directory (output-base hash plus sandbox counter) as DW_AT_comp_dir.
+    # rules_rust does not remap that C path, so it made the image digest
+    # depend on the workspace path and sandbox number. Stripping debug info
+    # at link time removes it; the build-id then covers identical bytes.
+    # This is a BUILD attribute, not .bazelrc, because CI ignores rc files.
+    rustc_flags = ["-Cstrip=debuginfo"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
         "//crates/swb-agentd:swb_agentd",

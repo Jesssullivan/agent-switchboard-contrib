@@ -115,9 +115,23 @@ branch type tin slug:
     git switch -c "{{type}}/tin-{{tin}}-{{slug}}-$(date -u +%Y%m%d)" upstream/main
 
 # Build the immutable Linux/amd64 OCI image and print the exact manifest digest.
-image:
-    {{clean_bazel_env}} bazelisk build --lockfile_mode=error //deploy:image //deploy:image.digest
-    @digest="$(cat bazel-bin/deploy/image.json.sha256)" && printf 'ghcr.io/xoxd-ai/agent-switchboard@%s\n' "$digest"
+# R-C268: the image's org.opencontainers.image.revision label is the commit
+# given here (default: HEAD, and then the worktree must be clean). Two builds
+# of one commit give one digest. Build outside `nix develop`: a Nix C compiler
+# in PATH leaks into rules_cc, and //deploy:swb_checked refuses that binary.
+image revision="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rev="{{revision}}"
+    if [ -z "$rev" ]; then
+      if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+        echo "image: worktree has changes; commit them or pass an explicit revision" >&2
+        exit 1
+      fi
+      rev="$(git rev-parse HEAD)"
+    fi
+    {{clean_bazel_env}} bazelisk build --lockfile_mode=error --embed_label="$rev" //deploy:image //deploy:image.digest
+    digest="$(cat bazel-bin/deploy/image.json.sha256)" && printf 'ghcr.io/xoxd-ai/agent-switchboard@%s\n' "$digest"
 
 # R-C229 formal spec. Dhall checks are interpreters only and run on any
 # seat, neo included: `nix shell` substitutes the tools from the locked

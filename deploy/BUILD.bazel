@@ -8,13 +8,61 @@ _linux_amd64 = [
     "@platforms//cpu:x86_64",
 ]
 
-# The swb binary as an image layer.
+# R-C268: refuse a shipped binary that carries a build-machine path. An
+# `/execroot/` or `/sandbox/` string is the unremapped C debug path that made
+# SWB-R53 irreproducible; a `/nix/store/` string means a Nix C compiler (for
+# example from `nix develop`) leaked into rules_cc, and that binary would ask
+# for a Nix dynamic linker the distroless base does not have. The output is a
+# byte copy, so the layer is unchanged when the check passes.
+genrule(
+    name = "swb_checked",
+    srcs = ["//crates/swb:swb"],
+    outs = ["swb"],
+    cmd = """
+if grep -a -q -e /execroot/ -e /sandbox/ -e /nix/store/ $<; then
+  echo "R-C268: $< embeds a build-machine path; the image would not be reproducible" >&2
+  grep -a -o -e '[^[:cntrl:]]*/execroot/[^[:cntrl:]]*' -e '[^[:cntrl:]]*/sandbox/[^[:cntrl:]]*' -e '[^[:cntrl:]]*/nix/store/[^[:cntrl:]]*' $< | head -5 >&2
+  exit 1
+fi
+cp $< $@
+chmod 0755 $@
+""",
+    target_compatible_with = _linux_amd64,
+)
+
+# The swb binary as an image layer. Every entry is 0:0 with the portable
+# mtime, so the tar depends only on the binary's bytes.
 pkg_tar(
     name = "swb_layer",
-    srcs = ["//crates/swb:swb"],
+    srcs = [":swb_checked"],
     mode = "0755",
+    owner = "0.0",
     package_dir = "/usr/local/bin",
+    portable_mtime = True,
     target_compatible_with = _linux_amd64,
+)
+
+# R-C268: OCI labels. `source` is constant. `revision` is the commit passed as
+# `--embed_label=<40-hex sha>` (see `just image`), read from the stable
+# workspace status; without it the value is `unstamped`. Only that one key is
+# read, so BUILD_HOST, BUILD_USER and the volatile status never reach the
+# image. Any other embed label fails the build.
+genrule(
+    name = "image_labels",
+    outs = ["image_labels.txt"],
+    cmd = """
+rev=$$(sed -n 's/^BUILD_EMBED_LABEL //p' bazel-out/stable-status.txt)
+case "$$rev" in
+  "") rev=unstamped ;;
+  *[!0-9a-f]*) echo "R-C268: --embed_label must be a 40-hex commit sha, got '$$rev'" >&2; exit 1 ;;
+esac
+if [ "$$rev" != unstamped ] && [ $${#rev} -ne 40 ]; then
+  echo "R-C268: --embed_label must be a 40-hex commit sha, got '$$rev'" >&2
+  exit 1
+fi
+printf 'org.opencontainers.image.revision=%s\norg.opencontainers.image.source=https://github.com/xoxd-ai/agent-switchboard\n' "$$rev" > $@
+""",
+    stamp = True,
 )
 
 # SWB-R04: a pinned Linux/amd64 runtime. The nonroot base runs as UID 65532;
@@ -24,6 +72,7 @@ oci_image(
     base = "@distroless_cc_amd64_linux_amd64",
     entrypoint = ["/usr/local/bin/swb"],
     cmd = ["serve"],
+    labels = ":image_labels",
     tars = [":swb_layer"],
     target_compatible_with = _linux_amd64,
 )
