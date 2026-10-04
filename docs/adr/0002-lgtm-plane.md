@@ -1141,10 +1141,8 @@ any host); the agent asks, waits, and records the result.
 
 #### L5 — harness-native telemetry (SWB-R31, SWB-R32, SWB-R35, SWB-R36; independent of P4, starts once the scrubbed TIN-4668 endpoint, its scrubber and the enforced ACL all exist)
 
-*Retitled 2026-09-25 (SWB-R36).* The heading read "… gated on the scrubbed
-TIN-4668 endpoint, its scrubber, and SWB-R27; its place after P4 is an open
-question". The operator's answer, "Start once its three gates hold
-(Recommended)", makes L5 independent of P4; it can start before, during or
+The operator's answer, "Start once its three gates hold (Recommended)"
+(SWB-R36), makes L5 independent of P4; it can start before, during or
 after any P phase once the gates below hold. *Clarified 2026-09-26
 (SWB-R48):* telemetry qualification is post-v1 functional proof and cannot
 hold the P1b broker MVP; the existing body gates still apply.
@@ -1508,7 +1506,7 @@ renumbered 1–9 (5 → 1, 6 → 2, 7 → 3, 8 → 4, 12 → 8, 13 → 9).
 | # | Problem, in short | Handling |
 | --- | --- | --- |
 | 1 | Stale estate facts: the tailnet already exposes the collector's OTLP 4317/4318, unscrubbed; Loki and Tempo answer without credentials; `26a311db`, `875fc21f`, `1001c0fb`, TIN-4670 uncited | Context "What runs today", Auth, Risks and the unverified list rewritten against `26a311db` and `875fc21f`/`1001c0fb`; blahaj `:58-102` and registry `:279-282` cited; TIN-4670 named; the ingest-path paragraph no longer claims hosts cannot reach a proxy |
-| 2 | The L5 gate "until that endpoint exists" could be met by the wrong 4318 | L5 names `otlp-harness-http-tailscale` (4318 → 14318, `otlp/tailnet`), forbids `otlp-observability-{http,grpc}` with the operator's words, adds a rendered-endpoint gate and exit, and records TIN-4670's retire-or-repoint as the operator's later pick with the bypass stated meanwhile; the ADR-0001 delta row says the same |
+| 2 | The L5 gate "until that endpoint exists" could be met by the wrong 4318 | L5 names `otlp-harness-http-tailscale` (4318 → 14318, `otlp/tailnet`), forbids `otlp-observability-{http,grpc}` with the operator's words, adds a rendered-endpoint gate and exit, and records TIN-4670's retire-or-repoint as the operator's later pick with the bypass stated meanwhile; the ADR-0001 delta row said the same (*that row was deleted 2026-10-04 with ADR-0001's Deltas tables, R-C275*) |
 | 3 | SWB-R27's status is stale: the operator answered "A: tailnet ACL, admins + MCP" on TIN-4668; "decided" is not "enforced" | Auth, L1 and the rulings row cite `1001c0fb`; Open rulings 1 asks for the TIN-4655 carrier and for the decision-versus-enforcement gate; the "needs its own interview under the no-containment ruling" framing is removed everywhere |
 | 4 | The L5 content exit cannot pass in Tempo (2048-byte cap; the build's `traces/tailnet` allowlist) | Loki through `logs/tailnet` is the L5 content store; the content exit is a Loki check; scrub checks cover both signals; whether ruling 2's Tempo ban covers harness content is Open rulings 2 |
 | 5 | Drills need someone to stop or scale a process; R-N11 makes that operator-only | The phases intro states it once; the L0 canary, the L2 restart and reconciliation drills, the L3 scale-to-zero and ADR-0001's P1b pod-restart and broker-down drills each name the operator as the actor |
@@ -1522,7 +1520,7 @@ renumbered 1–9 (5 → 1, 6 → 2, 7 → 3, 8 → 4, 12 → 8, 13 → 9).
 | 13 | `swb` bodies bypass every scrubber | Stated in the Loki schema and Risks; Open rulings 4 asks whether SWB-R19 accepts it or an Alloy-side stage is added; not decided here |
 | 14 | `swb.body_sha256` lets a reader confirm a guessed short body | Both signals carry a keyed `body_hmac` under a broker-held sops key; the residual `size` exposure is stated in Risks |
 | 15 | "A client cannot pick a trace id" overstated, since `msg_id` idempotency was unscoped | `msg_id` is globally unique at the broker, with the retry and conflict semantics stated in Identifiers and in ADR-0001 → Mailbox |
-| 16 | The two ADRs contradicted each other (L0 dependency, the outbox's phase, the P4 heading, the phase orders, principle 3) | L0 is after P1a in sequence with the canary as its only gate; the outbox and projector land in L2 and P1b writes stdout after commit; P4 is "Codex push" again and Pi stays in P1b as proposed (Open rulings 6); AGENTS.md and README carry the SWB-R27 step; principle 3 is scoped to `swb` telemetry |
+| 16 | The two ADRs contradicted each other (L0 dependency, the outbox's phase, the P4 heading, the phase orders, principle 3) | L0 is after P1a in sequence with the canary as its only gate; the outbox and projector land in L2 and P1b writes stdout after commit; P4 is "Codex push" again and Pi stays in P1b as proposed (Open rulings 6); the phase order, SWB-R27 step included, is carried by ADR-0001 → Phases (*updated 2026-10-04, R-C275:* AGENTS.md and the README no longer restate it, after agent-switchboard #14 and #12); principle 3 is scoped to `swb` telemetry |
 | 17 | An ingress rule into the broker's namespace was assigned to tinyland.dev | Assigned to blahaj in L3 |
 | 18 | "Accepted (design)" before the refutation and the PR | Proposed until the PR merges; unruled design choices are named as proposals in the status line |
 | 19 | Unpinned or missing citations; TIN-75 cited by its status field | Tempo, OTel, Prometheus and Loki docs pinned to `main` shas re-read on 2026-09-25; Grafana 12.3.6+security-04, prometheus-mail v2.51.0, Mimir 2.17.10, `GF_LIVE_MAX_CONNECTIONS=0` and the ntfy topic cited to lane tool calls and file:line; the textfile owner cited to blahaj `honey_hardware/tasks/main.yml:131-138` and the PZM path to lab `petting-zoo-mini.nix:619,638`; TIN-75 cited by `stateHistory` |
