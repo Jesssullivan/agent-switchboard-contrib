@@ -8,11 +8,14 @@
 -- starts, stops or signals a process (R-N11). It refuses any URL that is not
 -- loopback, so it cannot write test traffic into a shared broker.
 --
--- Not covered live, because the broker has no clock seam and no claims yet:
--- 'Tick' and the claim operations return 'RUnsupported', and LiveMode never
--- generates them. See spec/README.md for the follow-up.
+-- 'Tick' posts to /v1/test/clock, which exists only on a broker built with
+-- the R-C262 `test-clock` feature and started with SWB_TEST_CLOCK=1;
+-- 'probeClock' checks for it before a clocked run. The claim operations
+-- return 'RUnsupported', and no live mode generates them, because the broker
+-- has no claims yet (SWB-R16, P2).
 module Swb.Live
   ( loopbackOnly
+  , probeClock
   , runLive
   ) where
 
@@ -38,6 +41,16 @@ loopbackOnly :: String -> Either String String
 loopbackOnly url
   | any (`isPrefixOf` url) ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"] = Right (reverse (dropWhile (== '/') (reverse url)))
   | otherwise = Left ("refusing non-loopback broker URL " ++ show url ++ "; start a disposable broker on 127.0.0.1")
+
+-- | Read the broker's test clock with a zero advance. Fails unless the broker
+-- serves /v1/test/clock, so a clocked run never silently drops its ticks.
+probeClock :: Manager -> String -> IO Integer
+probeClock mgr base = do
+  req <- parseRequest (base ++ "/v1/test/clock")
+  resp <- httpLbs req {method = "POST", requestBody = RequestBodyLBS (encode (object ["advance_seconds" .= (0 :: Int)])), requestHeaders = [("Content-Type", "application/json")]} mgr
+  case (statusCode (responseStatus resp), eitherDecode (responseBody resp)) of
+    (200, Right v) | Just t <- int "now" v -> pure t
+    (code, _) -> ioError (userError ("broker at " ++ base ++ " has no test clock (HTTP " ++ show code ++ "); start bazel-bin/crates/swb/swb_test_clock serve with SWB_TEST_CLOCK=1"))
 
 data LiveSt = LiveSt
   { lsThreads :: M.Map Thread T.Text
@@ -90,6 +103,9 @@ runLive mgr base ops = do
             mid <- maybe newUlid pure (M.lookup i (lsIds st))
             (code, _) <- post "/v1/ack" (object ["me" .= agentId a, "msg_id" .= mid])
             pure (if code == 200 then RAcked else RErr (show code), st)
+          Tick d -> do
+            (code, _) <- post "/v1/test/clock" (object ["advance_seconds" .= d])
+            pure (if code == 200 then RTicked else RErr (show code), st)
           _ -> pure (RUnsupported, st)
         pure (st', (op, r) : acc)
   (_, acc) <- foldM stepLive (LiveSt M.empty M.empty M.empty 0, []) ops

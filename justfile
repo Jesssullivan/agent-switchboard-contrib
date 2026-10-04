@@ -144,6 +144,11 @@ spec-check: spec-dhall spec-quickcheck
 spec-live url="http://127.0.0.1:18080":
     SWB_SPEC_BROKER_URL={{ quote(url) }} nix run .#spec-live
 
+# The same, with Tick, against a broker on the R-C262 test clock
+# (`swb_test_clock serve` with SWB_TEST_CLOCK=1; see spec/README.md).
+spec-live-clock url="http://127.0.0.1:18080":
+    SWB_SPEC_LIVE_CLOCK=1 SWB_SPEC_BROKER_URL={{ quote(url) }} nix run .#spec-live
+
 # Run `just spec-check` on a build host from a teletype seat (neo).
 remote-spec-check host="sting" dir="~/scratch/agent-switchboard-spec":
     ssh {{host}} 'mkdir -p {{dir}}'

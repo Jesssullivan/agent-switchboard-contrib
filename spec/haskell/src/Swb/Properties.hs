@@ -26,9 +26,12 @@ import Swb.Constants
 import Swb.Model
 import Test.QuickCheck hiding (classify)
 
--- | The live broker has no clock seam and no claims yet, so the live mode
--- generates neither 'Tick' nor claim operations.
-data Mode = ModelMode | LiveMode deriving (Eq, Show)
+-- | The live broker has no claims yet, so neither live mode generates claim
+-- operations. 'LiveMode' runs against the wall clock and generates no
+-- 'Tick'. 'LiveClockMode' runs against a broker started with the R-C262 test
+-- clock (`swb_test_clock`, `SWB_TEST_CLOCK=1`) and generates 'Tick', so the
+-- live run covers expiry, idle, gone and retention.
+data Mode = ModelMode | LiveMode | LiveClockMode deriving (Eq, Show)
 
 genOps :: Mode -> Gen [Op]
 genOps mode = normalizeAcks <$> listOf (frequency (common ++ extra))
@@ -42,13 +45,15 @@ genOps mode = normalizeAcks <$> listOf (frequency (common ++ extra))
       , (4, Inbox <$> agent <*> elements [1, 2, 3, 20, 100, 101])
       , (4, Ack <$> agent <*> choose (0, 20))
       ]
-    extra
-      | mode == LiveMode = []
-      | otherwise =
-          [ (3, Claim <$> agent <*> (Subject <$> choose (0, 1)) <*> arbitrary <*> oneof [pure Nothing, Just <$> elements [1, 4, 24, 25]])
-          , (2, pure ListClaims)
-          , (3, Tick <$> elements [1, 60, 899, 900, 901, 3600, 14399, 14400, 21600, 21601, 86400, 259200, 604801, 1296000, 2678400])
-          ]
+    tick = (3, Tick <$> elements [1, 60, 899, 900, 901, 3600, 14399, 14400, 21600, 21601, 86400, 259200, 604801, 1296000, 2678400])
+    extra = case mode of
+      LiveMode -> []
+      LiveClockMode -> [tick]
+      ModelMode ->
+        [ (3, Claim <$> agent <*> (Subject <$> choose (0, 1)) <*> arbitrary <*> oneof [pure Nothing, Just <$> elements [1, 4, 24, 25]])
+        , (2, pure ListClaims)
+        , tick
+        ]
 
 shrinkOps :: [Op] -> [[Op]]
 shrinkOps = map normalizeAcks . shrinkList (const [])

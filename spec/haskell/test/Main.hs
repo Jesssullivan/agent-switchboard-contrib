@@ -1,5 +1,7 @@
 -- | Runs the five trace properties against the pure model, and against a
--- live broker when SWB_SPEC_BROKER_URL names one on loopback (R-C229).
+-- live broker when SWB_SPEC_BROKER_URL names one on loopback (R-C229). With
+-- SWB_SPEC_LIVE_CLOCK=1 the live run also generates 'Tick', which needs a
+-- broker on the R-C262 test clock.
 module Main (main) where
 
 import Control.Monad (unless)
@@ -36,11 +38,16 @@ main = do
       Left err -> ioError (userError err)
       Right base -> do
         mgr <- newManager defaultManagerSettings
+        clocked <- (== Just "1") <$> lookupEnv "SWB_SPEC_LIVE_CLOCK"
+        mode <-
+          if clocked
+            then LiveClockMode <$ (probeClock mgr base >>= \t -> putStrLn ("live: test clock at " ++ show t))
+            else LiveMode <$ putStrLn "live: wall clock (set SWB_SPEC_LIVE_CLOCK=1 for expiry, idle and gone)"
         mapM
           ( \(name, check) -> do
               putStrLn ("live: " ++ name)
               quickCheckWithResult stdArgs {maxSuccess = 25} $ monadicIO $ do
-                ops <- pick (resize 30 (genOps LiveMode))
+                ops <- pick (resize 30 (genOps mode))
                 tr <- run (runLive mgr base ops)
                 let bad = check tr
                 monitor (counterexample (unlines (bad ++ map show tr)))

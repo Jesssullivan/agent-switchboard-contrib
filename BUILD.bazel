@@ -41,6 +41,9 @@ rust_clippy(
     testonly = True,
     deps = RUST_SOURCE_TARGETS + [
         "//crates/swb:swb_test",
+        "//crates/swb:swb_test_clock",
+        "//crates/swb-broker:swb_broker_test_clock",
+        "//crates/swb-broker:swb_broker_test_clock_test",
         "//crates/swb-agentd:swb_agentd_test",
         "//crates/swb-broker:swb_broker_test",
         "//crates/swb-proto:swb_proto_test",
@@ -64,6 +67,7 @@ test_suite(
         "//crates/swb:swb_test",
         "//crates/swb-agentd:swb_agentd_test",
         "//crates/swb-broker:swb_broker_test",
+        "//crates/swb-broker:swb_broker_test_clock_test",
         "//crates/swb-proto:swb_proto_test",
         "//crates/swb-store:swb_store_test",
     ],

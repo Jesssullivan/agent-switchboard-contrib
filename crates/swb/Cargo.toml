@@ -11,6 +11,11 @@ publish.workspace = true
 name = "swb"
 path = "src/main.rs"
 
+# R-C262: test-only time control for the spec live adapter. No production
+# target enables it; see crates/swb-broker/src/lib.rs `test_clock`.
+[features]
+test-clock = ["swb-broker/test-clock"]
+
 [dependencies]
 swb-agentd = { path = "../swb-agentd" }
 swb-broker = { path = "../swb-broker" }

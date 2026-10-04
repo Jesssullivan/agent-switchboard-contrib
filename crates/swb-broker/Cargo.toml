@@ -7,6 +7,11 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# R-C262: test-only time control for the spec live adapter. No production
+# target enables it; see crates/swb-broker/src/lib.rs `test_clock`.
+[features]
+test-clock = []
+
 [dependencies]
 swb-proto = { path = "../swb-proto" }
 swb-store = { path = "../swb-store" }

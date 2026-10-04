@@ -40,3 +40,31 @@ rust_test(
         "@crates//:serde_json",
     ],
 )
+
+# R-C262: the same crate with the `test-clock` feature, for the spec live
+# adapter's broker only. testonly, so no production target (//crates/swb:swb,
+# //deploy:image) can depend on it.
+rust_library(
+    name = "swb_broker_test_clock",
+    testonly = True,
+    srcs = ["src/lib.rs"],
+    aliases = aliases(),
+    crate_features = ["test-clock"],
+    crate_name = "swb_broker",
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + ["//crates/swb-proto:swb_proto", "//crates/swb-store:swb_store"],
+)
+
+rust_test(
+    name = "swb_broker_test_clock_test",
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate = ":swb_broker_test_clock",
+    crate_features = ["test-clock"],
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)

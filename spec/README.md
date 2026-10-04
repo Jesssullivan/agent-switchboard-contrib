@@ -8,7 +8,8 @@ extensive architecture boundary checks."
 
 Nothing here is a Bazel input or a release-protected input
 (`scripts/release-check.py` `SOURCE_INPUTS_V1`), so this tree can change
-without touching the SWB-R53 release lock.
+without touching the SWB-R53 release lock. The R-C262 test clock the live
+adapter drives does live in `crates/`; see "Live adapter" below.
 
 ## Layout
 
@@ -105,23 +106,30 @@ timeout 600 env SWB_DB_PATH="$d/swb.sqlite3" SWB_LISTEN=127.0.0.1:18080 \
 just spec-live http://127.0.0.1:18080
 ```
 
-**Live coverage today.** The broker has no clock seam and no claims, so the
-live mode generates no `Tick` and no claim operations. The live run fully
-checks `threadSeqDense` and `atLeastOnceUntilAck`, minus expiry. It checks
-`leaseLifecycle` only for the live, ended and revive transitions. The claim
-properties are vacuous there.
+**Clocked live run (R-C262).** `swb-store` takes an injected `Clock`. A
+broker built from the testonly target `//crates/swb:swb_test_clock` (Cargo
+feature `test-clock`) and started with `SWB_TEST_CLOCK=1` runs on a manual
+clock that only `POST /v1/test/clock {"advance_seconds": n}` moves. It
+refuses non-loopback listeners. The released `//crates/swb:swb` has no such
+route. With `SWB_SPEC_LIVE_CLOCK=1`, the suite probes the route, fails if it
+is missing, and generates `Tick` exactly as the model mode does:
 
-**TODO.** Close the gap. This is proposed ticket text under TIN-4655 and is
-not filed:
+```sh
+bazel build //crates/swb:swb_test_clock
+d="$(mktemp -d "$HOME/scratch/swb-spec.XXXXXX")"
+timeout 900 env SWB_TEST_CLOCK=1 SWB_DB_PATH="$d/swb.sqlite3" \
+  SWB_LISTEN=127.0.0.1:18080 SWB_METRICS_LISTEN=127.0.0.1:19090 \
+  bazel-bin/crates/swb/swb_test_clock serve &
+just spec-live-clock http://127.0.0.1:18080
+```
 
-> Give `swb-store` a clock seam: a `Clock` trait, with SQLite `unixepoch()`
-> as the default and a test clock behind a feature or test-only constructor.
-> Then add a `spec/driver` harness that reads JSON operations on stdin and
-> writes results on stdout, exiting at EOF so it needs no signal.
-> `Swb.Live` can then drive `Tick` and the expiry and idle/gone paths with
-> the same five properties.
->
-> Both changes edit `crates/`, which are release-protected inputs (SWB-R53).
-> So they need a new approved release, or a ruling that a test-only crate is
-> outside `SOURCE_INPUTS_V1`. Claims (SWB-R16) join the live run when P2
-> implements them.
+**Live coverage.**
+
+- Wall-clock run (`just spec-live`): no `Tick`. It checks `threadSeqDense`
+  and `atLeastOnceUntilAck` minus expiry, and `leaseLifecycle` only for the
+  live, ended and revive transitions.
+- Clocked run (`just spec-live-clock`): adds `Tick`, so `leaseLifecycle`
+  covers live, idle and gone, `atLeastOnceUntilAck` covers expiry and the
+  7-day acked prune, and `threadSeqDense` covers seq after a prune.
+- Both: the claim properties stay vacuous until P2 implements claims
+  (SWB-R16).

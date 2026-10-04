@@ -28,3 +28,23 @@ rust_test(
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True),
 )
+
+# R-C262: `swb` with the `test-clock` feature. Only `SWB_TEST_CLOCK=1` on
+# loopback listeners switches it to the manual clock. testonly, and not in
+# //:build or //deploy:image; the released binary is :swb above.
+rust_binary(
+    name = "swb_test_clock",
+    testonly = True,
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    crate_features = ["test-clock"],
+    crate_name = "swb",
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//crates/swb-agentd:swb_agentd",
+        "//crates/swb-broker:swb_broker_test_clock",
+        "//crates/swb-proto:swb_proto",
+        "//crates/swb-store:swb_store",
+    ],
+)

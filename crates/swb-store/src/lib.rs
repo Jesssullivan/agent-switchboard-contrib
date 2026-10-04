@@ -1,12 +1,18 @@
 //! SQLite coordination state. Mutations and their receipts commit in one writer
 //! transaction (SWB-R02, SWB-R09, SWB-R14, SWB-R46).
+//!
+//! Every time the store reads or writes comes from an injected [`Clock`]
+//! (R-C262). Production uses [`SystemClock`], which reads the same Unix
+//! seconds SQLite `unixepoch()` returned before the seam existed. Tests and
+//! the spec live adapter use [`ManualClock`], which moves only when told to.
 
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ulid::Ulid;
 
@@ -21,7 +27,60 @@ pub fn effective_ttl_hours(requested: Option<u32>) -> u32 {
         .clamp(1, MAX_TTL_DAYS * 24)
 }
 
-pub struct Store(Mutex<Connection>);
+/// Source of the current time, in whole seconds since the Unix epoch
+/// (R-C262). The store asks it once per operation and binds the answer into
+/// its SQL, so no statement reads SQLite's own clock.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> i64;
+}
+
+/// The wall clock. Truncated Unix seconds, the value SQLite `unixepoch()`
+/// returns, so the store's production behaviour is unchanged by the seam.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64)
+    }
+}
+
+/// A clock that stands still until [`ManualClock::advance`] moves it. It
+/// never moves backwards. For tests and the spec live adapter only; no
+/// production path constructs one.
+#[derive(Debug)]
+pub struct ManualClock(AtomicI64);
+
+impl ManualClock {
+    pub fn new(start: i64) -> Self {
+        Self(AtomicI64::new(start))
+    }
+    /// Start at the current wall-clock second.
+    pub fn starting_now() -> Self {
+        Self::new(SystemClock.now())
+    }
+    /// Move forward by `seconds` and return the new time.
+    pub fn advance(&self, seconds: u32) -> i64 {
+        let step = i64::from(seconds);
+        self.0.fetch_add(step, Ordering::SeqCst) + step
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl<C: Clock + ?Sized> Clock for Arc<C> {
+    fn now(&self) -> i64 {
+        (**self).now()
+    }
+}
+
+pub struct Store(Mutex<Connection>, Arc<dyn Clock>);
 #[derive(Debug)]
 pub struct SendOutcome {
     pub envelope: Value,
@@ -95,21 +154,32 @@ fn sql_err(e: rusqlite::Error) -> String {
 }
 
 impl Store {
+    /// The store's current time, in Unix seconds.
+    pub fn now(&self) -> i64 {
+        self.1.now()
+    }
     pub fn prune(&self) -> Result<(), String> {
+        let now = self.now();
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
-        db.execute("DELETE FROM messages WHERE (state='acked' AND acked_at<=unixepoch()-604800) OR (state!='acked' AND created_at<=unixepoch()-2592000)", []).map_err(sql_err)?;
+        db.execute("DELETE FROM messages WHERE (state='acked' AND acked_at<=?1-604800) OR (state!='acked' AND created_at<=?1-2592000)", [now]).map_err(sql_err)?;
         Ok(())
     }
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::open_with_clock(path, Arc::new(SystemClock))
+    }
+    pub fn open_with_clock(path: impl AsRef<Path>, clock: Arc<dyn Clock>) -> Result<Self, String> {
         let db = Connection::open(path).map_err(sql_err)?;
-        let store = Self::init(db)?;
+        let store = Self::init(db, clock)?;
         store.prune()?;
         Ok(store)
     }
     pub fn memory() -> Result<Self, String> {
-        Self::init(Connection::open_in_memory().map_err(sql_err)?)
+        Self::memory_with_clock(Arc::new(SystemClock))
     }
-    fn init(db: Connection) -> Result<Self, String> {
+    pub fn memory_with_clock(clock: Arc<dyn Clock>) -> Result<Self, String> {
+        Self::init(Connection::open_in_memory().map_err(sql_err)?, clock)
+    }
+    fn init(db: Connection, clock: Arc<dyn Clock>) -> Result<Self, String> {
         db.busy_timeout(Duration::from_secs(5)).map_err(sql_err)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS sessions (
@@ -138,7 +208,7 @@ impl Store {
             [&key[..]],
         )
         .map_err(sql_err)?;
-        Ok(Self(Mutex::new(db)))
+        Ok(Self(Mutex::new(db), clock))
     }
     pub fn body_hmac(&self, body: &str) -> Result<String, String> {
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
@@ -178,10 +248,11 @@ impl Store {
         if !valid_agent_id(&id) {
             return Err("invalid agent id".into());
         }
+        let now = self.now();
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
-        db.execute("INSERT INTO sessions(agent_id,harness,host,proc_start,last_seen) VALUES(?1,?2,?3,?4,unixepoch())
+        db.execute("INSERT INTO sessions(agent_id,harness,host,proc_start,last_seen) VALUES(?1,?2,?3,?4,?5)
                     ON CONFLICT(agent_id) DO UPDATE SET proc_start=excluded.proc_start,last_seen=excluded.last_seen,ended=0",
-            params![id,harness,host,proc_start]).map_err(sql_err)?;
+            params![id,harness,host,proc_start,now]).map_err(sql_err)?;
         Ok(json!({"agent_id":id,"lease_seconds":900}))
     }
     pub fn end(&self, me: &str, proc_start: &str) -> Result<Value, String> {
@@ -195,6 +266,7 @@ impl Store {
         Ok(json!({"agent_id":me,"state":if changed == 1 {"ended"} else {"unknown"}}))
     }
     pub fn peers(&self, me: Option<&str>) -> Result<Value, String> {
+        let now = self.now();
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
         if let Some(me) = me {
             if !valid_agent_id(me) {
@@ -202,8 +274,8 @@ impl Store {
             }
             let updated = db
                 .execute(
-                    "UPDATE sessions SET last_seen=unixepoch(), ended=0 WHERE agent_id=?1",
-                    [me],
+                    "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
+                    params![me, now],
                 )
                 .map_err(sql_err)?;
             if updated == 0 {
@@ -215,7 +287,7 @@ impl Store {
             let seen: i64 = r.get(4)?; let ended: i64 = r.get(5)?;
             Ok(json!({"agent_id":r.get::<_,String>(0)?,"harness":r.get::<_,String>(1)?,"host":r.get::<_,String>(2)?,
                 "proc_start":r.get::<_,String>(3)?,"last_seen":seen,
-                "state":if ended != 0 {"ended"} else if seen >= now()-900 {"live"} else if seen >= now()-21600 {"idle"} else {"gone"}}))
+                "state":if ended != 0 {"ended"} else if seen >= now-900 {"live"} else if seen >= now-21600 {"idle"} else {"gone"}}))
         }).map_err(sql_err)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map(|v| json!({"peers":v}))
@@ -350,6 +422,7 @@ impl Store {
                 .and_then(Value::as_u64)
                 .map(|n| n.min(u32::MAX as u64) as u32),
         );
+        let now = self.now();
         let mut db = self.0.lock().map_err(|_| "store lock poisoned")?;
         if let Some(value) = input.get("reply_expires") {
             let stamp = value
@@ -381,8 +454,8 @@ impl Store {
             }
             let envelope = serde_json::from_str(&envelope).map_err(|e| e.to_string())?;
             tx.execute(
-                "UPDATE sessions SET last_seen=unixepoch(), ended=0 WHERE agent_id=?1",
-                [sender],
+                "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
+                params![sender, now],
             )
             .map_err(sql_err)?;
             tx.commit().map_err(sql_err)?;
@@ -430,26 +503,28 @@ impl Store {
         map.insert("reply_to".into(), json!(format!("ag:{sender}")));
         map.remove("ttl_hours");
         let sent_at: String = tx
-            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%SZ',?1,'unixepoch')",
+                [now],
+                |r| r.get(0),
+            )
             .map_err(sql_err)?;
         map.insert("sent_at".into(), json!(sent_at));
         let expires_at: String = tx
             .query_row(
-                "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now',?1)",
-                [format!("+{} seconds", i64::from(ttl) * 3600)],
+                "SELECT strftime('%Y-%m-%dT%H:%M:%SZ',?1,'unixepoch',?2)",
+                params![now, format!("+{} seconds", i64::from(ttl) * 3600)],
                 |r| r.get(0),
             )
             .map_err(sql_err)?;
         map.insert("expires_at".into(), json!(expires_at));
         tx.execute("INSERT INTO messages(msg_id,thread_id,seq,sender,recipient,body,envelope,created_at,expires_at)
-                    VALUES(?1,?2,?3,?4,?5,?6,?7,unixepoch(),unixepoch()+?8)",
-            params![msg_id,thread_id,seq,sender,recipient,body,envelope.to_string(),i64::from(ttl)*3600]).map_err(sql_err)?;
+                    VALUES(?1,?2,?3,?4,?5,?6,?7,?9,?9+?8)",
+            params![msg_id,thread_id,seq,sender,recipient,body,envelope.to_string(),i64::from(ttl)*3600,now]).map_err(sql_err)?;
         tx.execute("INSERT INTO counters(name,value) VALUES('messages_total',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
         tx.execute(
-            "UPDATE sessions SET last_seen=unixepoch(), ended=0 WHERE agent_id=?1",
-            [sender],
+            "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
+            params![sender, now],
         )
         .map_err(sql_err)?;
         tx.commit().map_err(sql_err)?;
@@ -463,11 +538,12 @@ impl Store {
         if !valid_agent_id(me) {
             return Err("invalid agent id".into());
         }
+        let now = self.now();
         let mut db = self.0.lock().map_err(|_| "store lock poisoned")?;
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
-        tx.execute("UPDATE messages SET state='expired' WHERE state!='acked' AND state!='expired' AND expires_at<=unixepoch()",[]).map_err(sql_err)?;
+        tx.execute("UPDATE messages SET state='expired' WHERE state!='acked' AND state!='expired' AND expires_at<=?1",[now]).map_err(sql_err)?;
         let messages: Vec<(String, String)> = {
             let mut stmt = tx.prepare("SELECT msg_id,envelope FROM messages WHERE recipient=?1 AND state IN ('queued','notified','fetched') ORDER BY created_at,seq LIMIT ?2").map_err(sql_err)?;
             let rows = stmt
@@ -479,8 +555,8 @@ impl Store {
             tx.execute("UPDATE messages SET state='fetched',delivery_count=delivery_count+1 WHERE msg_id=?1",[id]).map_err(sql_err)?;
         }
         tx.execute(
-            "UPDATE sessions SET last_seen=unixepoch(), ended=0 WHERE agent_id=?1",
-            [me],
+            "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
+            params![me, now],
         )
         .map_err(sql_err)?;
         let values = messages
@@ -505,8 +581,9 @@ impl Store {
         if !valid_agent_id(me) || !valid_ulid(msg_id) {
             return Err("invalid identity or msg_id".into());
         }
+        let now = self.now();
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
-        let n = db.execute("UPDATE messages SET state='acked',acked_at=unixepoch() WHERE msg_id=?1 AND recipient=?2 AND expires_at>unixepoch() AND state IN ('queued','notified','fetched')",params![msg_id,me]).map_err(sql_err)?;
+        let n = db.execute("UPDATE messages SET state='acked',acked_at=?3 WHERE msg_id=?1 AND recipient=?2 AND expires_at>?3 AND state IN ('queued','notified','fetched')",params![msg_id,me,now]).map_err(sql_err)?;
         if n == 0 {
             let prior: Option<String> = db
                 .query_row(
@@ -521,13 +598,14 @@ impl Store {
             }
         }
         db.execute(
-            "UPDATE sessions SET last_seen=unixepoch(), ended=0 WHERE agent_id=?1",
-            [me],
+            "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
+            params![me, now],
         )
         .map_err(sql_err)?;
         Ok(json!({"msg_id":msg_id,"state":"acked"}))
     }
     pub fn metrics(&self) -> Result<String, String> {
+        let now = self.now();
         let db = self.0.lock().map_err(|_| "store lock poisoned")?;
         let sent: i64 = db
             .query_row(
@@ -540,15 +618,15 @@ impl Store {
             .unwrap_or(0);
         let unacked: i64 = db
             .query_row(
-                "SELECT COUNT(*) FROM messages WHERE state NOT IN ('acked','expired') AND expires_at>unixepoch()",
-                [],
+                "SELECT COUNT(*) FROM messages WHERE state NOT IN ('acked','expired') AND expires_at>?1",
+                [now],
                 |r| r.get(0),
             )
             .map_err(sql_err)?;
         let live: i64 = db
             .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE ended=0 AND last_seen>=unixepoch()-900",
-                [],
+                "SELECT COUNT(*) FROM sessions WHERE ended=0 AND last_seen>=?1-900",
+                [now],
                 |r| r.get(0),
             )
             .map_err(sql_err)?;
@@ -557,15 +635,115 @@ impl Store {
         ))
     }
 }
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 2023-11-14T22:13:20Z.
+    const T0: i64 = 1_700_000_000;
+
+    fn clocked() -> (Store, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new(T0));
+        (Store::memory_with_clock(clock.clone()).unwrap(), clock)
+    }
+
+    fn row_count(s: &Store) -> i64 {
+        s.0.lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn system_clock_matches_sqlite_unixepoch() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = SystemClock.now();
+        let sqlite: i64 = db
+            .query_row("SELECT unixepoch()", [], |r| r.get(0))
+            .unwrap();
+        let after = SystemClock.now();
+        assert!(before <= sqlite && sqlite <= after);
+        assert!((Store::memory().unwrap().now() - SystemClock.now()).abs() <= 2);
+    }
+
+    #[test]
+    fn manual_clock_moves_only_forward_and_only_when_told() {
+        let clock = ManualClock::new(T0);
+        assert_eq!(clock.now(), T0);
+        assert_eq!(clock.now(), T0);
+        assert_eq!(clock.advance(0), T0);
+        assert_eq!(clock.advance(901), T0 + 901);
+        assert_eq!(clock.advance(u32::MAX), T0 + 901 + i64::from(u32::MAX));
+        let shared: Arc<dyn Clock> = Arc::new(ManualClock::new(5));
+        assert_eq!(shared.now(), 5);
+    }
+
+    #[test]
+    fn lease_bands_follow_the_injected_clock() {
+        let (s, clock) = clocked();
+        let me = s.register(&json!({"harness":"claude","host":"honey","pid":1,"session_id":"a","proc_start":"1"})).unwrap()["agent_id"].as_str().unwrap().to_owned();
+        let state = |s: &Store| s.peers(None).unwrap()["peers"][0]["state"].clone();
+        assert_eq!(s.peers(None).unwrap()["peers"][0]["last_seen"], T0);
+        clock.advance(900);
+        assert_eq!(state(&s), "live");
+        clock.advance(1);
+        assert_eq!(state(&s), "idle");
+        clock.advance(21600 - 901);
+        assert_eq!(state(&s), "idle");
+        assert!(s.metrics().unwrap().contains("swb_sessions{state=\"live\"} 0\n"));
+        clock.advance(1);
+        assert_eq!(state(&s), "gone");
+        let renewed = s.peers(Some(&me)).unwrap();
+        assert_eq!(renewed["peers"][0]["state"], "live");
+        assert_eq!(renewed["peers"][0]["last_seen"], T0 + 21601);
+        assert!(s.metrics().unwrap().contains("swb_sessions{state=\"live\"} 1\n"));
+    }
+
+    #[test]
+    fn envelope_times_and_expiry_follow_the_injected_clock() {
+        let (s, clock) = clocked();
+        let to = "pi:sting:2:b";
+        let sent = s
+            .send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"hi","ttl_hours":1}))
+            .unwrap();
+        assert_eq!(sent.envelope["sent_at"], "2023-11-14T22:13:20Z");
+        assert_eq!(sent.envelope["expires_at"], "2023-11-14T23:13:20Z");
+        let id = sent.envelope["msg_id"].as_str().unwrap().to_owned();
+        clock.advance(3599);
+        assert_eq!(s.inbox(to, 10).unwrap()["messages"].as_array().unwrap().len(), 1);
+        assert!(s.metrics().unwrap().contains("swb_mailbox_unacked 1\n"));
+        clock.advance(1);
+        assert!(s.metrics().unwrap().contains("swb_mailbox_unacked 0\n"));
+        assert!(s.inbox(to, 10).unwrap()["messages"].as_array().unwrap().is_empty());
+        assert_eq!(s.ack(to, &id).unwrap_err(), "message unavailable");
+    }
+
+    #[test]
+    fn retention_follows_the_injected_clock() {
+        let (s, clock) = clocked();
+        let from = "claude:honey:1:a";
+        let to = "pi:sting:2:b";
+        let thread = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let send = |s: &Store, body: &str| {
+            s.send(&json!({"from":from,"to":to,"ticket":"none","body":body,"thread_id":thread}))
+                .unwrap()
+                .envelope
+        };
+        let acked = send(&s, "acked")["msg_id"].as_str().unwrap().to_owned();
+        send(&s, "unacked");
+        clock.advance(10);
+        s.ack(to, &acked).unwrap();
+        clock.advance(604_799);
+        s.prune().unwrap();
+        assert_eq!(row_count(&s), 2);
+        clock.advance(1);
+        s.prune().unwrap();
+        assert_eq!(row_count(&s), 1);
+        clock.advance(2_592_000 - 604_810);
+        s.prune().unwrap();
+        assert_eq!(row_count(&s), 0);
+        assert_eq!(send(&s, "after prune")["seq"], 3);
+    }
+
     #[test]
     fn ttl_defaults_and_clamps() {
         assert_eq!(effective_ttl_hours(None), 72);

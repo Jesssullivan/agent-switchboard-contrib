@@ -292,6 +292,10 @@ fn main() -> ExitCode {
             let listen = std::env::var("SWB_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
             let metrics =
                 std::env::var("SWB_METRICS_LISTEN").unwrap_or_else(|_| "0.0.0.0:9090".into());
+            #[cfg(feature = "test-clock")]
+            if std::env::var("SWB_TEST_CLOCK").as_deref() == Ok("1") {
+                return serve_test_clock(&path, &listen, &metrics);
+            }
             let store = swb_store::Store::open(&path).unwrap_or_else(|e| {
                 eprintln!("store: {e}");
                 std::process::exit(1)
@@ -322,6 +326,39 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("usage: swb <serve|agentd|hook <harness> <event>|whoami|inbox|version>");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// R-C262: `swb serve` on a manual clock that only `POST /v1/test/clock`
+/// moves, for the spec live adapter. Compiled only with the `test-clock`
+/// feature and used only when `SWB_TEST_CLOCK=1`; both listeners must be
+/// loopback.
+#[cfg(feature = "test-clock")]
+fn serve_test_clock(path: &str, listen: &str, metrics: &str) -> ExitCode {
+    let clock = std::sync::Arc::new(swb_store::ManualClock::starting_now());
+    let store = swb_store::Store::open_with_clock(path, clock.clone()).unwrap_or_else(|e| {
+        eprintln!("store: {e}");
+        std::process::exit(1)
+    });
+    eprintln!("swb serve: SWB_TEST_CLOCK=1, manual clock at {}", store.now());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("runtime: {e}");
+            std::process::exit(1)
+        });
+    match runtime.block_on(swb_broker::test_clock::serve(
+        std::sync::Arc::new(store),
+        clock,
+        listen,
+        metrics,
+    )) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("serve: {e}");
+            ExitCode::FAILURE
         }
     }
 }

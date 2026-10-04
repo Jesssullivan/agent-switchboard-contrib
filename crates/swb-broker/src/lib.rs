@@ -289,19 +289,47 @@ async fn serve_until<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    serve_until_with(
+        store,
+        listen,
+        metrics_listen,
+        prune_interval,
+        drain_timeout,
+        shutdown,
+        Router::new(),
+    )
+    .await
+}
+
+/// `serve_until` plus `extra` routes merged into the main listener. Production
+/// passes an empty router; only the `test-clock` feature passes anything else.
+async fn serve_until_with<F>(
+    store: Arc<Store>,
+    listen: &str,
+    metrics_listen: &str,
+    prune_interval: Duration,
+    drain_timeout: Duration,
+    shutdown: F,
+    extra: Router,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let main_listener = tokio::net::TcpListener::bind(listen).await?;
     let metrics_listener = tokio::net::TcpListener::bind(metrics_listen).await?;
-    serve_bound(
+    serve_bound_with(
         store,
         main_listener,
         metrics_listener,
         prune_interval,
         drain_timeout,
         shutdown,
+        extra,
     )
     .await
 }
 
+#[cfg(test)]
 async fn serve_bound<F>(
     store: Arc<Store>,
     main_listener: tokio::net::TcpListener,
@@ -309,6 +337,30 @@ async fn serve_bound<F>(
     prune_interval: Duration,
     drain_timeout: Duration,
     shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_bound_with(
+        store,
+        main_listener,
+        metrics_listener,
+        prune_interval,
+        drain_timeout,
+        shutdown,
+        Router::new(),
+    )
+    .await
+}
+
+async fn serve_bound_with<F>(
+    store: Arc<Store>,
+    main_listener: tokio::net::TcpListener,
+    metrics_listener: tokio::net::TcpListener,
+    prune_interval: Duration,
+    drain_timeout: Duration,
+    shutdown: F,
+    extra: Router,
 ) -> io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -326,7 +378,7 @@ where
     store.prune().map_err(io::Error::other)?;
     let config = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
     let mcp_cancel = config.cancellation_token.clone();
-    let app = router_with_config(Arc::clone(&store), config);
+    let app = router_with_config(Arc::clone(&store), config).merge(extra);
     let metrics_app = Router::new()
         .route("/metrics", get(metrics))
         .with_state(Arc::clone(&store));
@@ -384,6 +436,134 @@ where
         }
     }
     Ok(())
+}
+
+/// Test-only time control for the spec live adapter (R-C262). Compiled only
+/// with the `test-clock` Cargo feature, which no production target enables:
+/// the `//crates/swb:swb` binary and the `//deploy:image` it ships are built
+/// without it. A broker built with it still runs on the wall clock unless
+/// `swb serve` is started with `SWB_TEST_CLOCK=1` on loopback listeners.
+#[cfg(feature = "test-clock")]
+pub mod test_clock {
+    use super::*;
+    use std::net::SocketAddr;
+    use swb_store::ManualClock;
+
+    /// Largest single advance: 400 days, past every retention bound.
+    pub const MAX_ADVANCE_SECONDS: u64 = 400 * 86_400;
+
+    /// `POST /v1/test/clock {"advance_seconds": n}` moves the clock forward
+    /// by n seconds (0 reads it) and returns `{"now": <unix seconds>}`.
+    pub fn router(clock: Arc<ManualClock>) -> Router {
+        Router::new()
+            .route("/v1/test/clock", post(advance))
+            .with_state(clock)
+    }
+
+    async fn advance(State(clock): State<Arc<ManualClock>>, Json(args): Json<Value>) -> Response {
+        match args
+            .get("advance_seconds")
+            .and_then(Value::as_u64)
+            .filter(|n| *n <= MAX_ADVANCE_SECONDS)
+        {
+            Some(n) => {
+                let now = clock.advance(n as u32);
+                (StatusCode::OK, Json(json!({"now":now}))).into_response()
+            }
+            None => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"invalid advance_seconds"})),
+            )
+                .into_response(),
+        }
+    }
+
+    /// Refuse any listener that is not a loopback socket address.
+    pub fn require_loopback(listen: &str) -> io::Result<()> {
+        match listen.parse::<SocketAddr>() {
+            Ok(address) if address.ip().is_loopback() => Ok(()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("test clock refuses non-loopback listener {listen:?}"),
+            )),
+        }
+    }
+
+    /// `serve` with the clock route on the main listener. Both listeners must
+    /// be loopback addresses.
+    pub async fn serve(
+        store: Arc<Store>,
+        clock: Arc<ManualClock>,
+        listen: &str,
+        metrics_listen: &str,
+    ) -> io::Result<()> {
+        require_loopback(listen)?;
+        require_loopback(metrics_listen)?;
+        serve_until_with(
+            store,
+            listen,
+            metrics_listen,
+            Duration::from_secs(3600),
+            Duration::from_secs(30),
+            shutdown_signal(),
+            router(clock),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        #[tokio::test]
+        async fn clock_route_drives_store_time() {
+            let clock = Arc::new(ManualClock::new(1_700_000_000));
+            let store = Arc::new(Store::memory_with_clock(clock.clone()).unwrap());
+            let app = router(clock).merge(super::super::router(
+                Arc::clone(&store),
+                vec!["localhost".into()],
+            ));
+            let post = |body: &'static str| {
+                Request::post("/v1/test/clock")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap()
+            };
+            let response = app
+                .clone()
+                .oneshot(post(r#"{"advance_seconds":901}"#))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["now"], 1_700_000_901);
+            assert_eq!(store.now(), 1_700_000_901);
+            for bad in [
+                r#"{"advance_seconds":-1}"#,
+                r#"{"advance_seconds":"1"}"#,
+                r#"{"advance_seconds":34560001}"#,
+                r#"{}"#,
+            ] {
+                let response = app.clone().oneshot(post(bad)).await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            assert_eq!(store.now(), 1_700_000_901);
+        }
+
+        #[test]
+        fn refuses_non_loopback_listeners() {
+            assert!(require_loopback("127.0.0.1:18080").is_ok());
+            assert!(require_loopback("[::1]:18080").is_ok());
+            assert!(require_loopback("0.0.0.0:8080").is_err());
+            assert!(require_loopback("100.85.46.118:8080").is_err());
+            assert!(require_loopback("localhost:8080").is_err());
+        }
+    }
 }
 
 #[cfg(test)]
