@@ -341,7 +341,10 @@ fn serve_test_clock(path: &str, listen: &str, metrics: &str) -> ExitCode {
         eprintln!("store: {e}");
         std::process::exit(1)
     });
-    eprintln!("swb serve: SWB_TEST_CLOCK=1, manual clock at {}", store.now());
+    eprintln!(
+        "swb serve: SWB_TEST_CLOCK=1, manual clock at {}",
+        store.now()
+    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

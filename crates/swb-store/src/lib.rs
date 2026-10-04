@@ -689,13 +689,21 @@ mod tests {
         assert_eq!(state(&s), "idle");
         clock.advance(21600 - 901);
         assert_eq!(state(&s), "idle");
-        assert!(s.metrics().unwrap().contains("swb_sessions{state=\"live\"} 0\n"));
+        assert!(
+            s.metrics()
+                .unwrap()
+                .contains("swb_sessions{state=\"live\"} 0\n")
+        );
         clock.advance(1);
         assert_eq!(state(&s), "gone");
         let renewed = s.peers(Some(&me)).unwrap();
         assert_eq!(renewed["peers"][0]["state"], "live");
         assert_eq!(renewed["peers"][0]["last_seen"], T0 + 21601);
-        assert!(s.metrics().unwrap().contains("swb_sessions{state=\"live\"} 1\n"));
+        assert!(
+            s.metrics()
+                .unwrap()
+                .contains("swb_sessions{state=\"live\"} 1\n")
+        );
     }
 
     #[test]
@@ -709,11 +717,22 @@ mod tests {
         assert_eq!(sent.envelope["expires_at"], "2023-11-14T23:13:20Z");
         let id = sent.envelope["msg_id"].as_str().unwrap().to_owned();
         clock.advance(3599);
-        assert_eq!(s.inbox(to, 10).unwrap()["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            s.inbox(to, 10).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(s.metrics().unwrap().contains("swb_mailbox_unacked 1\n"));
         clock.advance(1);
         assert!(s.metrics().unwrap().contains("swb_mailbox_unacked 0\n"));
-        assert!(s.inbox(to, 10).unwrap()["messages"].as_array().unwrap().is_empty());
+        assert!(
+            s.inbox(to, 10).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(s.ack(to, &id).unwrap_err(), "message unavailable");
     }
 
