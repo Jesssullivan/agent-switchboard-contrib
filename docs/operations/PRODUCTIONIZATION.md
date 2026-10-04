@@ -59,7 +59,14 @@ rebuilding or approving another image.
      its signature verifies, it points at the checked-out commit and that
      commit is on main; the signed source and all 27 protected inputs match;
   3. build `//deploy:image.digest` and `release-check --built-digest`: refuse
-     to push unless it equals the approved immutable digest;
+     to push unless it equals the approved immutable digest. The build runs
+     in the `release` devShell, which is `mkShellNoCC` (R-C282): `mkShell`
+     would put the Nix gcc-wrapper in `CC` and on `PATH`, rules_cc would
+     compile libsqlite3-sys with it, and the binary would carry `/nix/store`
+     paths and a Nix dynamic linker, so the digest could never reproduce
+     (R-C268). The step also refuses if `CC`, `CXX` or `NIX_CC` is set or
+     `cc`/`gcc` resolves into `/nix/store`, and passes the tagged commit as
+     `--embed_label` so the revision label matches the approved build;
   4. `bazelisk run //deploy:push` (digest only, `packages: write` token);
   5. read the manifest back from ghcr.io by digest, verify digest and byte
      size with `release-check --registry-manifest`, and keep the report,

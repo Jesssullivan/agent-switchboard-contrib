@@ -10,7 +10,9 @@ name: release
 #      the pinned release key, points at the checked-out commit, sits on main,
 #      and that all protected build/runtime inputs equal the approved signed
 #      source in docs/releases/approved-broker.json.
-#   2. Bazel builds //deploy:image.digest, and `release-check --built-digest`
+#   2. Bazel builds //deploy:image.digest with the host C toolchain (the
+#      release devShell is mkShellNoCC; R-C282) and the tagged commit as
+#      --embed_label (R-C268), and `release-check --built-digest`
 #      refuses unless it equals the approved immutable digest. A different
 #      image is a new publication that needs its own ruling, so nothing is
 #      pushed.
@@ -104,8 +106,28 @@ jobs:
           TAG: ${{ github.ref_name }}
           BAZELISK: ${{ steps.bazelisk.outputs.path }}
         run: |
+          # R-C282: Bazel must use the host C toolchain, never a Nix
+          # gcc-wrapper. The release devShell is mkShellNoCC; refuse here if a
+          # Nix compiler still reaches CC/CXX or PATH, because rules_cc would
+          # embed /nix/store paths and the digest could never match (R-C268).
+          for var in CC CXX NIX_CC; do
+            if [[ -n "${!var:-}" ]]; then
+              echo "::error::${var} is set (${!var}); the release build must not use a Nix C compiler"
+              exit 1
+            fi
+          done
+          for tool in cc gcc c++ g++; do
+            if path="$(command -v "$tool")" && [[ "$(readlink -f "$path")" == /nix/store/* ]]; then
+              echo "::error::${tool} resolves to ${path}; the release build must use the host C toolchain"
+              exit 1
+            fi
+          done
+          # R-C268: the image's org.opencontainers.image.revision label is the
+          # tagged commit, exactly as the approved double-build stamped it.
+          revision="$(git rev-parse 'HEAD^{commit}')"
           "$BAZELISK" --ignore_all_rc_files build --lockfile_mode=error \
             --platforms="$BAZEL_PLATFORM" --remote_executor= --remote_cache= \
+            --embed_label="$revision" \
             //deploy:image //deploy:image.digest
           python3 scripts/release-check.py --tag "$TAG" --main-ref origin/main \
             --built-digest bazel-bin/deploy/image.json.sha256
@@ -123,6 +145,7 @@ jobs:
             jq -n --arg auth "$auth" '{auths: {"ghcr.io": {auth: $auth}}}' > "$DOCKER_CONFIG/config.json" )
           "$BAZELISK" --ignore_all_rc_files run --lockfile_mode=error \
             --platforms="$BAZEL_PLATFORM" --remote_executor= --remote_cache= \
+            --embed_label="$(git rev-parse 'HEAD^{commit}')" \
             //deploy:push
 
       - name: Read the manifest back from the registry and verify it

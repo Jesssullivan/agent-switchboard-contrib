@@ -58,7 +58,14 @@
         # The tag-triggered release workflow (.github/workflows/release.yml)
         # runs its gates here: signature verification, release-check and the
         # registry readback. Bazelisk comes from the runner custody fact.
-        release = pkgs.mkShell {
+        # mkShellNoCC, not mkShell (R-C282): the Bazel image build runs in
+        # this shell, and mkShell's stdenv puts the Nix gcc-wrapper on PATH
+        # and in CC. rules_cc would then compile libsqlite3-sys with a
+        # /nix/store compiler, the binary would embed /nix/store paths and a
+        # Nix dynamic linker, and the image would not reproduce the approved
+        # digest (R-C268). Without a stdenv C compiler, Bazel uses the
+        # runner's host C toolchain, the same one the approved build used.
+        release = pkgs.mkShellNoCC {
           packages = with pkgs; [
             coreutils
             curl
