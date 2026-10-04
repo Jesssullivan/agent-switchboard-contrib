@@ -55,23 +55,72 @@ pass (SWB-R33, SWB-R34, SWB-R48).
 nix develop            # bazelisk, just, cargo (diagnostic), gh, jq
 just fork-setup        # origin = your fork, upstream = xoxd-ai (push disabled)
 just check             # rustfmt, clippy, unit + integration tests (Bazel)
-just build             # swb binary and OCI image
+just build             # swb binary (bazel-bin/crates/swb/swb) and OCI image
 just image             # build image and print its immutable GHCR reference
 just remote-check      # from neo: run `just check` on sting
+just spec-dhall        # formal-spec Dhall check (runs anywhere; see spec/README.md)
+just secrets-scan      # TruffleHog + gitleaks, as ci-ok requires
+just release-check     # verify the approved release's protected inputs
 just lock              # regenerate all three lock files together (linux x86_64)
 ```
 
-CI is `xoxd-ai/ci-templates` `rust-bazel-application.yml`, pinned by commit,
-on GloriousFlywheel runners. `ci-ok` is the required check, and changes land
-through the merge queue. See [AGENTS.md](AGENTS.md).
+Never build on neo; use `just remote-check` there. Fork convention, signed
+commits, CI and how a PR lands: [AGENTS.md](AGENTS.md) → "Fork convention
+and CI". Image publication and rollout gates:
+[docs/operations/PRODUCTIONIZATION.md](docs/operations/PRODUCTIONIZATION.md).
 
-Contributions arrive as pull requests from a private fork (`just fork-setup`)
-into `xoxd-ai/agent-switchboard` `main`.
+## Run locally
 
-After a reviewed main build, the explicit `bazelisk run //deploy:push` target
-publishes the image by digest without a mutable tag. Run `just image` on that
-same Linux/amd64 source revision and hand its `ghcr.io/xoxd-ai/agent-switchboard@sha256:…`
-reference to the blahaj owner. PR CI only builds the image and digest target;
-it does not publish. The rollout must supply the measured tailnet
-`SWB_MCP_ALLOWED_HOSTS` and a writable PVC directory for the image's nonroot
-UID 65532.
+On a build host (sting or honey), after `just build`. The broker binds
+loopback only, keeps its database in a scratch directory and exits on its
+own `timeout`, so nothing needs to be signalled afterwards.
+
+```sh
+swb=$PWD/bazel-bin/crates/swb/swb
+d="$(mktemp -d "$HOME/scratch-swb.XXXXXX")"
+timeout 600 env SWB_DB_PATH="$d/swb.sqlite3" SWB_LISTEN=127.0.0.1:18080 \
+  SWB_METRICS_LISTEN=127.0.0.1:19090 "$swb" serve &
+
+# Register two sessions the way the SessionStart hook does.
+# The hook reads session_id from stdin; the rest comes from the environment.
+export SWB_BROKER_URL=http://127.0.0.1:18080 SWB_HOST="$(hostname -s)" \
+  SWB_PROC_START=2026-10-04T00:00:00Z
+echo '{"session_id":"sess-a"}' | SWB_SESSION_PID=40001 "$swb" hook claude SessionStart
+echo '{"session_id":"sess-b"}' | SWB_SESSION_PID=40002 "$swb" hook codex SessionStart
+a="claude:$SWB_HOST:40001:sess-a" b="codex:$SWB_HOST:40002:sess-b"
+
+# There is no `swb send` or `swb ack` yet: use REST (or MCP at /mcp).
+curl -s "$SWB_BROKER_URL/v1/peers"
+curl -s -H 'content-type: application/json' "$SWB_BROKER_URL/v1/send" \
+  -d "{\"from\":\"$a\",\"to\":\"$b\",\"ticket\":\"none\",\"body\":\"hello\"}"
+SWB_AGENT_ID="$b" "$swb" inbox          # note the msg_id
+curl -s -H 'content-type: application/json' "$SWB_BROKER_URL/v1/ack" \
+  -d "{\"me\":\"$b\",\"msg_id\":\"<msg_id>\"}"
+```
+
+`swb hook` always exits 0 and prints nothing when a setting is missing
+(SWB-R10), so a silent hook can mean "not wired" as well as "no mail". Use
+`swb whoami` or `swb inbox`, which fail with exit 3 and name the missing
+setting.
+
+### Settings
+
+| Variable | Read by | Default | Notes |
+| --- | --- | --- | --- |
+| `SWB_DB_PATH` | `serve` | `/var/lib/swb/swb.sqlite3` | set it when not running as the image's UID 65532 |
+| `SWB_LISTEN` | `serve` | `0.0.0.0:8080` | MCP `/mcp` and REST `/v1/*` |
+| `SWB_METRICS_LISTEN` | `serve` | `0.0.0.0:9090` | `/metrics` |
+| `SWB_MCP_ALLOWED_HOSTS` | `serve` | `localhost,127.0.0.1,::1` | comma-separated `Host` allowlist for `/mcp`; a deployment sets its tailnet name |
+| `SWB_BROKER_URL` | `hook`, `whoami`, `inbox` | none | `http://host:port` only: no path, no trailing `/`, no `https` |
+| `SWB_HOST` | `hook`, `whoami` | none | host part of the agent id |
+| `SWB_SESSION_PID` | `hook`, `whoami` | none | nonzero integer |
+| `SWB_PROC_START` | `hook`, `whoami` | none | also the check on `/v1/end` |
+| `SWB_HARNESS` | `hook`, `whoami` | hook: its argument | `claude`, `kimi`, `codex`, `junie`, `opencode` or `pi` |
+| `SWB_SESSION_ID` | `whoami` | none | hooks read `session_id` from stdin instead |
+| `SWB_AGENT_ID` | `inbox` | none | `harness:host:pid:session_id` |
+
+REST routes: `POST /v1/register`, `POST /v1/end`, `GET /v1/peers[?me=]`,
+`POST /v1/send`, `GET /v1/inbox?me=[&limit=&wait_seconds=]`, `POST /v1/ack`.
+MCP tools at `/mcp`: `register`, `peers`, `send`, `inbox`, `ack`. A `ticket`
+is `TIN-<digits>` or `none`; a body is at most 16 KiB. CLI exit codes: 0 ok,
+2 usage, 3 missing setting or broker error, 1 `serve` failure.

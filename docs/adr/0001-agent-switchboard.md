@@ -1,9 +1,9 @@
 # ADR-0001: agent-switchboard
 
-- **Status:** Accepted (P0). P0 closed 2026-09-25; P1a (substrate) in
-  progress. The R0 revision of 2026-09-25 (this PR) is Proposed until it
-  merges through the queue, like [ADR-0002](0002-lgtm-plane.md), which
-  holds the LGTM plane itself.
+- **Status:** Accepted. P0 and R0 closed 2026-09-25; the R0 revision and
+  [ADR-0002](0002-lgtm-plane.md), which holds the LGTM plane, merged in
+  agent-switchboard #4. Phase status lives in [Phases](#phases) and
+  [PRODUCTIONIZATION](../operations/PRODUCTIONIZATION.md), not here.
 - **Date:** 2026-09-25 (revised 2026-09-25, R0)
 - **Linear:** TIN-4655
 - **Sources:**
@@ -555,8 +555,7 @@ P4, with the scrape job, dashboard and alert drill bundled into P3.
   P0 rulings, recorded as the two dated TIN-4655 comments above.
 - **R0: LGTM rulings.** Done 2026-09-25. Exit: TIN-4655 comment `73f1ce72`
   records the answers, and this revision plus ADR-0002 carry them
-  (SWB-R30). The repo note is
-  `docs/agent-notes/2026-09-25-TIN-4655-r0-lgtm-adr-revision.md`.
+  (SWB-R30).
 - **P1a: substrate** (this repo and its fork; tailnet-acl only if needed,
   since the tags are reused).
   - Scope: repo scaffold, ruleset, merge queue, private-fork org setting,

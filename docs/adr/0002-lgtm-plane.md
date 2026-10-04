@@ -1,7 +1,7 @@
 # ADR-0002: the LGTM plane
 
-- **Status:** Proposed, 2026-09-25. It becomes Accepted when its fork PR
-  merges through the queue (SWB-R30). The Opus refutation that SWB-R30
+- **Status:** Accepted: its fork PR, agent-switchboard #4, merged
+  (SWB-R30). Proposed 2026-09-25. The Opus refutation that SWB-R30
   requires ran on 2026-09-25 with the verdict "ship-with-fixes"; every
   problem it raised is handled in
   [Refutation review](#refutation-review-2026-09-25). Design choices below

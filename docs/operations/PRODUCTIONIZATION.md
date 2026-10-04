@@ -30,14 +30,13 @@ rebuilding or approving another image.
    the authority; never compile on Neo. The immutable candidate already has
    Honey `just check`, `build`, `image` and rootless startup receipts. Retain
    those exact-source receipts when only non-runtime tooling changes.
-4. Upstream #2–#6 were still open on 2026-09-30, with main at
-   `2a11acb2988a88ff0c5a6b6a7040487c6d55df0b`. Their pinned heads are in
-   the release ledger; #6 is `ff3f6f0c85344ef6ff6529200239cceaf140aa18`.
-   R49 authorizes local integration while GF is in development. Protected
-   GitHub main still requires signed commits, a fork PR, merge queue and
-   `ci-ok`; local integration does not satisfy that gate. Prepare reviewable
-   source in the fork and refresh exact PR heads before a future governed
-   landing. Do not enqueue or dispatch GF as part of this lane.
+4. Upstream #2–#8 and #10 have merged; open PR heads are in GitHub, and the
+   heads the SWB-R53 release was built from stay pinned in the release
+   ledger. R49 authorizes local integration while GF is in development, but
+   local integration does not satisfy the protected-main gate (signed
+   commits, a fork PR and `ci-ok`, landed by the queue or by an R-C228 admin
+   merge after sting validation). Do not enqueue or dispatch GF as part of
+   this lane.
 
 ## Secrets scan and CODEOWNERS
 
