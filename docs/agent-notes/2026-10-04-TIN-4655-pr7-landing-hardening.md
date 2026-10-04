@@ -88,3 +88,8 @@ was built, pushed to a registry, queued or merged.
   27 protected inputs are unchanged. Evaluated on neo with `nix eval` only;
   nothing was built.
 - Sting receipts for the new head are still owed (R-C228).
+- On `feat/tin-4655-release-workflow-20261004` (stacked on #7): the release
+  surfaces above are restored byte-for-byte from #7's former head `97d8281`
+  (`release.yml`, `release-signers.asc`, `release-check.py`, its tests, the
+  `release` devShell and `just release-check-tag`), with the doc paragraphs
+  and the CODEOWNERS line. `just release-check` passes and 17 tests pass.

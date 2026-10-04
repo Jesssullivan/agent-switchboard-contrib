@@ -39,7 +39,7 @@ rebuilding or approving another image.
    source in the fork and refresh exact PR heads before a future governed
    landing. Do not enqueue or dispatch GF as part of this lane.
 
-## Secrets scan and CODEOWNERS
+## Secrets scan, CODEOWNERS and tag-triggered release
 
 - `ci-ok` now also requires the `secrets-scan` job: the pinned
   `xoxd-ai/ci-templates` secrets-scan action (TruffleHog `--only-verified`,
@@ -49,9 +49,30 @@ rebuilding or approving another image.
   seat; it builds nothing) before a fork PR lands.
 - `.github/CODEOWNERS` names the owner for every path and the release
   surfaces. The ruleset does not require code-owner review.
-- The tag-triggered release workflow is not part of this change. Under
-  R-C238 it lands in its own pull request before `v0.1.0`; until then nothing
-  in this repository publishes an image.
+- `.github/workflows/release.yml` runs only for a signed annotated tag
+  `vMAJOR.MINOR.PATCH[-pre]` pushed to `xoxd-ai/agent-switchboard`. It depends
+  on no `merge_group` result (R-C228). It lands in its own PR before
+  `v0.1.0` (R-C238). Fail-closed order:
+  1. import `docs/releases/release-signers.asc` into an empty key ring and
+     require exactly the pinned primary fingerprint;
+  2. `release-check --tag TAG --main-ref origin/main`: the tag is annotated,
+     its signature verifies, it points at the checked-out commit and that
+     commit is on main; the signed source and all 27 protected inputs match;
+  3. build `//deploy:image.digest` and `release-check --built-digest`: refuse
+     to push unless it equals the approved immutable digest;
+  4. `bazelisk run //deploy:push` (digest only, `packages: write` token);
+  5. read the manifest back from ghcr.io by digest, verify digest and byte
+     size with `release-check --registry-manifest`, and keep the report,
+     manifest bytes and built digest as the `release-evidence-TAG` artifact.
+- `just release-check-tag TAG [MAIN_REF]` runs the step 2 gate locally.
+- The workflow writes evidence only. `publication_authorized` and
+  `live_acceptance` stay false; it never edits `approved-broker.json`. Today
+  the only image it can push is the SWB-R53 digest, and only if the tagged
+  tree's Bazel build reproduces it. Publishing any other image needs a new
+  ruling and a new approved release entry first.
+- Before the first tag: the `ghcr.io/xoxd-ai/agent-switchboard` package must
+  grant this repository's Actions write access, and the tinyland-nix runner
+  must reach ghcr.io. Neither has been exercised by this workflow yet.
 
 ## Packaging, retention and shutdown boundaries
 

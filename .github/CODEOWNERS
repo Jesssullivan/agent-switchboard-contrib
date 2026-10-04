@@ -6,4 +6,5 @@
 # Release provenance and publication (SWB-R53, R-N13).
 /docs/releases/                     @Jesssullivan
 /scripts/release-check.py           @Jesssullivan
+/.github/workflows/release.yml      @Jesssullivan
 /deploy/                            @Jesssullivan

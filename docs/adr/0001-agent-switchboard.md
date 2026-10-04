@@ -400,6 +400,13 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
     the full history), both gated like the Rust lane on fork PRs;
   - the image is published by digest from reviewed main by default; SWB-R50
     permits one exact local candidate exception while GF is in development;
+  - `.github/workflows/release.yml` publishes only on a signed annotated
+    `v*` tag on main, never on `pull_request` or `merge_group`. It builds
+    `//deploy:image.digest`, refuses to push unless that digest equals the
+    approved immutable digest in `docs/releases/approved-broker.json`
+    (SWB-R53), pushes by digest, reads the manifest back from ghcr.io and
+    verifies it with `release-check --registry-manifest`. A different image
+    still needs its own ruling and a new approved release entry;
   - the repo is private, as the template requires.
 - **Canonical repo:** `xoxd-ai/agent-switchboard`. Its ruleset on `main`
   requires:

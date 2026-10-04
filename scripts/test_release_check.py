@@ -119,5 +119,62 @@ class SourceTests(unittest.TestCase):
             check.check_source(Path("."), release)
 
 
+class TagTests(unittest.TestCase):
+    HEAD = "c" * 40
+
+    def exercise(self, tag="v1.0.0", kind="tag", commit=HEAD, verified=True, on_main=True, main_ref="main"):
+        def git(_repo, *args):
+            if args[0] == "cat-file":
+                return kind
+            if args[0] == "verify-tag" and not verified:
+                raise check.subprocess.CalledProcessError(1, "git verify-tag")
+            if args[0] == "rev-parse":
+                return self.HEAD if args[1] == "HEAD" else commit
+            if args[0] == "merge-base" and not on_main:
+                raise check.subprocess.CalledProcessError(1, "git merge-base")
+            return ""
+        with patch.object(check, "git", side_effect=git):
+            return check.check_tag(Path("."), tag, main_ref)
+
+    def test_signed_annotated_tag_on_main_passes(self):
+        report = self.exercise()
+        self.assertEqual((report["release_tag_commit"], report["release_tag_on_main"]), (self.HEAD, "main"))
+
+    def test_bad_name_or_lightweight_tag_refuses(self):
+        with self.assertRaisesRegex(ValueError, "tag name"):
+            self.exercise(tag="latest")
+        with self.assertRaisesRegex(ValueError, "annotated"):
+            self.exercise(kind="commit")
+
+    def test_unsigned_tag_refuses(self):
+        with self.assertRaisesRegex(ValueError, "signature"):
+            self.exercise(verified=False)
+
+    def test_tag_elsewhere_or_off_main_refuses(self):
+        with self.assertRaisesRegex(ValueError, "checked-out HEAD"):
+            self.exercise(commit="d" * 40)
+        with self.assertRaisesRegex(ValueError, "protected main"):
+            self.exercise(on_main=False)
+
+
+class BuiltDigestTests(unittest.TestCase):
+    APPROVED = "sha256:" + "a" * 64
+
+    def compare(self, text):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.json.sha256"
+            path.write_text(text)
+            return check.check_built_digest(path, {"image": "ghcr.io/xoxd-ai/agent-switchboard@" + self.APPROVED})
+
+    def test_approved_digest_passes(self):
+        self.assertEqual(self.compare(self.APPROVED + "\n"), self.APPROVED)
+
+    def test_other_or_malformed_digest_refuses(self):
+        with self.assertRaisesRegex(ValueError, "own ruling"):
+            self.compare("sha256:" + "b" * 64)
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            self.compare("sha256:../../x")
+
+
 if __name__ == "__main__":
     unittest.main()

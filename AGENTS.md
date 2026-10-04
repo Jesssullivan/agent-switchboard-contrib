@@ -87,6 +87,10 @@ When sources disagree, prefer them in this order:
   `--only-verified` and gitleaks with `.gitleaks.toml`, full history). It is
   skipped on a fork PR like the Rust lane, so run `nix develop --command just
   secrets-scan` before queueing.
+- **Release:** `.github/workflows/release.yml` runs only on a signed annotated
+  `v*` tag on main. It pushes only the approved immutable digest from
+  `docs/releases/approved-broker.json` (SWB-R53) and verifies the registry
+  readback; a different image needs its own ruling first.
 - **SWB-R49 local integration while GF is in development:** use
   `just local-integrate` with exact reviewed `PR@FULL_SHA` inputs to assemble
   a separate signed merge tree, then run `just remote-check honey` (Sting

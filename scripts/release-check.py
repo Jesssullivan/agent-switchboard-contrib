@@ -3,6 +3,10 @@
 
 No network, build, publication, activation or process-control action is taken.
 Supplied registry bytes are evidence from the caller, not a fresh pull proof.
+With --tag the check also binds a signed annotated release tag to HEAD (and,
+with --main-ref, to the protected main history); with --built-digest it refuses
+any locally built image whose digest is not the approved immutable digest, so
+the release workflow can never publish an image SWB-R53 did not approve.
 """
 import argparse
 import hashlib
@@ -66,6 +70,42 @@ def check_layout(layout, release):
     return {"verified_blob_count": len(manifest["layers"]) + 2, "platform": platform}
 
 
+TAG_NAME = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?")
+
+
+def check_tag(repo, tag, main_ref=None):
+    if not TAG_NAME.fullmatch(tag):
+        raise ValueError("release tag name must be vMAJOR.MINOR.PATCH[-pre]")
+    ref = "refs/tags/" + tag
+    if git(repo, "cat-file", "-t", ref) != "tag":
+        raise ValueError("release tag must be an annotated tag object")
+    # Verification has no timeout handler: it never signals a subprocess.
+    try:
+        git(repo, "verify-tag", ref)
+    except subprocess.CalledProcessError:
+        raise ValueError("release tag signature does not verify against the trusted key ring") from None
+    commit = git(repo, "rev-parse", ref + "^{commit}")
+    if commit != git(repo, "rev-parse", "HEAD"):
+        raise ValueError("release tag does not point at the checked-out HEAD")
+    report = {"release_tag": tag, "release_tag_commit": commit}
+    if main_ref:
+        try:
+            git(repo, "merge-base", "--is-ancestor", commit, main_ref)
+        except subprocess.CalledProcessError:
+            raise ValueError("release tag commit is not on the protected main history") from None
+        report["release_tag_on_main"] = main_ref
+    return report
+
+
+def check_built_digest(path, release):
+    built = path.read_text().strip()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", built):
+        raise ValueError("built image digest file is malformed")
+    if built != release["image"].rsplit("@", 1)[1]:
+        raise ValueError("built image differs from the approved immutable digest; a new image needs its own ruling")
+    return built
+
+
 def git(repo, *args):
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
@@ -106,12 +146,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--oci-layout", type=Path)
     parser.add_argument("--registry-manifest", type=Path)
+    parser.add_argument("--tag", help="signed annotated release tag that must point at HEAD")
+    parser.add_argument("--main-ref", help="ref whose history must contain the tag commit (requires --tag)")
+    parser.add_argument("--built-digest", type=Path, help="Bazel //deploy:image.digest output to compare")
     args = parser.parse_args()
+    if args.main_ref and not args.tag:
+        parser.error("--main-ref requires --tag")
     repo = Path(__file__).resolve().parents[1]
     report = {"rulings": ["SWB-R53", "SWB-R49", "R-N13"], "live_acceptance": False, "fresh_registry_pull": False, "publication_authorized": False}
     try:
         release = json.loads((repo / "docs/releases/approved-broker.json").read_text())
         report.update(check_source(repo, release), image=release["image"])
+        if args.tag:
+            report.update(check_tag(repo, args.tag, args.main_ref))
+        if args.built_digest:
+            report["built_digest_matches"] = check_built_digest(args.built_digest, release)
         if args.oci_layout:
             report["oci_evidence"] = check_layout(args.oci_layout, release)
         if args.registry_manifest:

@@ -63,6 +63,12 @@ release-check *args:
 release-check-test:
     python3 -m unittest discover -s scripts -p test_release_check.py
 
+# TIN-4655 (SWB-R53): verify a signed annotated release tag at HEAD that is on
+# upstream main, plus the approved source inputs. Read-only; the release
+# workflow runs the same gate before it builds or pushes anything.
+release-check-tag tag main_ref="upstream/main":
+    python3 ./scripts/release-check.py --tag {{ quote(tag) }} --main-ref {{ quote(main_ref) }}
+
 # The scanners CI's `secrets-scan` job runs (TruffleHog --only-verified, then
 # gitleaks with .gitleaks.toml) over the full history. Both ship in the
 # devShell: `nix develop --command just secrets-scan`. This is the pre-queue

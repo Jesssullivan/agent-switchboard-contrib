@@ -1,0 +1,159 @@
+name: release
+
+# Tag-triggered broker publication (TIN-4655; SWB-R53, R-N13, R-C228).
+#
+# Runs only for a signed annotated tag vMAJOR.MINOR.PATCH[-pre] pushed to
+# xoxd-ai/agent-switchboard. It never runs on pull_request or merge_group and
+# depends on no merge_group result. The order is fail-closed:
+#
+#   1. `release-check --tag --main-ref origin/main` proves the tag is signed by
+#      the pinned release key, points at the checked-out commit, sits on main,
+#      and that all protected build/runtime inputs equal the approved signed
+#      source in docs/releases/approved-broker.json.
+#   2. Bazel builds //deploy:image.digest, and `release-check --built-digest`
+#      refuses unless it equals the approved immutable digest. A different
+#      image is a new publication that needs its own ruling, so nothing is
+#      pushed.
+#   3. `bazelisk run //deploy:push` uploads by digest only (no mutable tag).
+#   4. The manifest is read back from ghcr.io by digest and checked with
+#      `release-check --registry-manifest` (digest and byte size).
+#   5. The report and raw manifest bytes are kept as a workflow artifact.
+#
+# The workflow writes evidence and grants no approval: release-check always
+# reports publication_authorized=false and live_acceptance=false.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Primary fingerprint of docs/releases/release-signers.asc. The imported
+  # key ring must contain exactly this primary key.
+  RELEASE_SIGNER_FPR: 161895136D2E5C292D2A663D0B01977B8DD5DA60
+  IMAGE_REPOSITORY: ghcr.io/xoxd-ai/agent-switchboard
+  BAZEL_PLATFORM: //platforms:x86_64-unknown-linux-gnu
+
+jobs:
+  publish:
+    name: publish approved broker image
+    if: github.repository == 'xoxd-ai/agent-switchboard' && github.ref_type == 'tag'
+    # Same single ARC scale-set label as ci.yml; extra labels never match a
+    # GloriousFlywheel scale set.
+    runs-on: tinyland-nix
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        shell: nix develop .#release --max-jobs 1 --cores 2 --command bash -euo pipefail {0}
+    steps:
+      - name: Validate trusted Bazelisk before checkout
+        id: bazelisk
+        uses: xoxd-ai/ci-templates/.github/actions/rust-bazel-binary-custody@ae836d8400d5784d74af4fecc020f225d1c2d08e # v5.1.1
+
+      - name: Check out the tagged revision with full history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore the annotated tag object
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # actions/checkout may leave a lightweight ref for the triggering tag.
+          # The repository is private and checkout did not persist credentials,
+          # so authenticate this one fetch through the environment (never argv).
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_VALUE_0
+          git fetch --no-tags --force origin "refs/tags/${TAG}:refs/tags/${TAG}" "refs/heads/main:refs/remotes/origin/main"
+
+      - name: Import the pinned release signer
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          install -d -m 0700 "$GNUPGHOME"
+          gpg --batch --import docs/releases/release-signers.asc
+          primaries="$(gpg --batch --with-colons --fingerprint | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;p=0}')"
+          if [[ "$primaries" != "$RELEASE_SIGNER_FPR" ]]; then
+            echo "::error::release signer key ring is not exactly ${RELEASE_SIGNER_FPR}"
+            exit 1
+          fi
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+      - name: Gate on signed tag, main ancestry and approved source
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 scripts/release-check.py --tag "$TAG" --main-ref origin/main
+
+      - name: Build the image digest and refuse anything unapproved
+        env:
+          TAG: ${{ github.ref_name }}
+          BAZELISK: ${{ steps.bazelisk.outputs.path }}
+        run: |
+          "$BAZELISK" --ignore_all_rc_files build --lockfile_mode=error \
+            --platforms="$BAZEL_PLATFORM" --remote_executor= --remote_cache= \
+            //deploy:image //deploy:image.digest
+          python3 scripts/release-check.py --tag "$TAG" --main-ref origin/main \
+            --built-digest bazel-bin/deploy/image.json.sha256
+
+      - name: Push the approved image by digest
+        env:
+          BAZELISK: ${{ steps.bazelisk.outputs.path }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
+          install -d -m 0700 "$DOCKER_CONFIG"
+          trap 'rm -f "$DOCKER_CONFIG/config.json"' EXIT
+          ( umask 077
+            auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+            jq -n --arg auth "$auth" '{auths: {"ghcr.io": {auth: $auth}}}' > "$DOCKER_CONFIG/config.json" )
+          "$BAZELISK" --ignore_all_rc_files run --lockfile_mode=error \
+            --platforms="$BAZEL_PLATFORM" --remote_executor= --remote_cache= \
+            //deploy:push
+
+      - name: Read the manifest back from the registry and verify it
+        env:
+          TAG: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          digest="$(tr -d '[:space:]' < bazel-bin/deploy/image.json.sha256)"
+          repo_path="${IMAGE_REPOSITORY#ghcr.io/}"
+          # Credentials reach curl on stdin (-K -), never in argv.
+          token="$(printf 'user = "x-access-token:%s"\n' "$GITHUB_TOKEN" \
+            | curl --proto '=https' --fail --silent --show-error -K - \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo_path}:pull" | jq -r .token)"
+          echo "::add-mask::${token}"
+          evidence="$RUNNER_TEMP/release-evidence"
+          install -d "$evidence"
+          printf 'header = "Authorization: Bearer %s"\n' "$token" \
+            | curl --proto '=https' --fail --silent --show-error -K - \
+            -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+            "https://ghcr.io/v2/${repo_path}/manifests/${digest}" \
+            --output "$evidence/registry-manifest.json"
+          python3 scripts/release-check.py --tag "$TAG" --main-ref origin/main \
+            --built-digest bazel-bin/deploy/image.json.sha256 \
+            --registry-manifest "$evidence/registry-manifest.json" \
+            | tee "$evidence/release-check.json"
+          cp bazel-bin/deploy/image.json.sha256 "$evidence/image.json.sha256"
+
+      - name: Keep the release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-evidence-${{ github.ref_name }}
+          path: ${{ runner.temp }}/release-evidence/
+          if-no-files-found: error
+          retention-days: 90

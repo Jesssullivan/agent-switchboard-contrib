@@ -55,6 +55,19 @@
             trufflehog
           ];
         };
+        # The tag-triggered release workflow (.github/workflows/release.yml)
+        # runs its gates here: signature verification, release-check and the
+        # registry readback. Bazelisk comes from the runner custody fact.
+        release = pkgs.mkShell {
+          packages = with pkgs; [
+            coreutils
+            curl
+            git
+            gnupg
+            jq
+            python3
+          ];
+        };
       });
 
       # The swb binary built with the toolchain rust-toolchain.toml pins

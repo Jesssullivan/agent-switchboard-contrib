@@ -20,7 +20,7 @@
     "agent_contract": "AGENTS.md and CLAUDE.md. Fork convention (ADR-0001, SWB-R08/SWB-R13), recorded here as free text because the manifest schema has no fork field: the canonical repo is xoxd-ai/agent-switchboard, and the private fork is Jesssullivan/agent-switchboard. In a clone, origin is the fork and the only push target; upstream is xoxd-ai with its push URL set to DISABLED (just fork-setup). Branches are <type>/tin-####-<slug>-<yyyymmdd>. PRs go from the fork to upstream main through the merge queue, or by an admin merge after validation on sting: the main ruleset's one bypass actor is the repository admin role (R-C237, matching lab R-C11; R-C228).",
     "just": "justfile",
     "nix": "flake.nix: the devShell, plus packages.{x86_64-linux,aarch64-darwin}.swb built with the rust-toolchain.toml release (1.97.1) for lab to consume (R-C239). Bazel is the build and test authority.",
-    "github_actions": ".github/workflows/ci.yml. ci-ok is the required aggregate of the rust lane and the secrets-scan job. The rust lane calls xoxd-ai/ci-templates rust-bazel-application.yml at ae836d8400d5784d74af4fecc020f225d1c2d08e (v5.1.1) for same-repository pull_request, merge_group and push to main. On fork pull requests both jobs are skipped (gated in merge queue), and the full lane runs on merge_group.",
+    "github_actions": ".github/workflows/ci.yml and .github/workflows/release.yml. ci-ok is the required aggregate of the rust lane and the secrets-scan job. The rust lane calls xoxd-ai/ci-templates rust-bazel-application.yml at ae836d8400d5784d74af4fecc020f225d1c2d08e (v5.1.1) for same-repository pull_request, merge_group and push to main. On fork pull requests both jobs are skipped (gated in merge queue), and the full lane runs on merge_group. release.yml runs only on a signed annotated v* tag on main and publishes only the approved immutable digest.",
     "secrets_scan": "gitleaks",
     "conformance": "just check (Bazel //:check: rustfmt, clippy, unit and integration tests), run on sting or honey (just remote-check from neo), plus just release-check, just release-check-test and just secrets-scan. CI runs the exact target lists in ci.yml, and its secrets-scan job (required through ci-ok) runs xoxd-ai/ci-templates .github/actions/secrets-scan at ae836d8400d5784d74af4fecc020f225d1c2d08e: TruffleHog --only-verified, then gitleaks with .gitleaks.toml over the full history."
   },
@@ -44,7 +44,7 @@
     "sbom": {
       "status": "planned",
       "formats": [],
-      "notes": "The broker ships as an OCI image published by digest; the only approved image is the one in docs/releases/approved-broker.json (SWB-R53), and the tag-triggered release workflow lands separately (R-C238). No SBOM format has been chosen; standardize through ci-templates before this moves to recipe-available."
+      "notes": "The broker ships as an OCI image published by digest only from a signed release tag on main through .github/workflows/release.yml, which refuses any digest other than the approved one in docs/releases/approved-broker.json (SWB-R53) and verifies the registry readback. No SBOM format has been chosen; standardize through ci-templates before this moves to recipe-available."
     }
   }
 }
