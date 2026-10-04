@@ -25,8 +25,9 @@
 This ADR is the approved plan with every P0 ruling applied. Where a P0 ruling
 changed the draft, the text below states the ruled design and cites the
 ruling ID. [Rulings](#rulings) gives the source and quote for every ID.
-Where the R0 round changed a line, the earlier text stays in a dated
-supersession note next to the new one; nothing is silently rewritten (R-N13).
+Earlier wording is not kept inline: the signed commits that replaced it,
+read with `git log -p -- docs/adr/0001-agent-switchboard.md`, are the record
+(R35, R-C275).
 
 ## Context
 
@@ -64,8 +65,6 @@ registered once on the tailnet so that new harness instances spawn nothing.
   read/query/context plane and never the commit path." Acks, claims,
   sequence and leases stay in the broker. The projection is
   [ADR-0002](0002-lgtm-plane.md).
-  - *Superseded wording (P0, 2026-09-25):* "self-registration is the source
-    of truth. LGTM is a view." The R0 answer was "Re-word, don't reverse".
 - **Delivery:** a mailbox plus native push where it exists, never tmux
   injection (SWB-R03).
 - **Hosting:** a blahaj pod, tailnet-only (SWB-R04).
@@ -103,9 +102,6 @@ registered once on the tailnet so that new harness instances spawn nothing.
     evidence in the P1b receipt, and never derived from pid ancestry
     (the R-N11 corollary). Until then Codex registration is its own P1b
     sub-exit, and the round trip does not silently depend on it.
-    - *Superseded (P0):* "Codex: its `notify` hook passes the thread UUID."
-    - *Superseded (refutation, 2026-09-25):* "`swb whoami` reads Codex's own
-      session records read-only" — a place, not a binding.
   - Junie, OpenCode, Pi: `swb whoami` reads `~/.junie/processes/*.json` and
     `~/.pi/agent/sessions` read-only, then calls `register`.
   - Every tool takes an explicit `me`, because the mcp-mux gateway hides
@@ -114,8 +110,6 @@ registered once on the tailnet so that new harness instances spawn nothing.
   - Heartbeat sources: the Claude/Kimi hooks (SessionStart, UserPromptSubmit,
     Stop) and every tool call. Codex heartbeats through tool calls only,
     because its `notify` slot is not lab's to declare (see Identity).
-    - *Superseded (P0):* "the hooks (SessionStart, UserPromptSubmit, Stop,
-      Codex `notify`) and every tool call."
   - States: `live` for 15 minutes, `idle` up to 6 hours, then `gone`.
     SessionEnd sets `ended`.
   - Host observations only corroborate a lease; they never renew it.
@@ -128,8 +122,7 @@ registered once on the tailnet so that new harness instances spawn nothing.
     with an opaque conflict, returns no stored receipt or metadata, and
     stores nothing. Exact retries remain idempotent.
     The global key makes the broker-derived trace id in ADR-0002 safe
-    to derive from `msg_id` alone. *Superseded 2026-09-26:* the proposal
-    returned the stored receipt even when the sender or body differed;
+    to derive from `msg_id` alone;
   - `thread_id` plus a per-thread `seq`, assigned inside the write
     transaction;
   - at-least-once delivery, with a `delivery_count` and receiver-side dedupe;
@@ -198,8 +191,6 @@ registered once on the tailnet so that new harness instances spawn nothing.
     scrubber (stdout → Alloy → Loki), so tinyland.dev's `loki.process`
     stage for the broker namespace gets a redaction step with the same
     pattern set as that scrubber (SWB-R34, 2026-09-25);
-    - *Superseded 2026-09-25:* "whether SWB-R19 accepts that or an
-      Alloy-side redaction stage is added is ADR-0002 → Open rulings 4";
   - bodies go only to Loki, "never into Tempo span attributes" (SWB-R26).
     Tempo truncates any attribute at 2048 bytes and the body cap is 16 KiB;
   - the route is broker stdout → Alloy `loki.source.kubernetes` →
@@ -219,9 +210,6 @@ registered once on the tailnet so that new harness instances spawn nothing.
     tailnet node is refused (SWB-R33, "Once ACL A is enforced live
     (Recommended)"). The line schema and the audit's reader scope are in
     [ADR-0002](0002-lgtm-plane.md).
-    - *Superseded 2026-09-25:* "carrying it onto TIN-4655 as SWB-R27's
-      decision, and whether bodies wait for TIN-4670's enforcement or only
-      for the decision, are asked in ADR-0002 → Open rulings 1."
 - **Failure behaviour (SWB-R10):** hooks time out after 2 s and always exit 0.
   The broker being down never blocks a harness.
 
@@ -256,9 +244,6 @@ registered once on the tailnet so that new harness instances spawn nothing.
   round trip. P1b includes an explicit combined broker plus LGTM read
   path with a measured tool budget. Pi's existing `zero` default remains
   until explicit profile selection. Pi can also use `swb inbox` via bash.
-- *Superseded 2026-09-26:* the September 25 design left Junie's `tracker`
-  and Pi's `agents` sessions without Grafana, left Pi's phase proposed,
-  and deferred whether to provide a combined path to the interview.
 
 ### Push
 
@@ -280,8 +265,6 @@ registered once on the tailnet so that new harness instances spawn nothing.
     (SWB-R48) and does not block the broker MVP. The broker remains the
     authority for consequential state. Census textfiles still require a
     declared writable path; neo has no textfile directory.
-    *Superseded 2026-09-26:* the unratified September 25 design said agentd
-    never emits OTLP anywhere and the broker is the only `swb` writer.
   - On neo and PZM `/nix` is an external volume, and a `/nix`-hosted
     LaunchDaemon on neo never started (dyld "file system sandbox blocked
     open()", lab `nix/darwin/modules/node-exporter-darwin.nix:14-33` at
@@ -300,8 +283,6 @@ registered once on the tailnet so that new harness instances spawn nothing.
 
 ### LGTM (read/query/context plane; the broker writes through)
 
-*Retitled 2026-09-25.* The P0 heading was "LGTM (view, not truth)". The P0
-text is kept below where it still holds, with dated notes where it changed.
 The plane itself — the Tempo dialog skeleton, the Loki line schema, the
 Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
 [ADR-0002](0002-lgtm-plane.md).
@@ -323,12 +304,11 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
   because honey has no ServiceMonitor CRDs. That job is the single writer of
   `swb_*` into Mimir (the registry's double-count rule); Alloy does not also
   scrape the broker.
-  - *Superseded 2026-09-25 (SWB-R28):* "Alert rules and dashboards belong to
-    blahaj; lab authors none." Now: "Dashboards go to tinyland.dev's owner
-    release, and paging alerts to blahaj prometheus-mail." prometheus-mail
-    sees `swb_*` through a federation match on the staging Prometheus (the
-    TIN-4324 precedent), never through a second scrape. lab still authors
-    neither.
+- **Dashboards and alerts (SWB-R28):** "Dashboards go to tinyland.dev's
+  owner release, and paging alerts to blahaj prometheus-mail."
+  prometheus-mail sees `swb_*` through a federation match on the staging
+  Prometheus (the TIN-4324 precedent), never through a second scrape. lab
+  authors neither.
 - **Census:** agentd writes `agents.prom` to node_exporter's textfile dir
   every 60 s: `swb_local_session{harness,pid,session_id,socket_ok}` and
   `swb_local_stale_sockets`.
@@ -482,7 +462,6 @@ Each phase's exit is checked before the next starts. Every phase writes a
 with the broker phases." The order is R0 → P1a → L0 → the SWB-R27 decision
 → P1b → L1 → L2 → P2 → L3 → P3 → L4 → P4, and L5 is off that sequence: it
 is independent of P4 and starts once its three gates hold (SWB-R36).
-*Superseded 2026-09-25 (SWB-R36):* the order ended "… → L4 → P4 → L5".
 The L phases are specified
 in [ADR-0002](0002-lgtm-plane.md); this list keeps the P phases and names
 the L phase between each pair. L0 comes after P1a in the sequence, and its
@@ -491,12 +470,9 @@ SWB-R27 decision, and L0's usable read plane for the combined Junie/Pi
 path (SWB-R41, SWB-R48). Collector scrubbing and telemetry provenance
 proof follow v1 functional proof; they do not block the broker MVP.
 Bodies remain off until the live ACL and redaction gates pass (SWB-R33,
-SWB-R34). *Superseded 2026-09-26:* "nothing in P1b consumes L0's output".
-Every drill
+SWB-R34). Every drill
 that stops, restarts or scales a process is performed by the operator
 (R-N11); the agent asks and records the result.
-*Superseded (P0):* the list read P0, P1a, P1b, P2, P3 ("Junie and LGTM"),
-P4, with the scrape job, dashboard and alert drill bundled into P3.
 
 - **P0: design and rulings.** Done 2026-09-25. Exit: the operator answered the
   P0 rulings, recorded as the two dated TIN-4655 comments above.
@@ -520,8 +496,6 @@ P4, with the scrape job, dashboard and alert drill bundled into P3.
     answer "A: tailnet ACL, admins + MCP" as SWB-R27's decision. Bodies
     still wait for ACL A to be enforced live (SWB-R33); that gate is L1's,
     not P1b's.
-  - *Superseded 2026-09-25:* "Its scope is in ADR-0002 → Risks and Open
-    rulings."
   - Under SWB-R49, local integration is an interim source-validation path,
     not evidence that this exit has passed.
 - **P1b: broker MVP.** Repos: this one, blahaj (the
@@ -533,11 +507,6 @@ P4, with the scrape job, dashboard and alert drill bundled into P3.
     SWB-R34) — and runs on SQLite on a
     PVC. The
     transactional outbox and the Tempo projector land in L2 (ADR-0002).
-    - *Superseded (P0):* "writes the audit stream with bodies (SWB-R19)".
-    - *Superseded 2026-09-25 (SWB-R33):* "without bodies until SWB-R27 is
-      decided".
-    - *Superseded (refutation, 2026-09-25):* "with the transactional
-      outbox (ADR-0002)" in P1b; ADR-0002 scopes the outbox to L2.
   - Lab adds the `agents` entry to `vars/mcp_registry.yml` for claude_code,
     codex and opencode (Kimi inherits), with `codex_startup_safe` set
     deliberately. It then runs `export-registries.py` and the Codex inventory
@@ -621,11 +590,6 @@ P4, with the scrape job, dashboard and alert drill bundled into P3.
   - Lab verifies the existing `ag` upstream and Junie reach delivered
     during P1b (SWB-R41), and adds the census textfile with a declared
     writable path per host (neo skipped).
-  - *Superseded 2026-09-26 (SWB-R41):* the initial Junie broker enrollment
-    was scheduled here. Its combined broker/LGTM functional path is P1b;
-    P3 retains census and follow-on verification.
-  - *Superseded (P0):* "tinyland.dev adds the scrape job. blahaj adds the
-    dashboard and an alert." Those are L3 (SWB-R28).
   - Exit, all must hold:
     - provisioning shows `tracker` at 100 tools or fewer and every name at 64
       characters or fewer;
@@ -638,19 +602,12 @@ P4, with the scrape job, dashboard and alert drill bundled into P3.
   - Exit: on neo, with the computer-use `notify` present, the Codex
     converge writer changes nothing (critique fix); a live-thread proof
     receipt exists before any daemon push is enabled.
-  - *Superseded (draft of this revision, 2026-09-25):* a P4 heading
-    "Pi profile, Codex registration and push" that carried the Pi profile
-    a second time; the Pi profile is now placed once, in P1b (SWB-R37).
 - **L5: harness-native telemetry.** Independent of P4; it starts once its
   three gates hold — the TIN-4668 scrubbed endpoint, its scrubber and the
   enforced ACL (ACL A applied by TIN-4670) — whatever P phase is current
   (SWB-R31, SWB-R32, SWB-R36). Tempo carries tool names, file paths and
   ticket IDs as span attributes; bodies and full content stay in Loki
   (SWB-R35). ADR-0002.
-  - *Superseded 2026-09-25 (SWB-R36):* "Gated on the scrubbed TIN-4668
-    endpoint, its scrubber and the SWB-R27 decision (ruling 4; SWB-R31,
-    SWB-R32). Whether it also waits for P4, as the adopted L0–L5 order
-    implies, is ADR-0002 → Open rulings 3."
 
 ## Rulings
 
