@@ -6,8 +6,8 @@ also holds the per-host push adapter (`swb agentd`) and the hook client
 (`swb hook`). Linear: TIN-4655.
 
 **Read first:** [ADR-0001](docs/adr/0001-agent-switchboard.md), the broker
-design. Its Rulings table holds `SWB-R01`..`SWB-R24` and the source/release
-rulings `SWB-R49`..`SWB-R54`.
+design. Its Rulings table holds `SWB-R01`..`SWB-R23` and the source/release
+rulings `SWB-R49`..`SWB-R54`; `SWB-R24` is recorded under its History.
 
 **Read second:** [ADR-0002](docs/adr/0002-lgtm-plane.md), the LGTM plane and
 the phase order. Its Rulings table holds `SWB-R25`..`SWB-R48`.
@@ -112,15 +112,19 @@ When sources disagree, prefer them in this order:
 ## Product invariants
 
 A summary of the rulings code must not break; the ADR Rulings tables carry
-the full text, and ADR-0002 carries the phase scope, host order and LGTM
-reader rules (`SWB-R37`..`SWB-R48`).
+the full text. ADR-0002 carries the phase scope and host order
+(`SWB-R37`..`SWB-R48`) and the LGTM lookup recipes.
 
 - The broker stamps `authority: peer` on every message and never emits
   `operator`. `operator_directed` is the sender's claim and needs a `ruling`
   pointer, which receivers check before acting (SWB-R14).
-- Self-registration is authoritative; the broker writes through to LGTM,
-  which is the read/query/context plane and never the commit path. Acks,
-  claims, sequence and leases stay in the broker (SWB-R02).
+- SWB-R02, verbatim: "Self-registration is authoritative; the broker writes
+  through to LGTM, which is the read/query/context plane and never the
+  commit path." Acks, claims, sequence and leases stay in the broker.
+- Readers of LGTM sort by `seq`, enumerate threads only through the broker
+  (a Loki or Tempo thread query is a sample, checked against `thread`'s max
+  `seq`), and treat an absence as "expired from the view or not projected".
+  ADR-0002's refutation review cites this line as the AGENTS.md reader rule.
 - Claims are advisory and always succeed. The only refusal is a second
   `exclusive` claim, which returns `held_by` (SWB-R16).
 - Hooks time out after 2 s and always exit 0 (SWB-R10).

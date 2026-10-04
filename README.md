@@ -66,7 +66,10 @@ just lock              # regenerate all three lock files together (linux x86_64)
 
 Never build on neo; use `just remote-check` there. Fork convention, signed
 commits, CI and how a PR lands: [AGENTS.md](AGENTS.md) → "Fork convention
-and CI". Image publication and rollout gates:
+and CI". PR CI builds the image and digest but never publishes; publication
+is the explicit `bazelisk run //deploy:push` target on a reviewed main build,
+by digest with no mutable tag. Release lock and rollout gates (including the
+tailnet `SWB_MCP_ALLOWED_HOSTS` and a PVC writable by UID 65532):
 [docs/operations/PRODUCTIONIZATION.md](docs/operations/PRODUCTIONIZATION.md).
 
 ## Run locally
@@ -80,6 +83,8 @@ swb=$PWD/bazel-bin/crates/swb/swb
 d="$(mktemp -d "$HOME/scratch-swb.XXXXXX")"
 timeout 600 env SWB_DB_PATH="$d/swb.sqlite3" SWB_LISTEN=127.0.0.1:18080 \
   SWB_METRICS_LISTEN=127.0.0.1:19090 "$swb" serve &
+# Wait for the listener: a hook that fires first fails silently (SWB-R10).
+until curl -sf http://127.0.0.1:19090/metrics >/dev/null; do sleep 0.1; done
 
 # Register two sessions the way the SessionStart hook does.
 # The hook reads session_id from stdin; the rest comes from the environment.
