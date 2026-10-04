@@ -72,9 +72,12 @@ cover a different image.
   then v0.1.0 ships the clock-seam image. SWB-R53 is never published. Until
   the successor record lands, merging this change makes `release-check`
   fail against SWB-R53, so it merges together with that record.
-- **Ruling ID.** R-C262 and R-C268 name the successor release `SWB-R54`,
-  but ADR-0001 already uses SWB-R54 for state custody (2026-09-27). The
-  successor needs a free ID from the operator before its record is written.
+- **Ruling ID: SWB-R55.** R-C262 and R-C268 named the successor release
+  `SWB-R54`, but ADR-0001 already uses SWB-R54 for state custody
+  (2026-09-27). R-C274 (operator interview 2026-10-04, TIN-4655 comment
+  `c4dfd4c8`) keeps SWB-R54 as custody, and the dated correction in
+  TIN-4655 comment `cdde44c6` names this release SWB-R55. Its record is
+  written under that ID.
 
 ## Secrets scan and CODEOWNERS
 
