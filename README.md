@@ -121,7 +121,8 @@ SWB_AGENT_ID="$b" "$swb" ack <msg_id>
 | `SWB_DB_PATH` | `serve` | `/var/lib/swb/swb.sqlite3` | set it when not running as the image's UID 65532 |
 | `SWB_LISTEN` | `serve` | `0.0.0.0:8080` | MCP `/mcp` and REST `/v1/*` |
 | `SWB_METRICS_LISTEN` | `serve` | `0.0.0.0:9090` | `/metrics` |
-| `SWB_MCP_ALLOWED_HOSTS` | `serve` | `localhost,127.0.0.1,::1` | comma-separated `Host` allowlist for `/mcp`; a deployment sets its tailnet name |
+| `SWB_MCP_ALLOWED_HOSTS` | `serve` | `localhost,127.0.0.1,::1` | comma-separated `Host` allowlist for every route on `SWB_LISTEN` (`/mcp` and `/v1/*`); a deployment sets its tailnet name. A host without a port admits any port. Missing or unlisted Host is 403; an empty list refuses to start |
+| `SWB_ALLOWED_ORIGINS` | `serve` | empty | comma-separated browser origins (`scheme://host[:port]` or `null`) admitted on `SWB_LISTEN`. Any request carrying another `Origin` is 403; requests without `Origin` (every `swb` and MCP client) pass |
 | `SWB_BROKER_URL` | every client verb | none | `http://host:port` only: no path, no trailing `/`, no `https` |
 | `SWB_HOST` | `hook`, `whoami`, `doctor` | none | host part of the agent id |
 | `SWB_SESSION_PID` | `hook`, `whoami`, `doctor` | none | nonzero integer |

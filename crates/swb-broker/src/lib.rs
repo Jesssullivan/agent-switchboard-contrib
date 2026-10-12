@@ -1,10 +1,13 @@
 //! Tailnet broker REST and rmcp Streamable HTTP server (SWB-R02, SWB-R14,
 //! SWB-R33, SWB-R46). Audit output omits bodies until SWB-R33/34 proof.
+//! Every route on the main listener passes the Host/Origin guard
+//! ([`RequestGuard`], ADR-0001 → Exposure and auth).
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Query, Request, State},
+    http::{HeaderMap, StatusCode, Uri, header, uri::Authority as UriAuthority},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -220,15 +223,218 @@ async fn metrics(State(store): State<Arc<Store>>) -> Response {
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
+
+/// The metrics listener's router. It carries no Host/Origin guard: it serves
+/// three aggregate counters with no identity, body or write path, it is a
+/// separate listener (`SWB_METRICS_LISTEN`) that a deployment keeps off the
+/// tailnet Service, and Prometheus scrapes it by pod address, a Host no
+/// broker allowlist names.
+fn metrics_router(store: Arc<Store>) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(store)
+}
+
+/// One normalized `Host` authority: lowercase host without IPv6 brackets,
+/// plus an optional port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+/// Parse a request `Host` value. Userinfo and anything that is not an
+/// RFC 3986 authority are refused.
+fn parse_request_authority(raw: &str) -> Option<HostAuthority> {
+    let authority = UriAuthority::try_from(raw.trim()).ok()?;
+    if authority.as_str().contains('@') || authority.host().is_empty() {
+        return None;
+    }
+    Some(HostAuthority {
+        host: normalize_host(authority.host()),
+        port: authority.port_u16(),
+    })
+}
+
+/// Parse an allowlist entry. Same rules as rmcp's `/mcp` check: an entry
+/// that is not an authority (a bare IPv6 literal such as `::1`) is kept as a
+/// host with no port.
+fn parse_allowed_authority(raw: &str) -> Option<HostAuthority> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    parse_request_authority(raw).or_else(|| {
+        Some(HostAuthority {
+            host: normalize_host(raw),
+            port: None,
+        })
+    })
+}
+
+/// A browser `Origin`: `null`, or a `(scheme, host, port)` tuple.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BrowserOrigin {
+    Null,
+    Tuple {
+        scheme: String,
+        host: String,
+        port: Option<u16>,
+    },
+}
+
+fn parse_origin(raw: &str) -> Option<BrowserOrigin> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("null") {
+        return Some(BrowserOrigin::Null);
+    }
+    let uri = Uri::try_from(raw).ok()?;
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    Some(BrowserOrigin::Tuple {
+        scheme: uri.scheme_str()?.to_ascii_lowercase(),
+        host: normalize_host(authority.host()),
+        port: authority.port_u16(),
+    })
+}
+
+/// DNS-rebinding guard for every route on the main listener: `/mcp`,
+/// every `/v1/*` route, the test-clock route and the 404 fallback.
+///
+/// - `Host` must be present, single, well formed and on the allowlist
+///   (`SWB_MCP_ALLOWED_HOSTS`). An entry without a port admits any port; an
+///   entry with a port admits only that port. Matching is case-insensitive.
+///   With no `Host` header the URI authority (HTTP/2 `:authority`) is used.
+/// - `Origin`, when present, must be on `SWB_ALLOWED_ORIGINS`, which is
+///   empty by default, so any browser-originated request is refused. The
+///   broker's clients (`swb`, hooks, channel, MCP harnesses) send no Origin.
+///
+/// Every refusal is HTTP 403 with a JSON `error`, before any handler runs.
+#[derive(Clone, Debug)]
+pub struct RequestGuard {
+    hosts: Vec<HostAuthority>,
+    origins: Vec<BrowserOrigin>,
+}
+
+impl RequestGuard {
+    /// Build a guard. An empty host allowlist is refused: rmcp reads an empty
+    /// list as "allow every Host", which is exactly the rebinding hole.
+    pub fn new(allowed_hosts: &[String], allowed_origins: &[String]) -> Result<Self, String> {
+        let hosts: Vec<_> = allowed_hosts
+            .iter()
+            .filter_map(|h| parse_allowed_authority(h))
+            .collect();
+        if hosts.is_empty() {
+            return Err("SWB_MCP_ALLOWED_HOSTS names no host; refusing to serve every Host".into());
+        }
+        let origins = allowed_origins
+            .iter()
+            .filter(|o| !o.trim().is_empty())
+            .map(|o| {
+                parse_origin(o).ok_or_else(|| format!("invalid SWB_ALLOWED_ORIGINS entry {o:?}"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { hosts, origins })
+    }
+
+    fn check(&self, uri: &Uri, headers: &HeaderMap) -> Result<(), &'static str> {
+        let mut values = headers.get_all(header::HOST).iter();
+        let host = match (values.next(), values.next()) {
+            (Some(_), Some(_)) => return Err("host not allowed"),
+            (Some(value), None) => value
+                .to_str()
+                .ok()
+                .and_then(parse_request_authority)
+                .ok_or("host not allowed")?,
+            (None, _) => uri
+                .authority()
+                .and_then(|a| parse_request_authority(a.as_str()))
+                .ok_or("missing host")?,
+        };
+        if !self.hosts.iter().any(|allowed| {
+            allowed.host == host.host && allowed.port.is_none_or(|p| host.port == Some(p))
+        }) {
+            return Err("host not allowed");
+        }
+        let mut origins = headers.get_all(header::ORIGIN).iter();
+        match (origins.next(), origins.next()) {
+            (None, _) => Ok(()),
+            (Some(_), Some(_)) => Err("origin not allowed"),
+            (Some(value), None) => {
+                let origin = value
+                    .to_str()
+                    .ok()
+                    .and_then(parse_origin)
+                    .ok_or("origin not allowed")?;
+                if self.origins.iter().any(|allowed| match (allowed, &origin) {
+                    (BrowserOrigin::Null, BrowserOrigin::Null) => true,
+                    (
+                        BrowserOrigin::Tuple { scheme, host, port },
+                        BrowserOrigin::Tuple {
+                            scheme: s,
+                            host: h,
+                            port: p,
+                        },
+                    ) => scheme == s && host == h && (port.is_none() || port == p),
+                    _ => false,
+                }) {
+                    Ok(())
+                } else {
+                    Err("origin not allowed")
+                }
+            }
+        }
+    }
+}
+
+async fn guard_request(
+    State(guard): State<Arc<RequestGuard>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match guard.check(request.uri(), request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(reason) => (StatusCode::FORBIDDEN, Json(json!({"error":reason}))).into_response(),
+    }
+}
+
+fn env_list(name: &str) -> Option<Vec<String>> {
+    std::env::var(name).ok().map(|v| {
+        v.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
 #[cfg(test)]
 fn router(store: Arc<Store>, allowed_hosts: Vec<String>) -> Router {
+    let guard = RequestGuard::new(&allowed_hosts, &[]).expect("test allowlist");
     router_with_config(
         store,
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
+        guard,
+        Router::new(),
     )
 }
 
-fn router_with_config(store: Arc<Store>, config: StreamableHttpServerConfig) -> Router {
+/// The main listener's app: `/mcp`, the `/v1/*` REST twin and `extra`, all
+/// behind one [`RequestGuard`] layer.
+fn router_with_config(
+    store: Arc<Store>,
+    config: StreamableHttpServerConfig,
+    guard: RequestGuard,
+    extra: Router,
+) -> Router {
     let factory_store = Arc::clone(&store);
     let service = StreamableHttpService::new(
         move || {
@@ -248,6 +454,11 @@ fn router_with_config(store: Arc<Store>, config: StreamableHttpServerConfig) -> 
         .route("/v1/inbox", get(inbox))
         .route("/v1/ack", post(ack))
         .with_state(store)
+        .merge(extra)
+        .layer(middleware::from_fn_with_state(
+            Arc::new(guard),
+            guard_request,
+        ))
 }
 pub async fn serve(store: Arc<Store>, listen: &str, metrics_listen: &str) -> io::Result<()> {
     serve_until(
@@ -365,23 +576,16 @@ async fn serve_bound_with<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let allowed_hosts = std::env::var("SWB_MCP_ALLOWED_HOSTS")
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
+    let allowed_hosts = env_list("SWB_MCP_ALLOWED_HOSTS")
         .unwrap_or_else(|| vec!["localhost".into(), "127.0.0.1".into(), "::1".into()]);
+    let allowed_origins = env_list("SWB_ALLOWED_ORIGINS").unwrap_or_default();
+    let guard = RequestGuard::new(&allowed_hosts, &allowed_origins)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     store.prune().map_err(io::Error::other)?;
     let config = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
     let mcp_cancel = config.cancellation_token.clone();
-    let app = router_with_config(Arc::clone(&store), config).merge(extra);
-    let metrics_app = Router::new()
-        .route("/metrics", get(metrics))
-        .with_state(Arc::clone(&store));
+    let app = router_with_config(Arc::clone(&store), config, guard, extra);
+    let metrics_app = metrics_router(Arc::clone(&store));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         shutdown.await;
@@ -553,6 +757,31 @@ pub mod test_clock {
                 assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             }
             assert_eq!(store.now(), 1_700_000_901);
+        }
+
+        #[tokio::test]
+        async fn clock_route_is_behind_the_host_guard() {
+            let clock = Arc::new(ManualClock::new(1_700_000_000));
+            let store = Arc::new(Store::memory_with_clock(clock.clone()).unwrap());
+            let app = super::super::router_with_config(
+                Arc::clone(&store),
+                StreamableHttpServerConfig::default(),
+                RequestGuard::new(&["127.0.0.1".into()], &[]).unwrap(),
+                router(clock),
+            );
+            let post = |host: &'static str| {
+                Request::post("/v1/test/clock")
+                    .header("host", host)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"advance_seconds":60}"#))
+                    .unwrap()
+            };
+            let refused = app.clone().oneshot(post("attacker.example")).await.unwrap();
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+            assert_eq!(store.now(), 1_700_000_000);
+            let allowed = app.oneshot(post("127.0.0.1:18080")).await.unwrap();
+            assert_eq!(allowed.status(), StatusCode::OK);
+            assert_eq!(store.now(), 1_700_000_060);
         }
 
         #[test]
@@ -940,6 +1169,316 @@ mod tests {
         let empty = mcp_call(&app, &session, 9, "inbox", json!({"me":to})).await;
         assert!(empty["messages"].as_array().unwrap().is_empty());
     }
+    /// Every state-bearing route on the main listener, with a request body
+    /// that would mutate or read state if the guard let it through.
+    const GUARDED_ROUTES: [(&str, &str, &str); 7] = [
+        (
+            "POST",
+            "/v1/register",
+            r#"{"harness":"claude","host":"honey","pid":1,"session_id":"a","proc_start":"1"}"#,
+        ),
+        (
+            "POST",
+            "/v1/end",
+            r#"{"me":"claude:honey:1:a","proc_start":"1"}"#,
+        ),
+        ("GET", "/v1/peers?me=claude:honey:1:a", ""),
+        (
+            "POST",
+            "/v1/send",
+            r#"{"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"rebound"}"#,
+        ),
+        ("GET", "/v1/inbox?me=pi:sting:2:b", ""),
+        (
+            "POST",
+            "/v1/ack",
+            r#"{"me":"pi:sting:2:b","msg_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
+        ),
+        (
+            "POST",
+            "/mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"rebind","version":"1"}}}"#,
+        ),
+    ];
+
+    fn guarded_request(
+        method: &str,
+        uri: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Body::from(body.to_owned())).unwrap()
+    }
+
+    async fn error_of(response: Response) -> String {
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn seeded_store() -> Arc<Store> {
+        let store = Arc::new(Store::memory().unwrap());
+        store
+            .register(
+                &json!({"harness":"pi","host":"sting","pid":2,"session_id":"b","proc_start":"2"}),
+            )
+            .unwrap();
+        store
+    }
+
+    fn state_snapshot(store: &Store) -> (usize, String) {
+        (
+            store.peers(None).unwrap()["peers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            store.metrics().unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn rebinding_host_is_refused_on_every_route_before_any_handler() {
+        let store = seeded_store();
+        let before = state_snapshot(&store);
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        for host in [
+            "attacker.example",
+            "attacker.example:8080",
+            "localhost.attacker.example",
+            "user@localhost",
+            "",
+        ] {
+            for (method, uri, body) in GUARDED_ROUTES {
+                let response = app
+                    .clone()
+                    .oneshot(guarded_request(method, uri, body, &[("host", host)]))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{method} {uri} Host {host:?}"
+                );
+                assert_eq!(error_of(response).await, "host not allowed");
+            }
+        }
+        assert_eq!(
+            state_snapshot(&store),
+            before,
+            "a refused request changed state"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_or_duplicate_host_is_refused_on_every_route() {
+        let store = seeded_store();
+        let before = state_snapshot(&store);
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        for (method, uri, body) in GUARDED_ROUTES {
+            let response = app
+                .clone()
+                .oneshot(guarded_request(method, uri, body, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_eq!(error_of(response).await, "missing host");
+            let response = app
+                .clone()
+                .oneshot(guarded_request(
+                    method,
+                    uri,
+                    body,
+                    &[("host", "localhost"), ("host", "attacker.example")],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+        assert_eq!(state_snapshot(&store), before);
+    }
+
+    #[tokio::test]
+    async fn allowed_host_with_or_without_port_reaches_the_handler() {
+        let app = router(
+            Arc::new(Store::memory().unwrap()),
+            vec![
+                "localhost".into(),
+                "::1".into(),
+                "mcp-agents.example.ts.net".into(),
+            ],
+        );
+        for host in [
+            "localhost",
+            "localhost:8080",
+            "LOCALHOST:18080",
+            "[::1]:8080",
+            "mcp-agents.example.ts.net:8080",
+        ] {
+            let register = app
+                .clone()
+                .oneshot(guarded_request(
+                    "POST",
+                    "/v1/register",
+                    GUARDED_ROUTES[0].2,
+                    &[("host", host)],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(register.status(), StatusCode::OK, "register Host {host:?}");
+            let peers = app
+                .clone()
+                .oneshot(guarded_request("GET", "/v1/peers", "", &[("host", host)]))
+                .await
+                .unwrap();
+            assert_eq!(peers.status(), StatusCode::OK, "peers Host {host:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn allowlist_entry_with_port_admits_only_that_port() {
+        let store = Arc::new(Store::memory().unwrap());
+        let guard = RequestGuard::new(&["swb.example:8080".into()], &[]).unwrap();
+        let app = router_with_config(
+            store,
+            StreamableHttpServerConfig::default().with_allowed_hosts(["swb.example:8080"]),
+            guard,
+            Router::new(),
+        );
+        for (host, status) in [
+            ("swb.example:8080", StatusCode::OK),
+            ("swb.example:9999", StatusCode::FORBIDDEN),
+            ("swb.example", StatusCode::FORBIDDEN),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(guarded_request("GET", "/v1/peers", "", &[("host", host)]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "Host {host:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_origin_is_refused_unless_allowlisted() {
+        let store = seeded_store();
+        let before = state_snapshot(&store);
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        for origin in [
+            "http://attacker.example",
+            "http://localhost:8080",
+            "null",
+            "not an origin",
+        ] {
+            for (method, uri, body) in GUARDED_ROUTES {
+                let response = app
+                    .clone()
+                    .oneshot(guarded_request(
+                        method,
+                        uri,
+                        body,
+                        &[("host", "localhost:8080"), ("origin", origin)],
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{method} {uri} Origin {origin:?}"
+                );
+                assert_eq!(error_of(response).await, "origin not allowed");
+            }
+        }
+        assert_eq!(state_snapshot(&store), before);
+        let allowed = router_with_config(
+            Arc::new(Store::memory().unwrap()),
+            StreamableHttpServerConfig::default(),
+            RequestGuard::new(&["localhost".into()], &["http://localhost:8080".into()]).unwrap(),
+            Router::new(),
+        );
+        for (origin, status) in [
+            ("http://localhost:8080", StatusCode::OK),
+            ("http://localhost:9999", StatusCode::FORBIDDEN),
+            ("https://localhost:8080", StatusCode::FORBIDDEN),
+        ] {
+            let response = allowed
+                .clone()
+                .oneshot(guarded_request(
+                    "GET",
+                    "/v1/peers",
+                    "",
+                    &[("host", "localhost:8080"), ("origin", origin)],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "Origin {origin:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_paths_are_guarded_and_metrics_is_not() {
+        let store = seeded_store();
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let refused = app
+            .clone()
+            .oneshot(guarded_request(
+                "GET",
+                "/healthz",
+                "",
+                &[("host", "attacker.example")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let not_found = app
+            .oneshot(guarded_request(
+                "GET",
+                "/healthz",
+                "",
+                &[("host", "localhost")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        // The metrics listener is deliberately unguarded (see metrics_router):
+        // Prometheus scrapes it by pod address, and it serves only aggregate
+        // counters.
+        let metrics = metrics_router(store)
+            .oneshot(guarded_request(
+                "GET",
+                "/metrics",
+                "",
+                &[("host", "10.42.0.17:9090")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(metrics.status(), StatusCode::OK);
+        let body = to_bytes(metrics.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("swb_messages_total"), "{text}");
+        assert!(
+            !text.contains("sting"),
+            "metrics leaked an identity: {text}"
+        );
+    }
+
+    #[test]
+    fn empty_or_invalid_allowlists_are_refused() {
+        assert!(RequestGuard::new(&[], &[]).is_err());
+        assert!(RequestGuard::new(&[" ".into()], &[]).is_err());
+        assert!(RequestGuard::new(&["localhost".into()], &["attacker.example".into()]).is_err());
+        assert!(RequestGuard::new(&["localhost".into()], &["https://app.example".into()]).is_ok());
+    }
+
     #[tokio::test]
     async fn conflict_is_opaque_over_rest() {
         let app = router(Arc::new(Store::memory().unwrap()), vec!["localhost".into()]);
@@ -949,6 +1488,7 @@ mod tests {
             let request = Request::builder()
                 .method("POST")
                 .uri("/v1/send")
+                .header("host", "localhost")
                 .header("content-type", "application/json")
                 .body(Body::from(args.to_string()))
                 .unwrap();

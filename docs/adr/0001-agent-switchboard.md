@@ -436,6 +436,37 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
     `mcp-agents-2`.
 - **Auth:** no bearer in v1, because messages carry no authority. If spoofing
   ever matters, add a per-host bearer later.
+- **Host and Origin guard (2026-10-12, TIN-4655; lab review of blahaj#2087,
+  TIN-5770 comment `e503f591`):** up to v0.2.1 the exact Host allowlist
+  (SWB-R52) reached only `/mcp`, through rmcp; the `/v1/*` REST twin had no
+  Host check. A DNS-rebinding page in a seat's browser could therefore
+  register, send, ack or end as any identity. The broker now runs one guard
+  layer over its whole main listener: `/mcp`, every `/v1/*` route, the
+  test-clock route and the 404 fallback.
+  - `Host` must be present, single, a well-formed authority without userinfo,
+    and on `SWB_MCP_ALLOWED_HOSTS` (the same list `/mcp` uses; the name is
+    kept so existing deployments need no change). A listed host without a
+    port admits any port, because `swb` sends `Host: host:port`; a listed
+    `host:port` admits only that port. Without a `Host` header the HTTP/2
+    `:authority` is used, as rmcp does.
+  - An empty allowlist is refused at startup, since rmcp reads an empty list
+    as "every Host".
+  - **Origin, defence in depth:** a request that carries `Origin` is refused
+    unless the origin is on `SWB_ALLOWED_ORIGINS`, which is empty by default.
+    Every broker client (`swb`, hooks, `swb channel`, the MCP harnesses) is a
+    non-browser client that sends no `Origin`, so the default refuses every
+    browser-originated request and admits every real client. A request with
+    no `Origin` is not refused, because non-browser clients omit it.
+  - Every refusal is HTTP 403 with a JSON `error` (`missing host`, `host not
+    allowed` or `origin not allowed`), returned before any handler reads a
+    body or touches the store.
+  - **Metrics is not guarded.** `/metrics` lives on the separate metrics
+    listener, serves three aggregate counters with no agent id or body, and
+    Prometheus scrapes it by pod address, which no Host allowlist names.
+    The deployment keeps that listener off the tailnet Service. There is no
+    `/healthz`; if one is added on the main listener it is guarded too.
+  - The release record still names v0.2.1 (SWB-R58). Shipping this guard as
+    an image needs its own release ruling and `approved-broker.json` update.
 - **Accepted trade-off:** anything that reaches `tag:k8s:*` can reach the
   broker. `authority: peer` stamping limits the damage. So does the fact that
   claims refuse only exclusive-vs-exclusive: a spoofed exclusive claim can
