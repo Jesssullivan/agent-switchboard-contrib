@@ -206,12 +206,41 @@ recorded below.
   clean Sting builds, `release-check --tag v0.1.0 --built-digest --oci-layout`,
   `skopeo copy --preserve-digests` of the OCI layout, and a byte-identical
   registry readback (GitHub release v0.1.0 records it). The flake-pinned
-  bazelisk change (#20) applies from the next tag. The package's Actions
-  write grant and the tinyland-nix runner's reach to ghcr.io are still
-  unexercised by this workflow. The ledger's `publication_receipt` records
-  the R-C312 manual push and its readback (TIN-4655 comment `828714be`); it
-  is a docs field, not a protected input, so editing it leaves release-check
-  unchanged.
+  bazelisk change (#20) applies from the next tag. The v0.1.0 ledger entry's
+  `publication_receipt` (in git history) records the R-C312 manual push and
+  its readback (TIN-4655 comment `828714be`).
+- The `v0.2.0` tag run failed before any push, so `sha256:66e43966…` is not
+  in the registry (a pull by that digest returns 404).
+- The workflow has published twice, which exercises the package's Actions
+  write grant and the tinyland-nix runner's reach to ghcr.io:
+  - **v0.2.1 (SWB-R58):** run
+    [37872283108](https://github.com/xoxd-ai/agent-switchboard/actions/runs/37872283108)
+    on tag object `a3c50c8d` at `f29769b3` pushed
+    `sha256:2d53153f4321fbfb06704b94f4820af0d6be28b473684de3cfcae152e7a1b453`
+    at 2026-10-09T02:07Z. The readback was 4579 bytes and
+    `release-check --registry-manifest` passed. Evidence:
+    `release-evidence-v0.2.1` (artifact 11590303907, zip `sha256:6d1b789c…`).
+    The ledger entry for v0.2.1 was replaced by SWB-R59 while it still read
+    `PENDING`, so this line is its publication receipt.
+  - **v0.2.2 (SWB-R59):** run
+    [38327423160](https://github.com/xoxd-ai/agent-switchboard/actions/runs/38327423160)
+    on tag object `b8fd62e6` at `911d643e` pushed `sha256:4ebaf180…` at
+    2026-10-13T01:04Z. The ledger's `publication_receipt` carries the
+    readback.
+  - An anonymous pull of both digests from neo on 2026-10-13T01:29Z returned
+    manifests byte-identical to the two evidence artifacts.
+- **No registry tag and no version label, by design.** `//deploy:push` is an
+  `oci_push` with no `remote_tags`, so a workflow publication exists in
+  ghcr.io only under its digest (SWB-R04, R-N13). `v0.1.0` is the package's
+  one tag, and only because the R-C312 manual `skopeo copy` named it. The
+  image config carries `org.opencontainers.image.revision` (the approved
+  source) and `org.opencontainers.image.source`, and no version label;
+  adding one would change the digest and so need a new approved release.
+  Consumers pin the digest from `approved-broker.json`. Pointing a `vX.Y.Z`
+  registry tag at an existing digest would need its own ruling.
+- `publication_receipt` is a docs field, not a protected input, so editing
+  it leaves release-check unchanged. `qualification` stays
+  `published-candidate-only` after publication, as it did for v0.1.0.
 
 ## Packaging, retention and shutdown boundaries
 
