@@ -1,15 +1,16 @@
 # Switchboard source and productionization lane
 
-Authority: SWB-R49–SWB-R58, LAB-TAKEOVER-20260930 and R-N13.
+Authority: SWB-R49–SWB-R59, LAB-TAKEOVER-20260930 and R-N13.
 Source/image ownership is here; lab delivers harness/Home Manager integration;
 blahaj owns custody, retained storage, routing and cluster rollout (SWB-R51).
 
-The approved release is SWB-R58, v0.2.1 (R-C451 under R-C435): signed source
-`9bc96349129a7e595dd7d3795da0ce0480f44f22` at
-`ghcr.io/xoxd-ai/agent-switchboard@sha256:2d53153f4321fbfb06704b94f4820af0d6be28b473684de3cfcae152e7a1b453`.
-The previous published release, SWB-R55 v0.1.0 (`d8ebfdbf` at
-`sha256:c9170c71…`), stays published; SWB-R57 v0.2.0 (`sha256:66e43966…`)
-was never published. Their records are in git history.
+The approved release is SWB-R59, v0.2.2 (R-C435 under R-C655): signed source
+`daa6d59f41d43feeb60e65409203a109703df897` at
+`ghcr.io/xoxd-ai/agent-switchboard@sha256:4ebaf180547b5a74ca51489381270792d6d87619a4444eb9a7fcd6c31da94490`.
+The previous published releases, SWB-R58 v0.2.1 (`9bc96349` at
+`sha256:2d53153f…`) and SWB-R55 v0.1.0 (`d8ebfdbf` at `sha256:c9170c71…`),
+stay published; SWB-R57 v0.2.0 (`sha256:66e43966…`) was never published.
+Their records are in git history.
 Its protected-input hashes and PR heads are in
 [`approved-broker.json`](../releases/approved-broker.json), whose
 `qualification` is `published-candidate-only` and `live_acceptance` false.
@@ -143,6 +144,16 @@ recorded below.
   that reproduced digest the approved one. The protected-input map adds the
   five `tools/cc/*` files. The `v0.2.1` tag sits on the merge of this
   record, as for v0.2.0.
+- **SWB-R59 recorded (R-C435 under R-C655).** #28 adds the Host and Origin
+  guard on every main-listener route (the `/v1/*` DNS-rebinding fix from the
+  lab review of blahaj#2087) and bumps the workspace to 0.2.2. Two clean
+  builds of its merge `daa6d59f` (fresh clones, fresh output roots and
+  bazelisk homes, no disk or remote cache, `nix develop .#release`,
+  `--embed_label=daa6d59f…`) ran on honey, because Sting is reserved for
+  ADI work, and both gave `sha256:4ebaf180…` (4579-byte manifest). R-C435
+  makes that reproduced digest the approved one; R-C655 is the standing
+  delegated choice that moved the builds to honey. The `v0.2.2` tag sits
+  on the merge of this record.
 
 ## Secrets scan, CODEOWNERS and tag-triggered release
 
@@ -186,7 +197,7 @@ recorded below.
 - `just release-check-tag TAG [MAIN_REF]` runs the step 2 gate locally.
 - The workflow writes evidence only. `publication_authorized` and
   `live_acceptance` stay false; it never edits `approved-broker.json`. Today
-  the only image it can push is the SWB-R58 digest `sha256:2d53153f…`,
+  the only image it can push is the SWB-R59 digest `sha256:4ebaf180…`,
   and only if the tagged tree's Bazel build reproduces it. Publishing any
   other image needs a ruling and an approved release entry first.
 - The `v0.1.0` tag run of this workflow failed: at the time it required a
