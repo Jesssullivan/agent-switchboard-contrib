@@ -82,9 +82,16 @@ When sources disagree, prefer them in this order:
 
 ## Fork convention and CI
 
-- **Remotes:** `origin` is your private fork and the only push target.
-  `upstream` is `xoxd-ai/agent-switchboard`, with its push URL set to
-  `DISABLED`. `just fork-setup` configures both.
+- **Remotes:** `origin` is your fork and the only push target. The fork is
+  `Jesssullivan/agent-switchboard-contrib`, a real GitHub fork of the
+  canonical repo (R-C655, TIN-5770 comment `fed25e8b`). `upstream` is
+  `xoxd-ai/agent-switchboard`, with its push URL set to `DISABLED`.
+  `just fork-setup` configures both and refuses a repository whose GitHub
+  parent is not `upstream`.
+  - The older `Jesssullivan/agent-switchboard` is detached from the fork
+    network. It is not a push target; its branches are history only.
+  - #23 to #29 used same-repo branches on `xoxd-ai` while no real fork
+    existed. That was an exception, not the convention.
 - **Branches:** `<type>/tin-####-<slug>-<yyyymmdd>`. `just branch <type>
   <tin> <slug>` creates one.
 - **PRs** go from the fork to `upstream/main` and land through the merge
