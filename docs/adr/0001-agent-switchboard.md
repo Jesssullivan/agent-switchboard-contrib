@@ -530,9 +530,15 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
   to match lab's R-C11 posture: a pull request may land by local validation
   on sting plus an admin merge (R-C228), and the merge queue stays configured
   for everything else. The other rules are unchanged.
-- **Fork (SWB-R08, SWB-R13):** `Jesssullivan/agent-switchboard`, private. It
-  requires the xoxd-ai org setting that allows forks of private repositories.
-  SWB-R13 authorizes it, and the operator sets it in the GitHub UI (SWB-R23).
+- **Fork (SWB-R08, SWB-R13):** `Jesssullivan/agent-switchboard-contrib`, a
+  GitHub fork of the canonical repo. *Changed 2026-10-13 (R-C655, TIN-5770
+  comment `fed25e8b`):* SWB-R08's `Jesssullivan/agent-switchboard` is
+  detached from the fork network (the GitHub API reports `fork: false` and
+  no parent), so #23 to #29 used same-repo branches on xoxd-ai. The fork
+  was re-created under the contrib name, as for `tinyland-infra`, and the
+  detached repo is kept as history, not as a push target. Both repos are
+  public now, so the org setting for forks of private repositories that
+  SWB-R13 authorized (set in the GitHub UI, SWB-R23) is no longer needed.
 - **Remotes:** `origin` is the fork, and agents push only there. `upstream` is
   xoxd-ai, with its push URL set to `DISABLED` (`just fork-setup`).
 - **Branches** are named `<type>/tin-####-<slug>-<yyyymmdd>`. PRs go from the

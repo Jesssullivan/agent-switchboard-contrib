@@ -91,12 +91,26 @@ secrets-scan:
     gitleaks git --config .gitleaks.toml --redact --exit-code 1 .
 
 # PRs go from the fork to upstream main through the merge queue (ADR-0001).
-# Set remotes: origin = your private fork (the only push target), upstream = xoxd-ai with push DISABLED.
-fork-setup fork_owner="Jesssullivan":
+# The fork is Jesssullivan/agent-switchboard-contrib: a real GitHub fork of
+# upstream with the contrib name (R-C655, TIN-5770 comment fed25e8b). The
+# older Jesssullivan/agent-switchboard is detached from the fork network.
+# When `gh` is on PATH the recipe refuses a repository whose GitHub parent is
+# not upstream.
+# Set remotes: origin = your fork (the only push target), upstream = xoxd-ai with push DISABLED.
+fork-setup fork_owner="Jesssullivan" fork_repo="agent-switchboard-contrib":
     #!/usr/bin/env bash
     set -euo pipefail
     upstream_url="https://github.com/{{upstream_repo}}.git"
-    fork_url="https://github.com/{{fork_owner}}/agent-switchboard.git"
+    fork_url="https://github.com/{{fork_owner}}/{{fork_repo}}.git"
+    if command -v gh >/dev/null 2>&1; then
+      parent="$(gh api "repos/{{fork_owner}}/{{fork_repo}}" --jq '.parent.full_name // ""')"
+      if [ "$parent" != "{{upstream_repo}}" ]; then
+        echo "fork-setup: {{fork_owner}}/{{fork_repo}} is not a GitHub fork of {{upstream_repo}} (parent: ${parent:-none})" >&2
+        exit 1
+      fi
+    else
+      echo "fork-setup: gh is not on PATH; fork parentage of {{fork_owner}}/{{fork_repo}} is unverified" >&2
+    fi
     if git remote get-url upstream >/dev/null 2>&1; then
       git remote set-url upstream "$upstream_url"
     else

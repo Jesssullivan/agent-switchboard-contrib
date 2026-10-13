@@ -6,7 +6,7 @@ name: CI
 # - Same-repository pull requests, merge_group and push to main run the full
 #   xoxd-ai/ci-templates rust-bazel-application lane on GloriousFlywheel
 #   private runners, and `ci-ok` aggregates it.
-# - Fork pull requests (for example Jesssullivan/agent-switchboard -> main)
+# - Fork pull requests (for example Jesssullivan/agent-switchboard-contrib -> main)
 #   are GATED IN MERGE QUEUE. The template refuses fork pull requests on
 #   private runners (contract.py: "fork pull requests cannot receive private
 #   native runners"), and the estate forbids hosted runners. So on a fork pull
