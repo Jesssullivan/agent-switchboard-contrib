@@ -53,7 +53,7 @@ in    { file_sha256 =
           [ { mapKey = "28", mapValue = "a84b8ded026136c16588b570aa42b227ed9caca4" }
           ]
       , publication_receipt =
-          "PENDING: v0.2.2 release workflow registry readback; ratified SWB-R59 under R-C435 (TIN-5770 comment d3d90700) applied under R-C655 (TIN-5770 comment be5a4566)"
+          "PUBLISHED 2026-10-13T01:04Z by the release workflow under the signed v0.2.2 tag (tag object b8fd62e66ecd884fefc77f9053cfbd77a9b22a22 on 911d643ec38b159e95a075c939b5cfd65a4870ec): run https://github.com/xoxd-ai/agent-switchboard/actions/runs/38327423160 rebuilt the approved digest, pushed it by digest with no registry tag (01:04:01Z-01:04:13Z) and read it back; release-check --registry-manifest passed (supplied_registry_manifest_matches true); registry readback digest sha256:4ebaf180547b5a74ca51489381270792d6d87619a4444eb9a7fcd6c31da94490, 4579 bytes, byte-identical to the approved manifest; evidence artifact release-evidence-v0.2.2 (id 11781494396, zip sha256:b377ade26bc859fbd317251be1401633ddb136a69cce731525fa2ce2570f527b, kept 90 days); anonymous readback from neo at 2026-10-13T01:29Z is byte-identical to that artifact; receipt TIN-5770 comment f8d42ee2-9e16-4184-a021-764d610131ed; ratified SWB-R59 under R-C435 (TIN-5770 comment d3d90700) applied under R-C655 (TIN-5770 comment be5a4566)"
       , qualification = "published-candidate-only"
       , rulings = [ "SWB-R59", "R-C416", "R-C435", "R-C655", "R-N13" ]
       , schema = "swb.approved-release.v1"
