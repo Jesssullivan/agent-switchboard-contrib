@@ -250,15 +250,30 @@ fn normalize_host(host: &str) -> String {
 }
 
 /// Parse a request `Host` value. Userinfo and anything that is not an
-/// RFC 3986 authority are refused.
+/// RFC 3986 authority are refused. A bracketed host must be an IPv6 literal
+/// (`[localhost]` is refused, not unwrapped), and a `:` after the host must
+/// carry a valid port (`host:` and `host:99999` are refused, not read as
+/// "no port").
 fn parse_request_authority(raw: &str) -> Option<HostAuthority> {
     let authority = UriAuthority::try_from(raw.trim()).ok()?;
-    if authority.as_str().contains('@') || authority.host().is_empty() {
+    let host = authority.host();
+    if authority.as_str().contains('@') || host.is_empty() {
         return None;
     }
+    if let Some(inner) = host.strip_prefix('[') {
+        inner
+            .strip_suffix(']')?
+            .parse::<std::net::Ipv6Addr>()
+            .ok()?;
+    }
+    let port = if authority.as_str().len() > host.len() {
+        Some(authority.port_u16()?)
+    } else {
+        None
+    };
     Some(HostAuthority {
-        host: normalize_host(authority.host()),
-        port: authority.port_u16(),
+        host: normalize_host(host),
+        port,
     })
 }
 
@@ -312,10 +327,14 @@ fn parse_origin(raw: &str) -> Option<BrowserOrigin> {
 /// - `Host` must be present, single, well formed and on the allowlist
 ///   (`SWB_MCP_ALLOWED_HOSTS`). An entry without a port admits any port; an
 ///   entry with a port admits only that port. Matching is case-insensitive.
-///   With no `Host` header the URI authority (HTTP/2 `:authority`) is used.
+///   With no `Host` header the URI authority (HTTP/2 `:authority`) is used;
+///   an absolute-form request target's authority must be allowed as well.
 /// - `Origin`, when present, must be on `SWB_ALLOWED_ORIGINS`, which is
-///   empty by default, so any browser-originated request is refused. The
-///   broker's clients (`swb`, hooks, channel, MCP harnesses) send no Origin.
+///   empty by default, so every request a browser marks with `Origin`
+///   (fetch, XHR, any form POST) is refused. Browsers omit `Origin` on
+///   simple GETs such as image loads and navigations, so this does not stop
+///   a blind cross-site GET with the real Host; see ADR-0001. The broker's
+///   clients (`swb`, hooks, channel, MCP harnesses) send no Origin.
 ///
 /// Every refusal is HTTP 403 with a JSON `error`, before any handler runs.
 #[derive(Clone, Debug)]
@@ -345,23 +364,40 @@ impl RequestGuard {
         Ok(Self { hosts, origins })
     }
 
+    fn allows_host(&self, host: &HostAuthority) -> bool {
+        self.hosts.iter().any(|allowed| {
+            allowed.host == host.host && allowed.port.is_none_or(|p| host.port == Some(p))
+        })
+    }
+
     fn check(&self, uri: &Uri, headers: &HeaderMap) -> Result<(), &'static str> {
         let mut values = headers.get_all(header::HOST).iter();
-        let host = match (values.next(), values.next()) {
+        let header_host = match (values.next(), values.next()) {
             (Some(_), Some(_)) => return Err("host not allowed"),
-            (Some(value), None) => value
-                .to_str()
-                .ok()
-                .and_then(parse_request_authority)
-                .ok_or("host not allowed")?,
-            (None, _) => uri
-                .authority()
-                .and_then(|a| parse_request_authority(a.as_str()))
-                .ok_or("missing host")?,
+            (Some(value), None) => Some(
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(parse_request_authority)
+                    .ok_or("host not allowed")?,
+            ),
+            (None, _) => None,
         };
-        if !self.hosts.iter().any(|allowed| {
-            allowed.host == host.host && allowed.port.is_none_or(|p| host.port == Some(p))
-        }) {
+        // The URI authority is HTTP/2's `:authority`, or the authority of an
+        // HTTP/1 absolute-form target, which RFC 9112 3.2.2 says takes
+        // precedence over Host. Whichever is present must be allowed.
+        let uri_host = match uri.authority() {
+            Some(a) => Some(parse_request_authority(a.as_str()).ok_or("host not allowed")?),
+            None => None,
+        };
+        if header_host.is_none() && uri_host.is_none() {
+            return Err("missing host");
+        }
+        if !header_host
+            .iter()
+            .chain(uri_host.iter())
+            .all(|host| self.allows_host(host))
+        {
             return Err("host not allowed");
         }
         let mut origins = headers.get_all(header::ORIGIN).iter();
@@ -1469,6 +1505,66 @@ mod tests {
             !text.contains("sting"),
             "metrics leaked an identity: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_host_ports_and_brackets_are_refused() {
+        let store = seeded_store();
+        let before = state_snapshot(&store);
+        let app = router(Arc::clone(&store), vec!["localhost".into(), "::1".into()]);
+        for host in [
+            "localhost:",
+            "localhost:99999",
+            "localhost:http",
+            "[localhost]",
+            "[localhost]:8080",
+            "[::1",
+        ] {
+            for (method, uri, body) in GUARDED_ROUTES {
+                let response = app
+                    .clone()
+                    .oneshot(guarded_request(method, uri, body, &[("host", host)]))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{method} {uri} Host {host:?}"
+                );
+                assert_eq!(error_of(response).await, "host not allowed");
+            }
+        }
+        assert_eq!(state_snapshot(&store), before);
+    }
+
+    #[tokio::test]
+    async fn absolute_form_target_authority_must_be_allowed_too() {
+        let store = seeded_store();
+        let before = state_snapshot(&store);
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let refused = app
+            .clone()
+            .oneshot(guarded_request(
+                "POST",
+                "http://attacker.example/v1/register",
+                GUARDED_ROUTES[0].2,
+                &[("host", "localhost:8080")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(error_of(refused).await, "host not allowed");
+        assert_eq!(state_snapshot(&store), before);
+        let allowed = app
+            .oneshot(guarded_request(
+                "GET",
+                "http://localhost:8080/v1/peers",
+                "",
+                &[("host", "localhost:8080")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 
     #[test]

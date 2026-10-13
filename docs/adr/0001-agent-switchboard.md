@@ -448,15 +448,30 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
     kept so existing deployments need no change). A listed host without a
     port admits any port, because `swb` sends `Host: host:port`; a listed
     `host:port` admits only that port. Without a `Host` header the HTTP/2
-    `:authority` is used, as rmcp does.
+    `:authority` is used, as rmcp does. An absolute-form request target's
+    authority must be on the list as well. A bracketed host must be an IPv6
+    literal, and a `:` after the host must carry a valid port.
   - An empty allowlist is refused at startup, since rmcp reads an empty list
     as "every Host".
   - **Origin, defence in depth:** a request that carries `Origin` is refused
     unless the origin is on `SWB_ALLOWED_ORIGINS`, which is empty by default.
     Every broker client (`swb`, hooks, `swb channel`, the MCP harnesses) is a
     non-browser client that sends no `Origin`, so the default refuses every
-    browser-originated request and admits every real client. A request with
-    no `Origin` is not refused, because non-browser clients omit it.
+    request a browser marks with `Origin` (fetch, XHR and any form POST) and
+    admits every real client. A request with no `Origin` is not refused,
+    because non-browser clients omit it.
+  - **Known residual, cross-site GET (2026-10-12 review of #28):** browsers
+    send no `Origin` on simple GETs such as `<img>` or `<script>` loads and
+    navigations, and over plain http to a non-loopback name no `Sec-Fetch-*`
+    headers either. Such a GET carries the real Host and passes the guard.
+    `GET /v1/peers?me=<id>` refreshes `last_seen` and revives an ended
+    session; `GET /v1/inbox?me=<id>` also marks messages fetched and counts
+    a delivery. A cross-site page that already knows an agent id
+    (`harness:host:pid:session_id`) can trigger these blind. It cannot read
+    the reply, cannot register, send or ack, and fetched messages stay
+    deliverable. Closing it means making those reads side-effect free or
+    moving the heartbeat to a POST, which changes the REST contract and
+    needs its own ruling.
   - Every refusal is HTTP 403 with a JSON `error` (`missing host`, `host not
     allowed` or `origin not allowed`), returned before any handler reads a
     body or touches the store.
