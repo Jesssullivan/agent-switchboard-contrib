@@ -129,7 +129,7 @@ struct BrokerMcp {
 impl ServerHandler for BrokerMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("agent-switchboard", "0.2.1"))
+            .with_server_info(Implementation::new("agent-switchboard", "0.2.2"))
     }
     async fn list_tools(
         &self,
