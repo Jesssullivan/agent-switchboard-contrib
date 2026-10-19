@@ -24,8 +24,9 @@
 --     orphaned exactly when its holder is gone ('viewClaim'). So a listed
 --     claim's holder is not gone, or the claim is marked orphaned for
 --     release. A claim operation refreshes its holder, so a holder is live
---     when the claim is recorded ('reviveLemma'). The model has no explicit
---     release, so that is as far as it goes.
+--     when the claim is recorded ('reviveLemma'). Ending a session releases
+--     its claims (R-C950); the model removes them in 'End', outside this
+--     module, so the QuickCheck property noOrphanAfterExpiry covers it.
 --
 -- Not proved: that Swb.Model threads its state through these functions
 -- correctly (it is not LiquidHaskell-checked; the QuickCheck trace

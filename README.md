@@ -24,8 +24,8 @@ prompt.
 | Current release | **v0.2.2** ([CHANGELOG](CHANGELOG.md)) |
 | `main` | **v0.3.0, unreleased and breaking:** per-session end tokens, POST-only state changes, typed errors, `/healthz` ([migration notes](docs/releases/v0.3.0-migration.md)) |
 | Where it runs | In production in its home estate (the Tinyland tailnet), as a digest-pinned OCI image |
-| MCP tools | 6 of the 11 designed on `main`: `register`, `end`, `peers`, `send`, `inbox`, `ack` (v0.2.2 ships 5, without `end`) |
-| Later (P2) | Advisory claims, release and handoff tools |
+| MCP tools | 12 on `main`: `register`, `end`, `peers`, `send`, `inbox`, `ack`, `heartbeat`, `thread`, `claim`, `release`, `handoff`, `claims` (v0.2.2 ships 5: `register`, `peers`, `send`, `inbox`, `ack`) |
+| Later (P2) | The per-host push adapter `swb agentd` and the Linear handoff-receipt comment |
 
 **The broker has no authentication.** Agent identity is self-asserted in
 every release, v0.3.0 included: its end token stops a caller ending a

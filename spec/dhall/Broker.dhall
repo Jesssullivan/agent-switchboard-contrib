@@ -5,21 +5,41 @@
 -- the Haskell suite reads only that JSON. The Rust crates keep their own
 -- literals (they are release-protected inputs, SWB-R53); the live adapter is
 -- what compares the two. R-C229.
-let Unruled =
-      -- SWB-R16 says "Not yet ruled" for the first two; the third is not
-      -- addressed by the SWB-R16 text at all. The model answers each of them
-      -- with `unruled` and no property asserts any outcome for them. They are
-      -- the questions for the P2 claims ruling packet.
-      < exclusive_request_while_nonexclusive_claims_exist
-      | nonexclusive_claim_lists_exclusive_holder_in_overlaps
-      | exclusive_reclaim_by_the_current_exclusive_holder
+let ClaimRule =
+      -- R-C950 (TIN-5770 comment 23fdf965) rules the SWB-R16 cases that were
+      -- "Not yet ruled". The model implements each and the properties
+      -- exclusiveRefusal and noOrphanAfterExpiry assert them:
+      --   exclusive_refused_while_any_other_claim_is_held: an exclusive
+      --     request while another session holds any active claim on the
+      --     subject is refused with held_by listing the holders; nothing is
+      --     recorded.
+      --   nonexclusive_recorded_with_exclusive_holder_in_overlaps: a
+      --     non-exclusive request is always recorded, and every other holder,
+      --     an exclusive one included, is listed in overlaps[].
+      --   exclusive_repeat_by_holder_renews: a repeat exclusive request by the
+      --     current exclusive holder is an idempotent renewal (same claim id,
+      --     expiry extended, never shortened).
+      --   end_releases_holder_claims: ending a holder session releases its
+      --     claims at once, and the broker logs each release.
+      -- SWB-R61 (R-C655, TIN-4655 comment 18c7bd1c) rules the cases R-C950
+      -- leaves open; the same two properties assert it:
+      --   holder_has_one_claim_per_subject: a repeat request by a holder
+      --     updates its one active claim on the subject (same claim id, the
+      --     later expiry); an exclusive request over its own advisory claim,
+      --     with no other holder, makes it exclusive and is recorded; an
+      --     advisory request never drops exclusivity.
+      < exclusive_refused_while_any_other_claim_is_held
+      | nonexclusive_recorded_with_exclusive_holder_in_overlaps
+      | exclusive_repeat_by_holder_renews
+      | end_releases_holder_claims
+      | holder_has_one_claim_per_subject
       >
 
 let LeaseState =
       -- peers() classification in swb-store: ended wins, then age bands.
       < live | idle | gone | ended >
 
-in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C944" ]
+in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655", "R-C944", "R-C950", "SWB-R61" ]
     , session =
       { lease_seconds = 900
       , live_max_age_seconds = 900
@@ -49,10 +69,15 @@ in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C944"
       , body_max_bytes = 16384
       , artifacts_max = 20
       }
-    , claim = { lease_default_hours = 4, lease_max_hours = 24 }
-    , unruled =
-      [ Unruled.exclusive_request_while_nonexclusive_claims_exist
-      , Unruled.nonexclusive_claim_lists_exclusive_holder_in_overlaps
-      , Unruled.exclusive_reclaim_by_the_current_exclusive_holder
-      ]
+    , claim =
+      { lease_default_hours = 4
+      , lease_max_hours = 24
+      , rules =
+        [ ClaimRule.exclusive_refused_while_any_other_claim_is_held
+        , ClaimRule.nonexclusive_recorded_with_exclusive_holder_in_overlaps
+        , ClaimRule.exclusive_repeat_by_holder_renews
+        , ClaimRule.end_releases_holder_claims
+        , ClaimRule.holder_has_one_claim_per_subject
+        ]
+      }
     }

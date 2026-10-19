@@ -153,22 +153,42 @@ registered once on the tailnet so that new harness instances spawn nothing.
     "Tempo and Loki keep 7 days, and the broker keeps 30 days for unacked
     messages." A reader of LGTM treats a missing message as "expired from
     the view or never projected", never as "never sent", and asks `thread`.
-- **Claims (SWB-R16):**
-  - Advisory by default. `claim` always succeeds and returns `overlaps[]`.
+- **Claims (SWB-R16, SWB-R60, SWB-R61):**
+  - Advisory by default. A non-exclusive `claim` always succeeds and returns
+    `overlaps[]`.
   - A claimant may request `exclusive`. A second `exclusive` claim on the same
     subject returns `held_by` and is not recorded. This ruling is the carrier
-    for that one narrow refusal.
+    for that one narrow refusal; SWB-R60 sets its scope below.
   - Non-exclusive claims always succeed.
   - Leases default to 4 h, at most 24 h.
   - When the holder is `gone`, a claim shows as `orphaned`. It is never
     revoked.
   - `handoff` creates a receipt in `offered`. The receiver's claim accepts it
     and marks the source `handed_off`.
-  - **Not yet ruled.** A P2 proposal will cover:
-    - what an `exclusive` request does while non-exclusive claims already
-      exist;
-    - whether a non-exclusive claim against an exclusive holder lists that
-      holder in `overlaps[]` (proposed: yes, as `held_by`).
+  - *Ruled 2026-10-19 (SWB-R60, R-C950):* the formerly open cases.
+    - An `exclusive` request while another session holds any active claim
+      on the subject, exclusive or not, is refused with `held_by` listing
+      the holders; nothing is recorded.
+    - A non-exclusive request while an exclusive claim is held is recorded,
+      and the exclusive holder is listed in `overlaps[]`.
+    - A repeat `exclusive` request by the current exclusive holder is an
+      idempotent renewal: the same claim id, its expiry extended.
+    - Ending a holder session (`end` with its token) releases its claims at
+      once, and the broker logs each release.
+  - *Ruled 2026-10-19 (SWB-R61, R-C655):* the cases SWB-R60 leaves open.
+    - A session holds at most one active claim per subject. A repeat request
+      by its holder updates that claim in place: the same claim id, the later
+      expiry.
+    - An exclusive request over the caller's own advisory claim, while no
+      other session holds one, makes it exclusive and is `recorded`.
+    - An advisory request by the exclusive holder is recorded and never drops
+      exclusivity.
+    - Accepting a handoff that would be exclusive is an exclusive request:
+      while another session holds an active claim it is refused and the
+      offer stays open.
+  - Implemented in P2 (TIN-6690): `claim`, `release`, `handoff` and
+    `claims`, plus `heartbeat` and `thread`, in the store, REST, MCP and CLI.
+    The SWB-R15 handoff receipt comment is not posted yet.
 - **Linear access (SWB-R15):**
   - The broker may read a ticket's title, state and assignee, to annotate
     claims and overlaps.
@@ -233,13 +253,13 @@ registered once on the tailnet so that new harness instances spawn nothing.
 - **Failure behaviour (SWB-R10):** hooks time out after 2 s and always exit 0.
   The broker being down never blocks a harness.
 
-### MCP tools (11)
+### MCP tools (12 on `main`)
 
 - The registry key is `agents` and the Junie alias is `ag`. The longest
   composed name, `mcp_mcp-mux_ag__heartbeat`, is 25 characters.
-- The tools are `register`, `heartbeat`, `peers`, `send`, `inbox` (long-poll
-  up to 25 s), `ack`, `thread`, `claim` (with optional `exclusive`),
-  `release`, `handoff` and `claims`.
+- The tools are `register`, `end` (v0.3.0, R-C944), `heartbeat`, `peers`,
+  `send`, `inbox` (long-poll up to 25 s), `ack`, `thread`, `claim` (with
+  optional `exclusive`), `release`, `handoff` and `claims`.
 - None of them acts on a process, a tmux pane or another session's claim
   (R-N11).
 
@@ -500,8 +520,9 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
   - The guard ships as v0.2.2 (SWB-R59, #28 merge `daa6d59f`).
 - **Accepted trade-off:** anything that reaches `tag:k8s:*` can reach the
   broker. `authority: peer` stamping limits the damage. So does the fact that
-  claims refuse only exclusive-vs-exclusive: a spoofed exclusive claim can
-  block another exclusive claim, never an advisory one.
+  claims refuse only an exclusive request against another session's active
+  claim (SWB-R60): a spoofed claim can block an exclusive request, never an
+  advisory one.
 
 ### Repo and fork convention (new estate standard)
 
@@ -779,7 +800,9 @@ that stops, restarts or scales a process is performed by the operator
 - **P2: claims, handoff, push.** Repos: this one, blahaj (the Linear sops
   leaf) and lab (Home Manager for agentd on PZM, neo, honey, sting and
   bumble).
-  - Claims ship with optional `exclusive` (SWB-R16).
+  - Claims ship with optional `exclusive` (SWB-R16, SWB-R60). *Status
+    2026-10-19:* claim, release, handoff and claims are implemented on
+    `main` after TIN-6690; the exits below are not yet run live.
   - Linear read and handoff-receipt comments ship (SWB-R15).
   - agentd includes neo (SWB-R17). Its telemetry is metadata only
     (SWB-R40, SWB-R47; Push).
@@ -875,6 +898,8 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R57 | 2026-10-07; amended 2026-10-08 | R-C411 (operator interview, Linear TIN-5770 comment `cdeb84f6`): "Ratify, release workflow (Recommended)". Amendment: R-C416 (TIN-5770 comment `9b9667d2`): "Hermetic toolchain" | Approve the v0.2.0 channel release: signed source 26f38b9a (GitHub merge key B5690EEEBB952194) at digest `sha256:66e43966…` (4579-byte manifest), from two matching clean Sting builds plus a release-workflow-equivalent rebuild. Recorded in `approved-broker.json`; the signed v0.2.0 tag publishes only this digest, through `release.yml`. *Amended 2026-10-08 (R-C416):* the release build uses the pinned Nix C toolchain (`tools/cc`), not the host gcc. The digest changes, so `sha256:66e43966…` is not published; the new digest needs its own ratification before publication. |
 | SWB-R58 | 2026-10-08 | R-C451 (operator interview, Linear TIN-5770 comment `0fc1217c`): "Bump crates to 0.2.1 first (Recommended)"; R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 (comment `9b9667d2`) | Approve the v0.2.1 hermetic-toolchain release: signed source 9bc96349 (the #26 version-bump merge; GitHub merge key B5690EEEBB952194) at digest `sha256:2d53153f…` (4579-byte manifest), from two matching clean Sting builds of that merge, one with every host C compiler and binutils hidden. Recorded in `approved-broker.json`; the signed v0.2.1 tag publishes only this digest, through `release.yml`. |
 | SWB-R59 | 2026-10-13 | R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)", applied under R-C655 (TIN-5770 comment `be5a4566`), the standing delegated choice; lab review of blahaj#2087 (TIN-5770 comment `e503f591`); R-C416 | Approve the v0.2.2 Host-guard release: signed source daa6d59f (the #28 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:4ebaf180…` (4579-byte manifest), from two matching clean honey builds of that merge (Sting reserved for ADI). Recorded in `approved-broker.json`; the signed v0.2.2 tag publishes only this digest, through `release.yml`. |
+| SWB-R60 | 2026-10-19 | R-C950 (operator interview, Linear TIN-5770 comment `23fdf965`); lane TIN-6690 | Claims semantics for the SWB-R16 cases that were not yet ruled: an exclusive request while another session holds any active claim on the subject is refused with `held_by` listing the holders and records nothing; a non-exclusive request while an exclusive claim is held is recorded with the exclusive holder in `overlaps[]`; a repeat exclusive request by the current holder is an idempotent renewal (same claim id, expiry extended); ending a holder session releases its claims immediately and logs each release. |
+| SWB-R61 | 2026-10-19 | R-C655 (standing delegated choice, Linear TIN-5770 comment `be5a4566`), recorded on TIN-4655 comment `18c7bd1c`; review of PR #40 (SHOULD 2); lane TIN-6690 | Claim cases SWB-R60 leaves open: a session holds at most one active claim per subject, and a repeat request by its holder updates that claim in place (same claim id, the later expiry); an exclusive request over the caller's own advisory claim, with no other session holding one, makes it exclusive and is `recorded`; an advisory request by the exclusive holder is recorded and never drops exclusivity. R-C950 (1) applies to handoffs as written: an acceptance that would be exclusive is refused while another session holds an active claim, and the offer stays open. |
 
 Estate rulings this design depends on:
 
@@ -884,7 +909,8 @@ Estate rulings this design depends on:
   - every mutating step cites a ruling ID in its receipt.
 - **The 2026-08-31 no-containment ruling** (lab `AGENTS.md`, "Harnesses run
   unconstrained"). Advisory claims keep this broker inside it. The one narrow
-  refusal, exclusive-vs-exclusive, carries its own ruling, SWB-R16.
+  refusal, an exclusive request against another session's active claim,
+  carries its own rulings, SWB-R16 and SWB-R60.
 - **The ban on state-writing Linear automation** (lab `AGENTS.md`, Tracker
   Hygiene, ratified 2026-09-03). SWB-R15 permits comments only.
 - **GloriousFlywheel runners only** (lab `AGENTS.md`, 2026-09-06), and no

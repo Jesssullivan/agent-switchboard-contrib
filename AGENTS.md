@@ -22,7 +22,7 @@ Linear: TIN-4655.
 
 **Read first:** [ADR-0001](docs/adr/0001-agent-switchboard.md), the broker
 design. Its Rulings table holds `SWB-R01`..`SWB-R23`, the source/release
-rulings `SWB-R49`..`SWB-R55` the Claude channel ruling `SWB-R56` the v0.2.0 release `SWB-R57`, the v0.2.1 hermetic release `SWB-R58` and the v0.2.2 Host-guard release `SWB-R59`; `SWB-R24` is recorded under its History.
+rulings `SWB-R49`..`SWB-R55` the Claude channel ruling `SWB-R56` the v0.2.0 release `SWB-R57`, the v0.2.1 hermetic release `SWB-R58` and the v0.2.2 Host-guard release `SWB-R59`, the claims rulings `SWB-R60` and `SWB-R61`; `SWB-R24` is recorded under its History.
 
 **Read second:** [ADR-0002](docs/adr/0002-lgtm-plane.md), the LGTM plane and
 the phase order. Its Rulings table holds `SWB-R25`..`SWB-R48`.
@@ -80,8 +80,9 @@ When sources disagree, prefer them in this order:
 - CI's `spec-dhall` job runs the same Dhall check and `ci-ok` requires it
   (R-C255). It is skipped on a fork PR like the other jobs, so run
   `just spec-dhall` before queueing.
-- Keep properties few and parsimonious. Never assert an `Unruled` SWB-R16
-  case. Edit `spec/dhall/approved-broker.dhall` together with
+- Keep properties few and parsimonious. The SWB-R16 claim cases are ruled
+  (R-C950 and SWB-R61, `claim.rules` in `Broker.dhall`); a new claim case needs a ruling
+  before a property asserts it. Edit `spec/dhall/approved-broker.dhall` together with
   `docs/releases/approved-broker.json`.
 
 ## Fork convention and CI

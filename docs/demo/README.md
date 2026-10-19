@@ -4,8 +4,9 @@ The recording of [examples/demo/run.sh](../../examples/demo/run.sh): every
 mode `swb` has on `main` (v0.3.0, unreleased), driven by scripted fake
 agents with no model calls and no secrets (R-C953, TIN-6694).
 
-This is a scripted, one-machine precursor: one machine plays both hosts and
-claims are stubbed. It does not satisfy TIN-6749 (recorded live demo: two
+This is a scripted, one-machine precursor: one machine plays both hosts.
+Step 12 runs real claim, release and handoff calls against the broker
+(TIN-6690). It does not satisfy TIN-6749 (recorded live demo: two
 harnesses, two hosts) or TIN-6750 (full-features demo with claims and
 handoff); both remain open.
 
@@ -18,5 +19,5 @@ Play the cast with `asciinema play docs/demo/demo.cast`, or with any
 asciinema-player embed. Regenerate both with
 `SWB_BIN=/path/to/swb examples/demo/run.sh --record`.
 
-The cast is a preview artifact: nothing here is published as a launch, and
-claims, release and handoff appear only as "pending P2" stubs.
+The cast is a preview artifact: nothing here is published as a launch.
+`swb agentd` is still P2 and appears only as a stub.

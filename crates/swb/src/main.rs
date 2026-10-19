@@ -8,6 +8,9 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use swb_proto::VERSION;
+// Claim subjects and notes use the broker's own validators, so the CLI and
+// the store cannot drift (SWB-R16).
+use swb_store::{valid_note, valid_subject};
 
 mod channel;
 
@@ -26,6 +29,18 @@ commands:
   ack <msg_id>              acknowledge a message for SWB_AGENT_ID
   peers [--all] [--host HOST] [--limit N] [--cursor AGENT_ID]
                             list live sessions (--all adds idle, gone and ended)
+  heartbeat                 renew SWB_AGENT_ID's lease
+  thread <thread_id> [--after SEQ] [--limit N]
+                            read one thread's messages that SWB_AGENT_ID sent or received
+  claim <subject> [--exclusive] [--lease-hours N] [--note TEXT]
+  claim --handoff <ULID> [--exclusive|--advisory]
+                            claim a subject (advisory), or accept a handoff offered to you;
+                            a refused exclusive claim prints its answer and exits 4
+  release <claim_id>        release one of SWB_AGENT_ID's claims
+  handoff <claim_id> <to-agent-id> [--note TEXT]
+                            offer one of your claims to another session
+  claims [--subject S] [--holder AGENT_ID] [--all] [--mine] [--limit N]
+                            list active claims (--mine adds your open handoffs)
   doctor [--register]       check the SWB_* settings and the broker
   channel                   Claude Code channel (stdio MCP server)
   version                   print the version
@@ -646,6 +661,250 @@ fn peers_cmd(lookup: Lookup, args: &PeersArgs) -> Result<Value, String> {
     call_with(lookup, "GET", &path, None)
 }
 
+/// Options for `swb claim`. Either a subject or `--handoff ULID`.
+#[derive(Debug, Default, PartialEq)]
+struct ClaimArgs {
+    subject: Option<String>,
+    /// `--exclusive` sends true, `--advisory` false; neither sends nothing.
+    exclusive: Option<bool>,
+    lease_hours: Option<u32>,
+    note: Option<String>,
+    handoff_id: Option<String>,
+}
+
+fn parse_claim_args(args: &[String]) -> Result<ClaimArgs, String> {
+    let mut out = ClaimArgs::default();
+    let mut positional = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = |flag: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match arg.as_str() {
+            "--exclusive" | "--advisory" => {
+                let want = arg == "--exclusive";
+                if out.exclusive.is_some_and(|e| e != want) {
+                    return Err("--exclusive and --advisory exclude each other".into());
+                }
+                out.exclusive = Some(want);
+            }
+            "--lease-hours" => {
+                out.lease_hours = Some(
+                    value("--lease-hours")?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| (1..=24).contains(n))
+                        .ok_or("--lease-hours must be 1..24")?,
+                )
+            }
+            "--note" => {
+                let note = value("--note")?;
+                if !valid_note(&note) {
+                    return Err("invalid --note (at most 512 bytes, no control characters)".into());
+                }
+                out.note = Some(note);
+            }
+            "--handoff" => {
+                let id = value("--handoff")?;
+                if !valid_ulid(&id) {
+                    return Err("invalid --handoff (ULID)".into());
+                }
+                out.handoff_id = Some(id);
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
+            _ => positional.push(arg.clone()),
+        }
+    }
+    match <[String; 1]>::try_from(positional) {
+        Ok([subject]) => {
+            if !valid_subject(&subject) {
+                return Err("invalid subject ([A-Za-z0-9._:/#@+-], at most 256 bytes)".into());
+            }
+            out.subject = Some(subject);
+        }
+        Err(rest) if rest.is_empty() && out.handoff_id.is_some() => {}
+        Err(_) => return Err("expected <subject> or --handoff <ULID>".into()),
+    }
+    Ok(out)
+}
+
+fn claim_cmd(lookup: Lookup, args: &ClaimArgs) -> Result<Value, String> {
+    let mut payload = json!({"me":me_from(lookup)?});
+    if let Some(subject) = &args.subject {
+        payload["subject"] = json!(subject);
+    }
+    if let Some(exclusive) = args.exclusive {
+        payload["exclusive"] = json!(exclusive);
+    }
+    if let Some(hours) = args.lease_hours {
+        payload["lease_hours"] = json!(hours);
+    }
+    if let Some(note) = &args.note {
+        payload["note"] = json!(note);
+    }
+    if let Some(id) = &args.handoff_id {
+        payload["handoff_id"] = json!(id);
+    }
+    call_with(lookup, "POST", "/v1/claim", Some(&payload))
+}
+
+fn release_cmd(lookup: Lookup, claim_id: &str) -> Result<Value, String> {
+    let me = me_from(lookup)?;
+    if !valid_ulid(claim_id) {
+        return Err("invalid claim_id (ULID)".into());
+    }
+    call_with(
+        lookup,
+        "POST",
+        "/v1/release",
+        Some(&json!({"me":me,"claim_id":claim_id})),
+    )
+}
+
+fn parse_handoff_args(args: &[String]) -> Result<Value, String> {
+    let mut note = None;
+    let mut positional = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--note" => {
+                let value = it.next().cloned().ok_or("--note needs a value")?;
+                if !valid_note(&value) {
+                    return Err("invalid --note (at most 512 bytes, no control characters)".into());
+                }
+                note = Some(value);
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
+            _ => positional.push(arg.clone()),
+        }
+    }
+    let [claim_id, to] = <[String; 2]>::try_from(positional)
+        .map_err(|_| "expected <claim_id> <to-agent-id>".to_string())?;
+    if !valid_ulid(&claim_id) {
+        return Err("invalid claim_id (ULID)".into());
+    }
+    if !valid_agent_id(&to) {
+        return Err("invalid receiver agent id".into());
+    }
+    let mut payload = json!({"claim_id":claim_id,"to":to});
+    if let Some(note) = note {
+        payload["note"] = json!(note);
+    }
+    Ok(payload)
+}
+
+fn handoff_cmd(lookup: Lookup, mut payload: Value) -> Result<Value, String> {
+    payload["me"] = json!(me_from(lookup)?);
+    call_with(lookup, "POST", "/v1/handoff", Some(&payload))
+}
+
+/// Options for `swb claims`. Like `swb peers`, a plain listing passes no
+/// `me`; `--mine` adds `me` (renewing the lease) to list this session's
+/// open handoffs too.
+fn parse_claims_args(args: &[String]) -> Result<Value, String> {
+    let mut out = json!({});
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = |flag: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match arg.as_str() {
+            "--all" => out["all"] = json!(true),
+            "--mine" => out["mine"] = json!(true),
+            "--subject" => {
+                let subject = value("--subject")?;
+                if !valid_subject(&subject) {
+                    return Err("invalid --subject".into());
+                }
+                out["subject"] = json!(subject);
+            }
+            "--holder" => {
+                let holder = value("--holder")?;
+                if !valid_agent_id(&holder) {
+                    return Err("invalid --holder (an agent id)".into());
+                }
+                out["holder"] = json!(holder);
+            }
+            "--limit" => {
+                out["limit"] = json!(
+                    value("--limit")?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| (1..=500).contains(n))
+                        .ok_or("--limit must be 1..500")?
+                )
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    Ok(out)
+}
+
+fn claims_cmd(lookup: Lookup, mut payload: Value) -> Result<Value, String> {
+    if payload
+        .as_object_mut()
+        .and_then(|m| m.remove("mine"))
+        .is_some()
+    {
+        payload["me"] = json!(me_from(lookup)?);
+    }
+    call_with(lookup, "POST", "/v1/claims", Some(&payload))
+}
+
+fn heartbeat_cmd(lookup: Lookup) -> Result<Value, String> {
+    let me = me_from(lookup)?;
+    call_with(lookup, "POST", "/v1/heartbeat", Some(&json!({"me":me})))
+}
+
+fn parse_thread_args(args: &[String]) -> Result<Value, String> {
+    let mut positional = Vec::new();
+    let mut out = json!({});
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = |flag: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match arg.as_str() {
+            "--after" => {
+                out["after_seq"] = json!(
+                    value("--after")?
+                        .parse::<u64>()
+                        .map_err(|_| "--after must be a seq number")?
+                )
+            }
+            "--limit" => {
+                out["limit"] = json!(
+                    value("--limit")?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| (1..=100).contains(n))
+                        .ok_or("--limit must be 1..100")?
+                )
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
+            _ => positional.push(arg.clone()),
+        }
+    }
+    let [thread_id] =
+        <[String; 1]>::try_from(positional).map_err(|_| "expected <thread_id>".to_string())?;
+    if !valid_ulid(&thread_id) {
+        return Err("invalid thread_id (ULID)".into());
+    }
+    out["thread_id"] = json!(thread_id);
+    Ok(out)
+}
+
+fn thread_cmd(lookup: Lookup, mut payload: Value) -> Result<Value, String> {
+    payload["me"] = json!(me_from(lookup)?);
+    call_with(lookup, "POST", "/v1/thread", Some(&payload))
+}
+
 #[derive(Debug, PartialEq)]
 enum Check {
     Ok(String),
@@ -958,6 +1217,29 @@ fn print_result(verb: &str, result: Result<Value, String>) -> ExitCode {
     }
 }
 
+/// Exit code of a refused exclusive claim (R-C950 (1)): the broker answers
+/// 200 with `outcome: refused`, and the CLI still prints that answer, but a
+/// script running `swb claim X --exclusive && ...` must not go on.
+const EXIT_CLAIM_REFUSED: u8 = 4;
+
+fn claim_exit(result: &Value) -> ExitCode {
+    if result["outcome"] == json!("refused") {
+        ExitCode::from(EXIT_CLAIM_REFUSED)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn print_claim_result(result: Result<Value, String>) -> ExitCode {
+    match result {
+        Ok(v) => {
+            println!("{v}");
+            claim_exit(&v)
+        }
+        Err(e) => print_result("claim", Err(e)),
+    }
+}
+
 fn hook(harness_arg: &str, event: &str) {
     if !matches!(
         event,
@@ -1099,6 +1381,42 @@ fn main() -> ExitCode {
             match parse_peers_args(&rest) {
                 Ok(parsed) => print_result("peers", peers_cmd(&process_env, &parsed)),
                 Err(e) => usage_error("peers", &e),
+            }
+        }
+        Some("claim") => {
+            let rest: Vec<String> = args.collect();
+            match parse_claim_args(&rest) {
+                Ok(parsed) => print_claim_result(claim_cmd(&process_env, &parsed)),
+                Err(e) => usage_error("claim", &e),
+            }
+        }
+        Some("release") => match (args.next(), args.next()) {
+            (Some(id), None) => print_result("release", release_cmd(&process_env, &id)),
+            _ => usage_error("release", "expected <claim_id>"),
+        },
+        Some("handoff") => {
+            let rest: Vec<String> = args.collect();
+            match parse_handoff_args(&rest) {
+                Ok(payload) => print_result("handoff", handoff_cmd(&process_env, payload)),
+                Err(e) => usage_error("handoff", &e),
+            }
+        }
+        Some("claims") => {
+            let rest: Vec<String> = args.collect();
+            match parse_claims_args(&rest) {
+                Ok(payload) => print_result("claims", claims_cmd(&process_env, payload)),
+                Err(e) => usage_error("claims", &e),
+            }
+        }
+        Some("heartbeat") => match args.next() {
+            None => print_result("heartbeat", heartbeat_cmd(&process_env)),
+            Some(_) => usage_error("heartbeat", "takes no arguments"),
+        },
+        Some("thread") => {
+            let rest: Vec<String> = args.collect();
+            match parse_thread_args(&rest) {
+                Ok(payload) => print_result("thread", thread_cmd(&process_env, payload)),
+                Err(e) => usage_error("thread", &e),
             }
         }
         Some("doctor") => {
@@ -1642,6 +1960,115 @@ mod tests {
     }
 
     #[test]
+    fn claim_exclusivity_flags() {
+        let parse = |a: &[&str]| parse_claim_args(&strings(a));
+        assert_eq!(parse(&["TIN-1"]).unwrap().exclusive, None);
+        assert_eq!(
+            parse(&["TIN-1", "--exclusive"]).unwrap().exclusive,
+            Some(true)
+        );
+        assert_eq!(
+            parse(&["--handoff", ULID, "--advisory"]).unwrap().exclusive,
+            Some(false)
+        );
+        assert!(parse(&["TIN-1", "--exclusive", "--advisory"]).is_err());
+    }
+
+    #[test]
+    fn claim_verbs_post_their_payloads() {
+        let ok = (200, "application/json", r#"{"outcome":"recorded"}"#);
+        let (url, server) = mock(vec![ok; 6]);
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_AGENT_ID", ME)]);
+        let args = parse_claim_args(&strings(&[
+            "TIN-4655",
+            "--exclusive",
+            "--lease-hours",
+            "8",
+            "--note",
+            "spec",
+        ]))
+        .unwrap();
+        claim_cmd(&lookup, &args).unwrap();
+        let accept = parse_claim_args(&strings(&["--handoff", ULID])).unwrap();
+        claim_cmd(&lookup, &accept).unwrap();
+        release_cmd(&lookup, ULID).unwrap();
+        handoff_cmd(
+            &lookup,
+            parse_handoff_args(&strings(&[ULID, PEER, "--note", "yours"])).unwrap(),
+        )
+        .unwrap();
+        claims_cmd(
+            &lookup,
+            parse_claims_args(&strings(&["--subject", "TIN-4655", "--all"])).unwrap(),
+        )
+        .unwrap();
+        claims_cmd(&lookup, parse_claims_args(&strings(&["--mine"])).unwrap()).unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("POST /v1/claim HTTP/1.1"));
+        assert_eq!(
+            request_json(&requests[0]),
+            json!({"me":ME,"subject":"TIN-4655","exclusive":true,"lease_hours":8,"note":"spec"})
+        );
+        assert_eq!(
+            request_json(&requests[1]),
+            json!({"me":ME,"handoff_id":ULID})
+        );
+        assert!(requests[2].starts_with("POST /v1/release HTTP/1.1"));
+        assert_eq!(request_json(&requests[2]), json!({"me":ME,"claim_id":ULID}));
+        assert!(requests[3].starts_with("POST /v1/handoff HTTP/1.1"));
+        assert_eq!(
+            request_json(&requests[3]),
+            json!({"me":ME,"claim_id":ULID,"to":PEER,"note":"yours"})
+        );
+        // A plain listing passes no `me`; --mine does.
+        assert!(requests[4].starts_with("POST /v1/claims HTTP/1.1"));
+        assert_eq!(
+            request_json(&requests[4]),
+            json!({"subject":"TIN-4655","all":true})
+        );
+        assert_eq!(request_json(&requests[5]), json!({"me":ME}));
+        for bad in [
+            &[][..],
+            &["has space"],
+            &["a", "b"],
+            &["x", "--lease-hours", "0"],
+            &["x", "--lease-hours", "25"],
+            &["x", "--handoff", "nope"],
+            &["x", "--bogus"],
+        ] {
+            assert!(parse_claim_args(&strings(bad)).is_err(), "{bad:?}");
+        }
+        assert!(parse_handoff_args(&strings(&[ULID])).is_err());
+        assert!(parse_handoff_args(&strings(&["nope", PEER])).is_err());
+        assert!(parse_claims_args(&strings(&["--limit", "501"])).is_err());
+        assert!(release_cmd(&lookup, "nope").is_err());
+    }
+
+    #[test]
+    fn heartbeat_and_thread_post_me() {
+        let ok = (200, "application/json", r#"{"state":"live"}"#);
+        let (url, server) = mock(vec![ok; 2]);
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_AGENT_ID", ME)]);
+        heartbeat_cmd(&lookup).unwrap();
+        thread_cmd(
+            &lookup,
+            parse_thread_args(&strings(&[ULID, "--after", "3", "--limit", "10"])).unwrap(),
+        )
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("POST /v1/heartbeat HTTP/1.1"));
+        assert_eq!(request_json(&requests[0]), json!({"me":ME}));
+        assert!(requests[1].starts_with("POST /v1/thread HTTP/1.1"));
+        assert_eq!(
+            request_json(&requests[1]),
+            json!({"me":ME,"thread_id":ULID,"after_seq":3,"limit":10})
+        );
+        assert!(parse_thread_args(&strings(&[])).is_err());
+        assert!(parse_thread_args(&strings(&["nope"])).is_err());
+        assert!(parse_thread_args(&strings(&[ULID, "--limit", "101"])).is_err());
+    }
+
+    #[test]
     fn help_and_version_are_successful_meta_commands() {
         for flag in ["-h", "--help", "help"] {
             let text = meta(Some(flag)).unwrap();
@@ -2049,5 +2476,16 @@ mod tests {
         assert!(
             matches!(&checks[5].1, Check::Fail { detail, .. } if detail.starts_with("POST /v1/register: "))
         );
+    }
+
+    #[test]
+    fn a_refused_exclusive_claim_exits_non_zero() {
+        assert_eq!(
+            claim_exit(&json!({"outcome":"refused","recorded":false})),
+            ExitCode::from(EXIT_CLAIM_REFUSED)
+        );
+        for outcome in ["recorded", "renewed"] {
+            assert_eq!(claim_exit(&json!({"outcome":outcome})), ExitCode::SUCCESS);
+        }
     }
 }

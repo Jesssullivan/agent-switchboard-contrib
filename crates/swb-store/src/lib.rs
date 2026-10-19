@@ -23,6 +23,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use ulid::Ulid;
 
+mod claims;
+pub use claims::{
+    CLAIM_LEASE_DEFAULT_HOURS, CLAIM_LEASE_MAX_HOURS, CLAIMS_DEFAULT_LIMIT, CLAIMS_MAX_LIMIT,
+    ClaimsQuery, NOTE_MAX_BYTES, SUBJECT_MAX_BYTES, THREAD_DEFAULT_LIMIT, THREAD_MAX_LIMIT,
+    effective_claim_lease_seconds, valid_note, valid_subject,
+};
+
 pub const RETENTION_ACKED_DAYS: u32 = 7;
 pub const RETENTION_UNACKED_DAYS: u32 = 30;
 pub const DEFAULT_TTL_HOURS: u32 = 72;
@@ -55,6 +62,9 @@ pub enum ErrorKind {
     Unavailable,
     /// A `msg_id` was reused with a different sender or body (SWB-R46).
     Conflict,
+    /// The claim or handoff does not exist for this caller, or is no longer
+    /// active (SWB-R16, P2).
+    ClaimUnavailable,
     /// The store itself failed; not the caller's fault.
     Internal,
 }
@@ -67,6 +77,7 @@ impl ErrorKind {
             Self::Unregistered => "unregistered",
             Self::Unavailable => "message_unavailable",
             Self::Conflict => "msg_id_conflict",
+            Self::ClaimUnavailable => "claim_unavailable",
             Self::Internal => "internal",
         }
     }
@@ -321,6 +332,7 @@ impl Store {
         let db = self.db()?;
         let now = self.now();
         db.execute("DELETE FROM messages WHERE (state='acked' AND acked_at<=?1-604800) OR (state!='acked' AND created_at<=?1-2592000)", [now]).map_err(sql_err)?;
+        claims::prune(&db, now)?;
         Ok(())
     }
     /// A cheap read that proves the store answers (`/healthz`).
@@ -413,6 +425,8 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS sessions_by_session ON sessions(session_id, registered_seq);",
         )
         .map_err(sql_err)?;
+        // P2 (SWB-R16, R-C950): the claim and handoff tables.
+        claims::migrate(&db)?;
         for name in ["audit_hmac_key", "end_token_key"] {
             let key = random_bytes::<32>()?;
             db.execute(
@@ -506,7 +520,9 @@ impl Store {
     }
     /// End a session. Only the end token its latest registration returned
     /// ends it; any other token, or an unknown session, answers `unknown`
-    /// without saying which (R-C944).
+    /// without saying which (R-C944). Ending a session releases every claim
+    /// it holds in the same transaction and lists them in
+    /// `released_claims` (R-C950).
     pub fn end(&self, me: &str, end_token: &str) -> StoreResult<Value> {
         if !valid_agent_id(me) {
             return Err("invalid me".into());
@@ -515,8 +531,12 @@ impl Store {
             return Err("invalid end_token".into());
         }
         let presented = unhex(end_token).ok_or("invalid end_token")?;
-        let db = self.db()?;
-        let nonce: Option<Option<Vec<u8>>> = db
+        let mut db = self.db()?;
+        let now = self.now();
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let nonce: Option<Option<Vec<u8>>> = tx
             .query_row(
                 "SELECT token_nonce FROM sessions WHERE agent_id=?1",
                 [me],
@@ -525,16 +545,19 @@ impl Store {
             .optional()
             .map_err(sql_err)?;
         let matches = match nonce.flatten() {
-            Some(nonce) => Self::end_token_mac(&db, me, &nonce)?
+            Some(nonce) => Self::end_token_mac(&tx, me, &nonce)?
                 .verify_slice(&presented)
                 .is_ok(),
             None => false,
         };
-        if matches {
-            db.execute("UPDATE sessions SET ended=1 WHERE agent_id=?1", [me])
-                .map_err(sql_err)?;
+        if !matches {
+            return Ok(json!({"agent_id":me,"state":"unknown"}));
         }
-        Ok(json!({"agent_id":me,"state":if matches {"ended"} else {"unknown"}}))
+        tx.execute("UPDATE sessions SET ended=1 WHERE agent_id=?1", [me])
+            .map_err(sql_err)?;
+        let released = claims::release_all_held(&tx, me, now)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(json!({"agent_id":me,"state":"ended","released_claims":released}))
     }
     /// List sessions (R-C944): live only unless `all`, one row per
     /// (harness, host, session id) (the latest registration wins), ordered
@@ -964,8 +987,19 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(sql_err)?;
+        let claims_active = Self::claims_active(&db, now)?;
+        let claim_overlaps = Self::claim_overlaps(&db, now)?;
+        let handoffs: i64 = db
+            .query_row(
+                "SELECT value FROM counters WHERE name='handoffs_total'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .unwrap_or(0);
         Ok(format!(
-            "# TYPE swb_messages_total counter\nswb_messages_total {sent}\n# TYPE swb_mailbox_unacked gauge\nswb_mailbox_unacked {unacked}\n# TYPE swb_sessions gauge\nswb_sessions{{state=\"live\"}} {live}\n"
+            "# TYPE swb_messages_total counter\nswb_messages_total {sent}\n# TYPE swb_mailbox_unacked gauge\nswb_mailbox_unacked {unacked}\n# TYPE swb_sessions gauge\nswb_sessions{{state=\"live\"}} {live}\n# TYPE swb_claims_active gauge\nswb_claims_active {claims_active}\n# TYPE swb_claim_overlaps gauge\nswb_claim_overlaps {claim_overlaps}\n# TYPE swb_handoffs_total counter\nswb_handoffs_total {handoffs}\n"
         ))
     }
 }

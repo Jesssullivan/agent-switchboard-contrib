@@ -1,7 +1,12 @@
 -- | A pure, executable model of the broker's coordination state (R-C229).
 --
--- It follows crates/swb-store for sessions, threads and messages, and the
--- SWB-R16 text in ADR-0001 for claims, which are not implemented in Rust yet.
+-- It follows crates/swb-store for sessions, threads, messages and claims.
+-- Claims follow SWB-R16 as R-C950 rules it: an exclusive request is refused
+-- while another session holds any active claim on the subject; a
+-- non-exclusive request is always recorded and lists every other holder; a
+-- repeat exclusive request by the current exclusive holder renews its claim;
+-- any other repeat request by a holder updates its one claim on the subject
+-- (SWB-R61, R-C655); and ending a session releases its claims.
 -- Time is an abstract clock in seconds that only 'Tick' advances.
 --
 -- v0.3.0 (R-C944): register returns an end token and only that token ends
@@ -34,7 +39,7 @@ module Swb.Model
   , sessionOf
   ) where
 
-import Data.List (sortOn)
+import Data.List (nub, sort, sortOn)
 import qualified Data.Map.Strict as M
 import Swb.Constants
 import Swb.Invariants
@@ -58,10 +63,11 @@ data Op
   | Tick Integer -- ^ advance the clock (model only)
   deriving (Eq, Show)
 
+-- | A claim's outcome (R-C950). Holder lists are sorted and distinct.
 data ClaimOutcome
-  = Recorded
-  | HeldBy Agent
-  | Unruled String -- ^ an SWB-R16 "Not yet ruled" case; never asserted
+  = Recorded [Agent] -- ^ recorded; overlaps[]: every other holder on the subject
+  | Renewed -- ^ the caller's own exclusive claim, expiry extended
+  | Refused [Agent] -- ^ exclusive request refused; held_by: the other holders
   deriving (Eq, Show)
 
 data Res
@@ -121,7 +127,7 @@ runModel c = go (St 0 M.empty [] M.empty 0 [] 0 0 M.empty)
 
 -- | Every broker operation by a registered agent refreshes its lease and
 -- clears ended (the `UPDATE sessions SET last_seen=..., ended=0` in each
--- swb-store mutation). Claims are assumed to do the same.
+-- swb-store mutation), claims included.
 refresh :: Agent -> St -> St
 refresh a s = s {sessions = M.adjust (\x -> x {sSeen = now s, sEnded = False}) a (sessions s)}
 
@@ -179,7 +185,8 @@ step c op s = case op of
             }
         )
   End a ref -> case (M.lookup a (sessions s), resolveTok ref (M.findWithDefault [] a (issued s))) of
-    (Just x, Just t) | t == token a (sNonce x) -> (REnded True, s {sessions = M.insert a x {sEnded = True} (sessions s)})
+    -- R-C950: ending a session releases every claim it holds.
+    (Just x, Just t) | t == token a (sNonce x) -> (REnded True, s {sessions = M.insert a x {sEnded = True} (sessions s), claims = filter ((/= a) . crHolder) (claims s)})
     _ -> (REnded False, s)
   Peers a everything
     | M.member a (sessions s) ->
@@ -207,17 +214,25 @@ step c op s = case op of
       | pending s a m -> (RAcked, refresh a s {msgs = map (\x -> if mId x == i then x {mAcked = Just (now s)} else x) (msgs s)})
       | mAcked m /= Nothing -> (RAcked, refresh a s)
     _ -> (RErr "message unavailable", s)
-  Claim h subj ex lease ->
-    let active = [r | r <- claims s, crSubject r == subj, crUntil r > now s]
-        others = [crHolder r | r <- active, crExclusive r, crHolder r /= h]
-        record = s {claims = claims s ++ [ClaimRec h subj ex (now s + claimLeaseSeconds c lease)]}
-        outcome
-          | not ex = (Recorded, record)
-          | any (\r -> crExclusive r && crHolder r == h) active = (Unruled "exclusive_reclaim_by_the_current_exclusive_holder", s)
-          | (x : _) <- others = (HeldBy x, s)
-          | not (null active) = (Unruled "exclusive_request_while_nonexclusive_claims_exist", s)
-          | otherwise = (Recorded, record)
-     in (RClaimed (fst outcome), refresh h (snd outcome))
+  Claim h subj ex lease
+    | not (M.member h (sessions s)) -> (RErr "unregistered me", s)
+    | otherwise ->
+        let expiry = now s + claimLeaseSeconds c lease
+            live r = crSubject r == subj && crUntil r > now s
+            others = sort (nub [crHolder r | r <- claims s, live r, crHolder r /= h])
+            mine r = live r && crHolder r == h
+            ownEx r = mine r && crExclusive r
+            -- A session holds at most one active claim per subject: a repeat
+            -- request extends it, and only ever adds exclusivity.
+            update r
+              | mine r = r {crUntil = max (crUntil r) expiry, crExclusive = crExclusive r || ex}
+              | otherwise = r
+            (outcome, s')
+              | ex && any ownEx (claims s) = (Renewed, s {claims = map update (claims s)})
+              | ex && not (null others) = (Refused others, s)
+              | any mine (claims s) = (Recorded others, s {claims = map update (claims s)})
+              | otherwise = (Recorded others, s {claims = claims s ++ [ClaimRec h subj ex expiry]})
+         in (RClaimed outcome, refresh h s')
   ListClaims ->
     let holder h = (\x -> classify c (now s) (sSeen x) (sEnded x)) <$> M.lookup h (sessions s)
      in (RClaims [viewClaim (holder (crHolder r)) r | r <- activeClaims (now s) (claims s)], s)

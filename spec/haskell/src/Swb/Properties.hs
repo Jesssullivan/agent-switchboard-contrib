@@ -7,16 +7,20 @@
 --                          along legal transitions.
 --   2. threadSeqDense      SWB-R14: per-thread seq is 1, 2, 3, ..., even after prune.
 --   3. atLeastOnceUntilAck SWB-R09: no ack means redelivered; ack means never again.
---   4. exclusiveRefusal    SWB-R16: the only refusal is a second exclusive claim.
---   5. noOrphanAfterExpiry SWB-R16: listed claims are unexpired, and orphaned
---                          exactly when the holder is gone.
+--   4. exclusiveRefusal    SWB-R16, R-C950: an exclusive request is refused,
+--                          with held_by, exactly while another session holds
+--                          an active claim; a non-exclusive one is always
+--                          recorded with every other holder in overlaps; the
+--                          holder's repeat exclusive request renews.
+--   5. noOrphanAfterExpiry SWB-R16, R-C950: listed claims are exactly the
+--                          unexpired, unreleased ones (ending a session
+--                          releases its claims), orphaned exactly when the
+--                          holder is gone.
 --   6. endNeedsToken       R-C944: only the latest token a session's registration
 --                          returned ends it; every registration rotates the token.
 --   7. peersView           R-C944: peers lists one row per (harness, host, session
 --                          id) (the latest registration wins), and only live rows
 --                          unless asked for all.
---
--- Unruled SWB-R16 cases are never asserted.
 module Swb.Properties
   ( Mode (..)
   , genOps
@@ -25,15 +29,13 @@ module Swb.Properties
   , properties
   ) where
 
-import Data.List (sort)
+import Data.List (nub, sort)
 import qualified Data.Map.Strict as M
 import Swb.Constants
 import Swb.Model
 import Test.QuickCheck hiding (classify)
 
--- | The live broker has no claims yet, so neither live mode generates claim
--- operations. 'LiveMode' runs against the wall clock and generates no
--- 'Tick'. 'LiveClockMode' runs against a broker started with the R-C262 test
+-- | 'LiveMode' runs against the wall clock and generates no 'Tick'. 'LiveClockMode' runs against a broker started with the R-C262 test
 -- clock (`swb_test_clock`, `SWB_TEST_CLOCK=1`) and generates 'Tick', so the
 -- live run covers expiry, idle, gone and retention.
 data Mode = ModelMode | LiveMode | LiveClockMode deriving (Eq, Show)
@@ -49,16 +51,14 @@ genOps mode = normalizeAcks <$> listOf (frequency (common ++ extra))
       , (5, Send <$> agent <*> agent <*> (Thread <$> choose (0, 2)) <*> oneof [pure Nothing, Just <$> elements [0, 1, 2, 72, 336, 337, 10000]])
       , (4, Inbox <$> agent <*> elements [1, 2, 3, 20, 100, 101])
       , (4, Ack <$> agent <*> choose (0, 20))
+      , (3, Claim <$> agent <*> (Subject <$> choose (0, 1)) <*> arbitrary <*> oneof [pure Nothing, Just <$> elements [1, 4, 24, 25]])
+      , (2, pure ListClaims)
       ]
     tick = (3, Tick <$> elements [1, 60, 899, 900, 901, 3600, 14399, 14400, 21600, 21601, 86400, 259200, 604801, 1296000, 2678400])
     extra = case mode of
       LiveMode -> []
       LiveClockMode -> [tick]
-      ModelMode ->
-        [ (3, Claim <$> agent <*> (Subject <$> choose (0, 1)) <*> arbitrary <*> oneof [pure Nothing, Just <$> elements [1, 4, 24, 25]])
-        , (2, pure ListClaims)
-        , tick
-        ]
+      ModelMode -> [tick]
 
 shrinkOps :: [Op] -> [[Op]]
 shrinkOps = map normalizeAcks . shrinkList (const [])
@@ -179,38 +179,56 @@ atLeastOnceUntilAck c tr = go M.empty M.empty M.empty (clocked tr)
          in unsound ++ counts ++ incomplete ++ go sent acked (M.union (M.fromList got) dc) rest
       _ -> go sent acked dc rest
 
--- | Claims that are recorded and unexpired at time t.
+-- | Claims that are recorded and not released, with their expiry.
 data Rec = Rec {rHolder :: Agent, rSubject :: Subject, rExclusive :: Bool, rUntil :: Integer} deriving (Eq, Show)
 
+-- | Replay one step's effect on the recorded claims. A holder has at most
+-- one active claim per subject: a recorded or renewed request extends it
+-- (never shortens it, and only ever adds exclusivity), or adds it when the
+-- holder has none; a successful 'End' releases every claim of that agent
+-- (R-C950).
 replayClaims :: Constants -> Integer -> Op -> Res -> [Rec] -> [Rec]
-replayClaims c t (Claim h s ex lease) (RClaimed Recorded) rs = rs ++ [Rec h s ex (t + claimLeaseSeconds c lease)]
+replayClaims c t (Claim h s ex lease) (RClaimed out) rs = case out of
+  Refused _ -> rs
+  _
+    | any mine rs -> [if mine x then x {rUntil = max (rUntil x) until', rExclusive = rExclusive x || ex} else x | x <- rs]
+    | otherwise -> rs ++ [Rec h s ex until']
+  where
+    until' = t + claimLeaseSeconds c lease
+    mine x = rHolder x == h && rSubject x == s && rUntil x > t
+replayClaims _ _ (End a _) (REnded True) rs = filter ((/= a) . rHolder) rs
 replayClaims _ _ _ _ rs = rs
 
--- | 4. A non-exclusive claim is always recorded. An exclusive claim is
--- refused with held_by naming another unexpired exclusive holder exactly when
--- one exists; otherwise it is recorded. Unruled cases are skipped.
+-- | 4. Every claim outcome is the ruled one (SWB-R16, R-C950). A claim by a
+-- registered agent never errors. Let others be the other sessions holding
+-- an active claim on the subject:
+--
+--   * exclusive, and the caller holds an active exclusive claim: Renewed;
+--   * exclusive, and others is not empty: Refused, held_by = others;
+--   * otherwise: Recorded, overlaps = others (an exclusive holder included).
 exclusiveRefusal :: Constants -> Trace -> [String]
-exclusiveRefusal c tr = go [] (clocked tr)
+exclusiveRefusal c tr = go M.empty [] (clocked tr)
   where
-    go _ [] = []
-    go rs ((t, o, r) : rest) =
-      let bad = case (o, r) of
-            (Claim h s ex _, RClaimed out) ->
+    go _ _ [] = []
+    go sess rs ((t, o, r) : rest) =
+      let bad = case o of
+            Claim h s ex _ ->
               let active = [x | x <- rs, rSubject x == s, rUntil x > t]
-                  holders = [rHolder x | x <- active, rExclusive x, rHolder x /= h]
-                  unruled = ex && (any (\x -> rExclusive x && rHolder x == h) active || (null holders && not (null active)))
-                  ok
-                    | unruled = True
-                    | not ex = out == Recorded
-                    | null holders = out == Recorded
-                    | otherwise = case out of HeldBy x -> x `elem` holders; _ -> False
-               in ["claim " ++ show (h, s, ex) ++ " gave " ++ show out | not ok]
+                  others = sort (nub [rHolder x | x <- active, rHolder x /= h])
+                  own = any (\x -> rHolder x == h && rExclusive x) active
+                  want
+                    | ex && own = Renewed
+                    | ex && not (null others) = Refused others
+                    | otherwise = Recorded others
+               in case r of
+                    RClaimed out -> ["claim " ++ show (h, s, ex) ++ " gave " ++ show out ++ " expected " ++ show want | out /= want]
+                    _ -> ["claim " ++ show (h, s, ex) ++ " by a registered agent gave " ++ show r | M.member h sess]
             _ -> []
-       in bad ++ go (replayClaims c t o r rs) rest
+       in bad ++ go (trackSessions t o r sess) (replayClaims c t o r rs) rest
 
--- | 5. ListClaims shows exactly the unexpired recorded claims, and a claim is
--- orphaned when its holder is gone and not orphaned while the holder is live
--- or idle. Ended or unregistered holders are not asserted (SWB-R16 is silent).
+-- | 5. ListClaims shows exactly the unexpired recorded claims that no 'End'
+-- released (R-C950), and a claim is orphaned exactly when its holder is
+-- gone. An ended holder holds nothing, so it never shows.
 noOrphanAfterExpiry :: Constants -> Trace -> [String]
 noOrphanAfterExpiry c tr = go M.empty [] (clocked tr)
   where
@@ -227,7 +245,6 @@ noOrphanAfterExpiry c tr = go M.empty [] (clocked tr)
                     | v <- views
                     , Just x <- [M.lookup (cvHolder v) sess']
                     , let st = classify c t (seenAt x) (seenEnded x)
-                    , st /= Ended
                     , cvOrphaned v /= (st == Gone)
                     ]
                in set ++ orphan

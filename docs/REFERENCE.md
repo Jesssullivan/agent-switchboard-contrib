@@ -38,7 +38,7 @@ did not register, but anyone who can register can re-register any agent id
 | `SWB_HARNESS` | `hook`, `whoami`, `doctor` | hook: its argument | `claude`, `kimi`, `codex`, `junie`, `opencode` or `pi` |
 | `SWB_STATE_DIR` | `hook`, `whoami --register`, `doctor --register` | `$XDG_STATE_HOME/swb`, then `$HOME/.local/state/swb` | where end tokens are kept (`sessions/<agent_id>.token`, dir 0700, file 0600); files not rewritten for 7 days are pruned |
 | `SWB_SESSION_ID` | `whoami`, `doctor` | none | hooks read `session_id` from stdin instead |
-| `SWB_AGENT_ID` | `inbox`, `send`, `ack`, `doctor`, `channel` | none | `harness:host:pid:session_id`, as `register` returned it; `channel` falls back to the launcher identity |
+| `SWB_AGENT_ID` | `inbox`, `send`, `ack`, `heartbeat`, `thread`, `claim`, `release`, `handoff`, `claims --mine`, `doctor`, `channel` | none | `harness:host:pid:session_id`, as `register` returned it; `channel` falls back to the launcher identity |
 | `SWB_CHANNEL_POLL_SECONDS` | `channel` | `5` | inbox poll interval, clamped to 2–60 |
 | `SWB_METRICS_URL` | `doctor` | none | `http://host:port` of `SWB_METRICS_LISTEN`; unset skips the `/metrics` check |
 
@@ -56,6 +56,12 @@ a POST with a JSON body (`Content-Type: application/json`).
 | `POST /v1/send` | `{from, to, ticket, body, …}` (envelope v3) | `ticket` is `TIN-<digits>` or `none`; a body is at most 16 KiB |
 | `POST /v1/inbox` | `{me, limit, wait_seconds}` | long-poll |
 | `POST /v1/ack` | `{me, msg_id}` | |
+| `POST /v1/heartbeat` | `{me}` | renews the lease only |
+| `POST /v1/thread` | `{me, thread_id, after_seq?, limit?}` | one thread's messages that `me` sent or received, in seq order; pages of `limit` (default 20, at most 100) with `next_after_seq`; changes no delivery state |
+| `POST /v1/claim` | `{me, subject?, exclusive?, lease_hours?, note?, handoff_id?}` | see Claims below |
+| `POST /v1/release` | `{me, claim_id}` | your own claim only; releasing it again changes nothing |
+| `POST /v1/handoff` | `{me, claim_id, to, note?}` | offers your active claim to `to`; the same offer again returns the open receipt |
+| `POST /v1/claims` | `{me?, subject?, holder?, all?, limit?}` | active claims (`all` adds released, handed-off and expired ones still kept); `me` renews that lease and adds its open `handoffs` |
 | `GET /healthz` | | also on `SWB_METRICS_LISTEN`, where it is not Host-guarded |
 
 `peers` lists live sessions by default (`all` adds idle, gone and ended),
@@ -66,16 +72,73 @@ at most 200) with a `next_cursor`. A row is
 
 Errors are `{"error", "code"}` with a status per kind: 400
 (`invalid_argument`, `invalid_json`), 404 (`unregistered`,
-`message_unavailable`, `not_found`), 405 (`method_not_allowed`), 409
+`message_unavailable`, `claim_unavailable`, `not_found`), 405 (`method_not_allowed`), 409
 (`msg_id_conflict`), 415 (`unsupported_media_type`), 500 (`internal`). The
 guard's refusals are 403. The full table is in the migration notes.
 
-`/metrics` is on `SWB_METRICS_LISTEN`.
+`/metrics` is on `SWB_METRICS_LISTEN`. It includes `swb_claims_active`,
+`swb_claim_overlaps` (active claims sharing a subject with another holder)
+and `swb_handoffs_total`.
+
+## Claims
+
+Claims are advisory (SWB-R16, R-C950). A subject is a ticket (`TIN-4655`), a
+path (`lab:nix/hosts/sting.nix`) or another token in `[A-Za-z0-9._:/#@+-]`,
+at most 256 bytes. A note is at most 512 bytes with no control characters;
+it is never written to the audit log. Never put a secret in either.
+
+- A non-exclusive claim is always recorded (`outcome: recorded`). Every
+  other session's active claim on the subject, an exclusive one included, is
+  listed in `overlaps[]` as `{claim_id, holder, exclusive, orphaned}`.
+- An exclusive claim is refused while another session holds any active claim
+  on the subject: `outcome: refused`, `recorded: false`, `held_by` lists the
+  holders, and nothing is recorded. The answer is a 200, not an error. Your
+  own non-exclusive claim on the subject does not block you.
+- Repeating your own exclusive claim renews it: `outcome: renewed`, the same
+  `claim_id`, and the expiry moves to the later of the old one and now plus
+  the new lease.
+- A session holds at most one active claim per subject. Any other repeat
+  claim by its holder updates that claim (`outcome: recorded`, the same
+  `claim_id`, the later expiry), so a holder is listed once in `overlaps[]`
+  and `held_by`. An exclusive request over your own advisory claim makes it
+  exclusive; an advisory request never drops exclusivity.
+- Leases default to 4 h and are clamped to 1..24 h. Every claim call renews
+  the caller's session lease.
+- `end` releases every active, unexpired claim the session holds at once
+  and returns them in `released_claims` (a claim that already expired keeps
+  its expiry as its end); the broker logs a `release` audit line for each, with
+  `reason: session_ended`.
+- A claim whose holder is `gone` shows `state: orphaned` and is never
+  revoked; it still counts against an exclusive request.
+- `handoff` offers one of your active claims to another session and creates
+  a receipt in `offered`. The receiver accepts it with
+  `claim {me, handoff_id}` (`swb claim --handoff <id>`): in one transaction
+  the source becomes `handed_off` and the receiver's claim is recorded under
+  the same rules. The accepted claim keeps the source's exclusivity unless
+  the receiver passes `exclusive`. An acceptance that would be exclusive is
+  an exclusive request under R-C950 (1), whether the exclusivity comes from
+  the source or from `exclusive: true`: while another session holds an
+  active claim on the subject it is refused with `held_by`, nothing moves,
+  and the offer stays open. The receiver can then accept it as advisory
+  with `exclusive: false` (`swb claim --handoff <id> --advisory`). A receiver that already holds a claim on the subject
+  keeps that claim, now with `handoff_from` set. Releasing a claim, or
+  ending its session, cancels its open offers.
+- `claims` returns `truncated: true` when more claims matched than the
+  page holds, and with `me`, `handoffs_truncated` when more than 100 open
+  handoffs did.
+- The audit log has a line for each recorded, renewed or refused claim, and
+  an accepted handoff adds a `handed_off` line for its source claim.
+- `release` and `handoff` act only on your own claims; another session's
+  claim, or an unknown id, answers `claim_unavailable`.
+
+Claims and handoffs are kept 7 days after they stop being active. The
+SWB-R15 Linear receipt comment for a handoff is not posted yet.
 
 ## MCP tools
 
-At `/mcp`: `register`, `end`, `peers`, `send`, `inbox`, `ack`, with the same
-fields and rules as the REST routes; every input field is described in the
+At `/mcp`: `register`, `end`, `peers`, `send`, `inbox`, `ack`, `heartbeat`,
+`thread`, `claim`, `release`, `handoff` and `claims`, with the same fields
+and rules as the REST routes; every input field is described in the
 tool schema. Tool errors carry the same JSON error object as their text. Over
 MCP the `register` result carries `end_token` into the model's context; an
 adapter that ends sessions itself should keep the token and strip it.
@@ -86,12 +149,19 @@ adapter that ends sessions itself should keep the token and strip it.
 makes no broker call), `inbox`,
 `send <to> <ticket> [--ruling ID] [--operator-directed] [--in-reply-to ULID]
 [--thread ULID] [--msg-id ULID] < body`, `ack <msg_id>`,
-`peers [--all] [--host H] [--limit N] [--cursor ID]`, `doctor [--register]`,
+`peers [--all] [--host H] [--limit N] [--cursor ID]`, `heartbeat`,
+`thread <thread_id> [--after SEQ] [--limit N]`,
+`claim <subject> [--exclusive] [--lease-hours N] [--note TEXT]`,
+`claim --handoff <ULID> [--exclusive]`, `release <claim_id>`,
+`handoff <claim_id> <to> [--note TEXT]`,
+`claims [--subject S] [--holder ID] [--all] [--mine] [--limit N]`,
+`doctor [--register]`,
 `channel` and `version`.
 
 - `--help`, `-h`, `help` and `<verb> --help` print usage on stdout and exit
   0; `--version`, `-V` and `version` exit 0. An unknown verb exits 2.
-- `peers` never passes `me`, so it refreshes no lease.
+- `peers` never passes `me`, so it refreshes no lease; nor does `claims`
+  without `--mine`.
 - Hooks save the end token on every successful register, under
   `$SWB_STATE_DIR/sessions/`; SessionEnd spends it and deletes the file.
   The CLI never prints the token: `whoami --register` prints
@@ -99,7 +169,8 @@ makes no broker call), `inbox`,
 - `agentd` is planned for P2 and exits 3; it is not in the usage text.
 
 Exit codes: 0 ok, 2 usage, 3 missing setting, broker error or a failed
-`doctor` check, 1 `serve` failure; `hook` always exits 0, and `channel`
+`doctor` check, 4 a refused exclusive `claim` (the answer is still printed),
+1 `serve` failure; `hook` always exits 0, and `channel`
 exits 0 when Claude Code closes its stdin.
 
 ## Claude Code channel
@@ -130,5 +201,5 @@ receiver's agent id, the sender and ticket, and the exact `swb inbox` and
 
 - Session rows are never pruned.
 - `/v1/notify` is not implemented.
-- `agentd` (per-host push) and the claim, release and handoff tools are
-  planned for P2.
+- `agentd` (per-host push) is planned for P2.
+- Handoffs post no Linear receipt comment yet (SWB-R15).

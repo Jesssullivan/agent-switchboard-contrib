@@ -19,7 +19,7 @@ adapter drives does live in `crates/`; see "Live adapter" below.
 | `dhall/ApprovedRelease.dhall` | Type of `docs/releases/approved-broker.json` (`swb.approved-release.v1`). |
 | `dhall/approved-broker.dhall` | The record itself. Its rendering must equal the committed JSON. |
 | `dhall/RustfsBucketIam.dhall` | Type of blahaj `config/rustfs-iam/owners.json` (`tinyland.blahaj.rustfs-bucket-iam.v1`), which carries the TIN-5105 `agent-switchboard-tofu-state` owner row. |
-| `dhall/Broker.dhall` | Ruled broker constants (SWB-R09, R14, R16; R-C944 end token and `peers` bounds) and the `Unruled` SWB-R16 cases. |
+| `dhall/Broker.dhall` | Ruled broker constants (SWB-R09, R14, R16; R-C944 end token and `peers` bounds) and the R-C950 claim rules. |
 | `dhall/generated/broker-constants.json` | Rendering of `Broker.dhall`, committed. The Haskell model reads only this file. |
 | `fixtures/blahaj-rustfs-iam-owners.json` | Snapshot of blahaj `owners.json` at commit `a54ff72480657fbecae8960946714081df2adb0e`. Check the live file with `just spec-owners <path>`. |
 | `check-dhall.sh` | The Dhall check. `just spec-dhall` and the flake check `spec-dhall` both run it. |
@@ -46,8 +46,8 @@ nothing. It does four things:
 ## QuickCheck properties
 
 The model (`haskell/src/Swb/Model.hs`) follows `crates/swb-store` for
-sessions, threads and messages. It follows the SWB-R16 text in ADR-0001 for
-claims, which Rust does not implement yet. Time is an abstract clock in
+sessions, threads, messages and claims. Claims follow SWB-R16 as R-C950
+(TIN-5770 comment `23fdf965`) rules it. Time is an abstract clock in
 seconds.
 
 Since v0.3.0 (R-C944) the model also covers the end token and the `peers`
@@ -68,29 +68,35 @@ adapter, the real broker.
 | `leaseLifecycle` | SWB-R09, `peers()` | Each observed state is the band implied by the agent's own last refresh or end. Between observations with no own activity, a state only decays: live, then idle, then gone. Ended stays ended. |
 | `threadSeqDense` | SWB-R14 | Within each thread, seq runs 1, 2, 3, and so on, and keeps doing so after a prune. |
 | `atLeastOnceUntilAck` | SWB-R09 | Inbox returns only pending messages, and `delivery_count` goes up by one each time. A short page holds every pending message, so a message that is never acked keeps coming back. Ack succeeds exactly for my own messages that are unexpired or already acked. |
-| `exclusiveRefusal` | SWB-R16 | A non-exclusive claim is always recorded. A second exclusive claim returns `held_by` while another holder's unexpired exclusive claim exists. Otherwise the claim is recorded. |
-| `noOrphanAfterExpiry` | SWB-R16 | The claim list shows exactly the unexpired recorded claims. A claim is orphaned while its holder is gone, and not while the holder is live or idle. |
+| `exclusiveRefusal` | SWB-R16, R-C950 | Every claim outcome is the ruled one. An exclusive request from the current exclusive holder renews its claim. Otherwise an exclusive request is refused, with `held_by` naming every other holder, while another session holds any active claim on the subject. Every other request is recorded, with every other holder (an exclusive one included) in `overlaps[]`. A claim by a registered agent never errors. |
+| `noOrphanAfterExpiry` | SWB-R16, R-C950 | The claim list shows exactly the unexpired recorded claims that no `End` released: ending a session releases its claims at once. A claim is orphaned exactly while its holder is gone. |
 | `endNeedsToken` | R-C944 | `End` succeeds exactly when it presents the latest token the agent's registrations returned. Every registration, even with the same `proc_start`, returns a token never handed out before. |
 | `peersView` | R-C944 | `peers` lists one row per (harness, host, session id), the one registered last, and only live rows unless the call asked for all. |
 
-**Unruled cases are never asserted.** The model answers each of these with
-`Unruled` and every property skips it:
+**The ruled claim cases (R-C950).** `Broker.dhall` lists them under
+`claim.rules`, and the two claim properties assert each one:
 
-- SWB-R16 "Not yet ruled": an exclusive request while non-exclusive claims
-  exist.
-- SWB-R16 "Not yet ruled": whether a non-exclusive claim lists an exclusive
-  holder in `overlaps[]`. The model has no overlaps.
-- Not addressed by the SWB-R16 text: a second exclusive claim from the current
-  exclusive holder.
+- `exclusive_refused_while_any_other_claim_is_held`: an exclusive request
+  while another session holds any active claim on the subject, exclusive or
+  not, is refused with `held_by` and records nothing.
+- `nonexclusive_recorded_with_exclusive_holder_in_overlaps`: a non-exclusive
+  request is always recorded and lists every other holder, an exclusive one
+  included, in `overlaps[]`.
+- `exclusive_repeat_by_holder_renews`: a repeat exclusive request by the
+  current exclusive holder is an idempotent renewal. The claim id stays; the
+  expiry moves to the later of the old one and now plus the new lease.
+- `end_releases_holder_claims`: `End` with the session's token releases its
+  claims at once (the broker logs each release).
+- `holder_has_one_claim_per_subject` (SWB-R61, R-C655): a repeat request by a
+  holder updates its one active claim on the subject (the same claim id, the
+  later expiry); an exclusive request over its own advisory claim, with no
+  other holder, makes it exclusive and is recorded; an advisory request never
+  drops exclusivity.
 
-The properties also make no assertion about a claim whose holder has ended.
-These cases are the questions for the P2 claims ruling packet.
-
-**Modeling assumptions to confirm in P2.** These are not rulings:
-
-- A claim lease ends at its expiry.
-- A claim refreshes the claimant's session lease, as every other broker
-  operation does.
+Release, handoff and `claims` filters are in the Rust tests
+(`crates/swb-store/src/claims.rs`), not the model. A claim lease ends at its
+expiry, and a claim refreshes the claimant's session lease, as every other
+broker operation does; both are now Rust behaviour, not assumptions.
 
 ## LiquidHaskell refinement types
 
@@ -103,7 +109,7 @@ exercise.
 |---|---|---|
 | Per-thread seq | `appendSeq`, type `SeqLog` | A thread's seq log is strictly decreasing newest first, and its newest seq equals its length. Appending always adds a seq above every earlier one on that thread, so seqs run 1, 2, 3, and so on. The log survives prune, like `thread_counters`. |
 | Lease transitions | `decayLemma`, `endedLemma`, `reviveLemma` over `classifyAge` | With no activity of its own, a lease only decays: live, then idle, then gone. Ended stays ended. End always gives ended, and a refresh always gives live. Those are the only edges. |
-| Claim holders | `activeClaims`, `viewClaim` | A listed claim is unexpired, and it is marked orphaned exactly when its holder is gone. So a listed claim's holder is not gone, or the claim is marked for release. A claim refreshes its holder, so the holder is live when the claim is recorded. The model has no explicit release, so this is as far as the model goes. |
+| Claim holders | `activeClaims`, `viewClaim` | A listed claim is unexpired, and it is marked orphaned exactly when its holder is gone. So a listed claim's holder is not gone, or the claim is marked for release. A claim refreshes its holder, so the holder is live when the claim is recorded. Release on `End` happens in the model, outside this module; `noOrphanAfterExpiry` covers it. |
 
 Not proved: that `Swb.Model` threads its state through these functions
 correctly. The model module is not LiquidHaskell-checked, because it reads
@@ -171,5 +177,6 @@ just spec-live-clock http://127.0.0.1:18080
   7-day acked prune, and `threadSeqDense` covers seq after a prune. Each
   `POST /v1/test/clock` runs one retention prune after it moves the clock,
   as the model does at `Tick`.
-- Both: the claim properties stay vacuous until P2 implements claims
-  (SWB-R16).
+- Both: `Claim` and `ListClaims` run against `/v1/claim` and `/v1/claims`.
+  Subjects carry the case's tag, and `ListClaims` asks per subject, so a case
+  sees only its own claims. Lease expiry is covered only in the clocked run.

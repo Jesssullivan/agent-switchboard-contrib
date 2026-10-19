@@ -16,7 +16,7 @@ secrets. It covers every mode `main` has, in order:
 | 9 | MCP over Streamable HTTP, with curl as the client: `tools/list`, `register`, `peers`, `send`, `inbox`, `ack`. The agent registers with harness id `pi`, but Pi has no built-in MCP client and its integration is unproven (R-C949) |
 | 10 | Cross-host: a second host (a second process with its own `SWB_HOST` and state dir) on the same broker, and a second broker that does not federate |
 | 11 | v0.3.0 end tokens: a forged end is refused, SessionEnd spends the token |
-| 12 | Claims and handoff as ADR-0001 SWB-R16 and SWB-R60 (R-C950) define them (advisory claims with `overlaps[]`, an exclusive request refused while any other session holds an active claim on the subject, `offered` handoff receipt accepted by the receiver's claim): **pending P2** stubs only; `swb agentd` exits 3 |
+| 12 | Claims and handoff (ADR-0001 SWB-R16, SWB-R60 and SWB-R61): an advisory claim recorded with `overlaps[]`, an exclusive request refused with `held_by` while another session holds a claim (exit 4), `release`, an `offered` handoff accepted by the receiver's claim, one claim per holder and subject, and `end` releasing a session's claims. `swb agentd` is still P2 and exits 3 |
 
 ```sh
 SWB_BIN=/path/to/swb examples/demo/run.sh            # print the transcript

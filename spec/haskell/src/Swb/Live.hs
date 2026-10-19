@@ -1,7 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Thin adapter that runs the same operations against a running broker's
--- REST API (/v1/register, /v1/end, /v1/peers, /v1/send, /v1/inbox, /v1/ack),
+-- REST API (/v1/register, /v1/end, /v1/peers, /v1/send, /v1/inbox, /v1/ack,
+-- /v1/claim, /v1/claims),
 -- so the properties in Swb.Properties can judge the real implementation.
 -- Every call is a POST with a JSON body, as v0.3.0 requires (R-C944).
 --
@@ -11,9 +12,9 @@
 --
 -- 'Tick' posts to /v1/test/clock, which exists only on a broker built with
 -- the R-C262 `test-clock` feature and started with SWB_TEST_CLOCK=1;
--- 'probeClock' checks for it before a clocked run. The claim operations
--- return 'RUnsupported', and no live mode generates them, because the broker
--- has no claims yet (SWB-R16, P2).
+-- 'probeClock' checks for it before a clocked run. Claim subjects carry the
+-- case's tag too, and 'ListClaims' asks per subject, so a case sees only its
+-- own claims (SWB-R16, R-C950).
 module Swb.Live
   ( loopbackOnly
   , probeClock
@@ -25,7 +26,7 @@ import Data.Aeson (Value (..), eitherDecode, encode, object, (.=))
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import Data.Bits (shiftL, shiftR, (.&.))
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, nub, sort)
 import qualified Data.Map.Strict as M
 import Data.Maybe (mapMaybe)
 import Data.Scientific (toBoundedInteger)
@@ -71,6 +72,9 @@ runLive mgr base ops = do
       sessionId x = T.concat ["s", T.pack (show (sessionOf x)), "-", host]
       agentId x = T.concat ["claude:", host, ":", T.pack (show (pid x)), ":", sessionId x]
       ours = M.fromList [(agentId (Agent a), Agent a) | a <- [0 .. 2]]
+      subjectText (Subject n) = T.concat [host, "-subject-", T.pack (show n)]
+      subjects = M.fromList [(subjectText (Subject n), Subject n) | n <- [0, 1]]
+      holders k v = sort (nub (mapMaybe (\row -> str "holder" row >>= (`M.lookup` ours)) (arr k v)))
       post path body = call =<< fmap (\r -> r {method = "POST", requestBody = RequestBodyLBS (encode body), requestHeaders = [("Content-Type", "application/json")]}) (parseRequest (base ++ path))
       call req = do
         resp <- httpLbs req mgr
@@ -115,10 +119,23 @@ runLive mgr base ops = do
             mid <- maybe newUlid pure (M.lookup i (lsIds st))
             (code, _) <- post "/v1/ack" (object ["me" .= agentId a, "msg_id" .= mid])
             pure (if code == 200 then RAcked else RErr (show code), st)
+          Claim h subj ex lease -> do
+            (code, v) <- post "/v1/claim" (object (["me" .= agentId h, "subject" .= subjectText subj, "exclusive" .= ex] ++ maybe [] (\n -> ["lease_hours" .= n]) lease))
+            let out = case str "outcome" v of
+                  Just "recorded" -> Just (Recorded (holders "overlaps" v))
+                  Just "renewed" -> Just Renewed
+                  Just "refused" -> Just (Refused (holders "held_by" v))
+                  _ -> Nothing
+            pure (maybe (RErr (show code)) RClaimed (if code == 200 then out else Nothing), st)
+          ListClaims -> do
+            pages <- mapM (\subj -> post "/v1/claims" (object ["subject" .= subj, "limit" .= (500 :: Int)])) (M.keys subjects)
+            let row c = ClaimView <$> (str "holder" c >>= (`M.lookup` ours)) <*> (str "subject" c >>= (`M.lookup` subjects)) <*> bool "exclusive" c <*> bool "orphaned" c
+                rows = concatMap (arr "claims" . snd) pages
+                views = mapMaybe row rows
+            pure (if all ((== 200) . fst) pages && length views == length rows then RClaims views else RErr "claims", st)
           Tick d -> do
             (code, _) <- post "/v1/test/clock" (object ["advance_seconds" .= d])
             pure (if code == 200 then RTicked else RErr (show code), st)
-          _ -> pure (RUnsupported, st)
         pure (st', (op, r) : acc)
   (_, acc) <- foldM stepLive (LiveSt M.empty M.empty M.empty 0 M.empty, []) ops
   pure (reverse acc)
@@ -140,6 +157,11 @@ field _ _ = Nothing
 str :: T.Text -> Value -> Maybe T.Text
 str k v = case field k v of
   Just (String s) -> Just s
+  _ -> Nothing
+
+bool :: T.Text -> Value -> Maybe Bool
+bool k v = case field k v of
+  Just (Bool b) -> Just b
   _ -> Nothing
 
 int :: T.Text -> Value -> Maybe Integer
