@@ -80,7 +80,7 @@ $ tools/call ack {msg_id: 01JDEM0000000000000000000B}
 $ POST $BROKER_A/mcp initialize
 {"server":"agent-switchboard","protocol":"2025-06-18"}
 $ tools/list
-["register","end","peers","send","inbox","ack"]
+["register","end","peers","send","inbox","ack","heartbeat","thread","claim","release","handoff","claims"]
 $ tools/call register {harness: pi, host: host-b, ...}
 {"agent_id":"pi:host-b:50001:sess-carol","lease_seconds":900,"end_token":"<redacted>"}
 # Over MCP the end token enters the caller's context; a real adapter keeps and strips it.
@@ -125,22 +125,44 @@ $ ls $SWB_STATE_DIR/sessions/   # alice: the hook spent and deleted the token
 $ swb peers --all
 [{"agent_id":"claude:host-a:40001:sess-alice","state":"ended"},{"agent_id":"claude:host-b:50002:sess-dave","state":"live"},{"agent_id":"codex:host-a:40002:sess-bob","state":"live"},{"agent_id":"pi:host-b:50001:sess-carol","state":"live"}]
 
-## 12. Claims and handoff: pending P2 (ADR-0001, SWB-R16, SWB-R60)
+## 12. Claims and handoff (ADR-0001, SWB-R16, SWB-R60, SWB-R61)
 
-# [pending P2] claim:   carol claims TIN-4655 (changelog). Claims are advisory: a
-#                       non-exclusive claim is always recorded and returns overlaps[]
-#                       naming other holders, an exclusive holder included.
-# [pending P2] exclusive: an exclusive request is refused, with held_by listing the
-#                       holders, while another session holds any active claim on the
-#                       subject; nothing is recorded. The holder's repeat request renews.
-# [pending P2] handoff: carol hands her live claim to dave; the broker records an
-#                       "offered" receipt.
-# [pending P2] accept:  dave's claim accepts the receipt and carol's claim becomes
-#                       handed_off.
-# [pending P2] release: a holder may instead release a claim; ending a session
-#                       releases its claims at once.
-# None of these tools is on main yet; tools/list above has six tools and no claim.
-# TIN-6690 adds them and replaces these stubs with real claim steps.
+# Claims are advisory. Every agent below uses the CLI with its own SWB_AGENT_ID.
+$ swb claim TIN-4655 --note changelog   # carol
+{"outcome":"recorded","subject":"TIN-4655","holder":"pi:host-b:50001:sess-carol","exclusive":false,"claim_id":"<ulid-2>","overlaps":[]}
+# A non-exclusive claim is always recorded; overlaps[] names the other holders:
+$ swb claim TIN-4655   # bob
+{"outcome":"recorded","subject":"TIN-4655","holder":"codex:host-a:40002:sess-bob","exclusive":false,"claim_id":"<ulid-3>","overlaps":["pi:host-b:50001:sess-carol"]}
+# An exclusive request is refused while another session holds any active claim on
+# the subject: held_by lists the holders, nothing is recorded, and the CLI exits 4.
+$ swb claim TIN-4655 --exclusive   # dave
+{"outcome":"refused","subject":"TIN-4655","exclusive":true,"held_by":["codex:host-a:40002:sess-bob","pi:host-b:50001:sess-carol"]}
+[exit 4]
+$ swb release $BOB_CLAIM   # bob
+{"subject":"TIN-4655","holder":"codex:host-a:40002:sess-bob","state":"released","released":true}
+# carol offers her claim to dave; the broker records an "offered" receipt:
+$ swb handoff $CAROL_CLAIM claude:host-b:50002:sess-dave --note 'changelog is yours'   # carol
+{"handoff_id":"<ulid-4>","subject":"TIN-4655","from":"pi:host-b:50001:sess-carol","to":"claude:host-b:50002:sess-dave","state":"offered"}
+# dave's claim accepts it; carol's claim becomes handed_off:
+$ swb claim --handoff $HANDOFF_ID   # dave
+{"outcome":"recorded","subject":"TIN-4655","holder":"claude:host-b:50002:sess-dave","exclusive":false,"claim_id":"<ulid-5>","overlaps":[],"handoff_from":"<ulid-2>"}
+# With no other holder left, dave's exclusive request makes his own claim exclusive
+# (one claim per holder and subject, SWB-R61); bob's exclusive request is refused:
+$ swb claim TIN-4655 --exclusive   # dave
+{"outcome":"recorded","subject":"TIN-4655","holder":"claude:host-b:50002:sess-dave","exclusive":true,"claim_id":"<ulid-5>","overlaps":[]}
+$ swb claim TIN-4655 --exclusive   # bob
+{"outcome":"refused","subject":"TIN-4655","exclusive":true,"held_by":["claude:host-b:50002:sess-dave"]}
+[exit 4]
+$ swb claims --subject TIN-4655 --all
+{"holder":"claude:host-b:50002:sess-dave","exclusive":true,"state":"active"}
+{"holder":"codex:host-a:40002:sess-bob","exclusive":false,"state":"released","end_reason":"released"}
+{"holder":"pi:host-b:50001:sess-carol","exclusive":false,"state":"handed_off","end_reason":"handoff"}
+# Ending a session releases its claims at once (dave's SessionEnd hook):
+$ echo '{"session_id":"sess-dave"}' | SWB_HOST=host-b swb hook claude SessionEnd
+$ swb claims --subject TIN-4655 --all
+{"holder":"claude:host-b:50002:sess-dave","exclusive":true,"state":"released","end_reason":"session_ended"}
+{"holder":"codex:host-a:40002:sess-bob","exclusive":false,"state":"released","end_reason":"released"}
+{"holder":"pi:host-b:50001:sess-carol","exclusive":false,"state":"handed_off","end_reason":"handoff"}
 # The per-host push adapter is P2 as well:
 $ swb agentd
 swb agentd: not implemented yet (planned for P2)
