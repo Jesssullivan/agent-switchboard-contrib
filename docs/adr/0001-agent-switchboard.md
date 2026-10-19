@@ -253,13 +253,13 @@ registered once on the tailnet so that new harness instances spawn nothing.
 - **Failure behaviour (SWB-R10):** hooks time out after 2 s and always exit 0.
   The broker being down never blocks a harness.
 
-### MCP tools (11)
+### MCP tools (12 on `main`)
 
 - The registry key is `agents` and the Junie alias is `ag`. The longest
   composed name, `mcp_mcp-mux_ag__heartbeat`, is 25 characters.
-- The tools are `register`, `heartbeat`, `peers`, `send`, `inbox` (long-poll
-  up to 25 s), `ack`, `thread`, `claim` (with optional `exclusive`),
-  `release`, `handoff` and `claims`.
+- The tools are `register`, `end` (v0.3.0, R-C944), `heartbeat`, `peers`,
+  `send`, `inbox` (long-poll up to 25 s), `ack`, `thread`, `claim` (with
+  optional `exclusive`), `release`, `handoff` and `claims`.
 - None of them acts on a process, a tmux pane or another session's claim
   (R-N11).
 

@@ -56,10 +56,11 @@ named; **gap** = not true yet. The current release is v0.2.2.
    (R-C275). `swb inbox` returns one message per call.
 7. **Coordinate.** Agents claim, release and hand off work. *Accept:* the
    ADR-0001 claim/handoff tools exist and the QuickCheck claim properties
-   test Rust, not only the Haskell model. **Gap:** 6 of 11 tools are on
-   `main` (register, end, peers, send, inbox, ack; v0.2.2 ships 5, without
-   `end`). Claim, release and handoff are P2; R-C950 settled the open
-   SWB-R16 claim cases. The public launch waits for them (R-C945).
+   test Rust, not only the Haskell model. **Holds on `main`, unreleased**
+   (TIN-6690): all 12 tools, including claim, release, handoff and claims,
+   with the R-C950 (SWB-R60) and SWB-R61 claim rules, and the live
+   QuickCheck adapter runs claims against a broker. v0.2.2 ships 5 tools.
+   The public launch waits for a release (R-C945).
 8. **Diagnose.** The operator learns why a host is not enrolled. *Accept:*
    `swb doctor` prints resolved settings and broker reachability and exits
    nonzero on failure; hooks stay exit-0 (SWB-R10). **Holds:** `swb doctor
