@@ -2,7 +2,7 @@ cabal-version: 2.4
 name:          swb-spec
 version:       0.1.0
 synopsis:      Executable model and QuickCheck properties for agent-switchboard (R-C229)
-license:       NONE
+license:       MIT OR Apache-2.0
 build-type:    Simple
 
 common shared

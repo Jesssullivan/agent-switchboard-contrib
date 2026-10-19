@@ -34,7 +34,10 @@
         };
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (pkgsFor system));
       # R-C239: lab consumes `packages.<system>.swb` instead of building swb
-      # with its own (older) nixpkgs rustc.
+      # with its own (older) nixpkgs rustc. `packages.default` is the same
+      # derivation, so `nix run github:xoxd-ai/agent-switchboard` works
+      # (R-C946). Only the systems the project builds and runs are listed;
+      # another system needs a validated build before it is added.
       packageSystems = [
         "x86_64-linux"
         "aarch64-darwin"
@@ -126,7 +129,10 @@
               export SWB_SPEC_CONSTANTS=${./spec/dhall/generated/broker-constants.json}
             '';
             description = "Executable model and QuickCheck properties for agent-switchboard (R-C229)";
-            license = "unknown";
+            license = [
+              nixpkgs.lib.licenses.mit
+              nixpkgs.lib.licenses.asl20
+            ];
             mainProgram = "swb-spec";
           }
         ) { };
@@ -276,6 +282,11 @@
             doCheck = false;
             meta = {
               description = "agent-switchboard broker, agent daemon and hook client";
+              homepage = "https://github.com/xoxd-ai/agent-switchboard";
+              license = [
+                nixpkgs.lib.licenses.mit
+                nixpkgs.lib.licenses.asl20
+              ];
               mainProgram = "swb";
             };
           };

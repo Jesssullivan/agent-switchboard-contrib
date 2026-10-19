@@ -13,6 +13,7 @@ version = "0.3.0"
 edition = "2024"
 rust-version = "1.97.1"
 repository = "https://github.com/xoxd-ai/agent-switchboard"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]

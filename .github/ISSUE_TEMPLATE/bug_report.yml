@@ -1,0 +1,52 @@
+name: Bug report
+description: Something in swb does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here; see SECURITY.md.
+        Never paste secrets, tokens or message bodies that contain them.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `swb version`, or the commit you built.
+      placeholder: swb 0.2.2 envelope v3
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed swb
+      options:
+        - nix run / nix profile
+        - cargo build from source
+        - Bazel (just build)
+        - OCI image (ghcr.io)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: harness
+    attributes:
+      label: Harness and platform
+      description: Which agent harness (Claude Code, Codex, Kimi, Pi, Junie, OpenCode, none) and OS/architecture.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Include the exact command, its output and exit code. `swb doctor` output helps.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Ideally starting from the README quickstart.

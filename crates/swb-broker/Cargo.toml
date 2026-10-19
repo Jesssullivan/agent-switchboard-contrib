@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
 
 # R-C262: test-only time control for the spec live adapter. No production

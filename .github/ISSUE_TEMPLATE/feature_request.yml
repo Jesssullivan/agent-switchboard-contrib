@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a change to swb's behaviour, tools or CLI.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Broker behaviour is governed by the Rulings tables in
+        docs/adr/0001-agent-switchboard.md and docs/adr/0002-lgtm-plane.md.
+        If your proposal changes a ruling, say which one.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The change you suggest, including any new tool, route, verb or setting.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: input
+    id: rulings
+    attributes:
+      label: Related rulings or docs
+      placeholder: e.g. SWB-R16, docs/REFERENCE.md

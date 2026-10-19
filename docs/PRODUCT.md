@@ -1,11 +1,14 @@
 # agent-switchboard product brief
 
 Authority: R-C265 (TIN-4655, operator direction 2026-10-04); refreshed
-against v0.1.0 (SWB-R55) under R-C318. This is the one page that says who
-`swb` serves, what works today, what blocks production, and which docs
-survive. Decisions and rulings stay in the ADRs; rollout gates stay in
-[operations/PRODUCTIONIZATION.md](operations/PRODUCTIONIZATION.md); how to
-build, run and configure `swb` is the [README](../README.md).
+against v0.1.0 (SWB-R55) under R-C318 and against v0.2.2 (SWB-R59) and
+`main` (v0.3.0, unreleased) under R-C946 (TIN-5770 comment `23fdf965`,
+2026-10-19). This is the one page that says who `swb` serves, what works
+today, what is still missing, and which docs survive. Decisions and rulings
+stay in the ADRs; rollout gates stay in
+[operations/PRODUCTIONIZATION.md](operations/PRODUCTIONIZATION.md); install
+and quickstart are the [README](../README.md), settings and verbs are
+[REFERENCE.md](REFERENCE.md).
 
 ## Users
 
@@ -18,19 +21,21 @@ build, run and configure `swb` is the [README](../README.md).
 
 ## User stories and acceptance
 
-Status: **holds** = true in v0.1.0; **gap** = not true yet.
+Status: **holds** = true on `main` (v0.3.0, unreleased) unless a release is
+named; **gap** = not true yet. The current release is v0.2.2.
 
 1. **Run locally.** A contributor runs a loopback broker from the README.
    *Accept:* the README quickstart reaches send/inbox/ack between two ids in
-   under 5 minutes on a warm host. **Holds:** README → "Run locally" uses
-   only `swb` verbs.
+   under 5 minutes on a warm host. **Holds:** README → "Quickstart" uses
+   only `swb` verbs, with the binary from `nix run`, `nix profile install`
+   or `cargo build`.
 2. **Register.** A harness session registers on SessionStart without agent
    action. *Accept:* `swb hook <harness> SessionStart` registers and the
    session appears in `peers`. **Holds** for the binary. Lab's launchers
    export `SWB_HOST`, `SWB_SESSION_PID`, `SWB_PROC_START` and
    `SWB_BROKER_URL` from their own pid when `tinyland.switchboard.enable` is
-   set (R-C273). **Gap** in delivery: that switch is false on every host, and
-   there is no live broker for it to point at.
+   set (R-C273). Enrollment of each host is lab's delivery, not this
+   repo's.
 3. **Discover.** An agent lists live peers. *Accept:* `peers` returns live
    sessions by default (`all` adds idle, gone and ended), bounded, without
    credentials. **Holds in v0.3.0** (R-C944): `peers` is paginated (default
@@ -51,8 +56,10 @@ Status: **holds** = true in v0.1.0; **gap** = not true yet.
    (R-C275). `swb inbox` returns one message per call.
 7. **Coordinate.** Agents claim, release and hand off work. *Accept:* the
    ADR-0001 claim/handoff tools exist and the QuickCheck claim properties
-   test Rust, not only the Haskell model. **Gap:** 5 of 11 tools ship
-   (register, peers, send, inbox, ack).
+   test Rust, not only the Haskell model. **Gap:** 6 of 11 tools are on
+   `main` (register, end, peers, send, inbox, ack; v0.2.2 ships 5, without
+   `end`). Claim, release and handoff are P2; R-C950 settled the open
+   SWB-R16 claim cases. The public launch waits for them (R-C945).
 8. **Diagnose.** The operator learns why a host is not enrolled. *Accept:*
    `swb doctor` prints resolved settings and broker reachability and exits
    nonzero on failure; hooks stay exit-0 (SWB-R10). **Holds:** `swb doctor
@@ -60,14 +67,15 @@ Status: **holds** = true in v0.1.0; **gap** = not true yet.
    and exits 3 on any failure. A hook itself still logs nothing.
 9. **Deploy.** The blahaj owner runs the approved image. *Accept:* one
    documented settings table, `/healthz`, P1b exits met. **Holds** for
-   `/healthz` from v0.3.0 (R-C944), on both listeners. **Gap:** v0.1.0 is
-   published by digest (`sha256:c9170c71…`, SWB-R55, pushed by hand under
-   R-C312) and the README carries the settings table, but no broker is
-   deployed and 0 of the P1b exits are met. The
-   staged blahaj source (#1793) still pins the never-published SWB-R53
-   digest.
+   `/healthz` from v0.3.0 (R-C944), on both listeners. v0.2.2 is
+   published by digest (`sha256:4ebaf180…`, SWB-R59, through the release
+   workflow) and runs in production in the home estate;
+   [REFERENCE.md](REFERENCE.md) carries the settings table. **Gap:**
+   v0.3.0 is not released, and the P1b closeout receipts (persistence
+   across a pod restart, cross-host round trip, harness canaries; R-C949)
+   are still being collected.
 
-## Install story (measured on sting, 2026-10-04, main `08de158`)
+## Install story (measured on sting, 2026-10-04, main `08de158`; the Bazel path)
 
 | Step | Time |
 | --- | --- |
@@ -78,7 +86,7 @@ Status: **holds** = true in v0.1.0; **gap** = not true yet.
 | `swb hook claude SessionStart` (register) | 14 ms |
 | send, inbox, reply, ack, notice | < 1 s total |
 
-The recipe and the settings table are in the README. Without its readiness
+The recipe is the README quickstart. Without its readiness
 wait the script registers nothing: a hook that fires before the listener is
 up exits 0 silently (re-run on sting 2026-10-04: `/v1/peers` got curl exit
 7, both hooks exited 0).
@@ -89,16 +97,18 @@ self-bounded). `swb --help` prints usage on stdout and exits 0 from v0.3.0
 
 ## AX/UX friction, ranked
 
-1. **Hooks are inert by default.** The lab launcher identity (R-C273) is off
-   on every host, and lab's hook wrapper discards errors, so an unwired hook
-   and an empty mailbox look the same. Run `swb doctor` to tell them apart.
+1. **Hooks are silent on failure.** A hook exits 0 and prints nothing when
+   a setting is missing (SWB-R10), and lab's hook wrapper discards errors,
+   so an unwired hook and an empty mailbox look the same. Run `swb doctor`
+   to tell them apart.
 2. **Notice was not actionable** before v0.2.0 (wrong command name, no agent
    id); v0.2.0 fixes it.
 3. **Identity is self-asserted.** v0.3.0 (R-C944) bounds `peers` and stops
    it leaking `proc_start`, and `end` needs the end token, so a caller can
    no longer end a session without registering it. It is not
    takeover-proof: anyone who can register can re-register any agent id,
-   get a fresh token and end that session. See story 3.
+   get a fresh token and end that session. See story 3 and
+   [SECURITY.md](../SECURITY.md).
 4. ~~MCP schemas carry no field descriptions or patterns~~: v0.3.0 describes
    every field and adds patterns and bounds (R-C944).
 5. **Broker errors are terse:** `invalid agent id`, `unknown envelope field`
@@ -121,17 +131,23 @@ self-bounded). `swb --help` prints usage on stdout and exits 0 from v0.3.0
 
 | Doc | Holds |
 | --- | --- |
-| `README.md` | What, status, develop, run locally, settings, CLI and routes |
+| `README.md` | What it is, status, install, quickstart, license |
+| `docs/REFERENCE.md` | Settings, routes, MCP tools, CLI verbs, exit codes, channel |
+| `docs/releases/v0.3.0-migration.md` | v0.3.0 wire and CLI changes, upgrade order |
+| `integrations/` | Harness configuration: Claude Code plugin, Codex and Pi snippets |
+| `CHANGELOG.md` | Release history (Keep a Changelog) |
+| `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md` | Contribution flow (DCO, fork-first), security posture and reporting, conduct |
 | `docs/PRODUCT.md` | Users, stories, install timings, friction, open decisions |
 | `AGENTS.md` | Read order, source of truth, build placement, fork convention, invariant summary |
 | ADR-0001, ADR-0002 | Decisions and Rulings tables; superseded wording lives in signed history (R-C275) |
+| `docs/operations/HOME_ESTATE.md` | How the home estate builds, releases and runs `swb` |
 | `docs/operations/PRODUCTIONIZATION.md` | Release lock, release workflow, rollout gates |
 | `docs/operations/SLO.md` | SLIs, no targets (R-C263) |
 | `spec/README.md` | Formal spec |
 | `docs/agent-notes/` | Live-gate notes only; superseded notes retire under R35 |
 
-A separate `CONTRIBUTING.md` was proposed to absorb the fork convention now
-in AGENTS.md and ADR-0001; it does not exist yet.
+`CONTRIBUTING.md` now carries the contributor-facing fork convention;
+AGENTS.md and ADR-0001 stay the agent-facing and normative records.
 
 ## Decided since the first brief
 
@@ -142,6 +158,12 @@ in AGENTS.md and ADR-0001; it does not exist yet.
 - CLI verbs `send`, `ack`, `peers`, `doctor`: shipped in v0.1.0 (R-C275).
 - Release ID for the clock seam: SWB-R55; SWB-R54 stays state custody
   (R-C274, R-C304).
+- License: MIT OR Apache-2.0, DCO sign-off, no CLA (R-C942).
+- Landing: local validation on sting, then an admin merge (R-C943).
+- v0.3.0 security bundle: per-session end token, no `proc_start` in
+  `peers`, lease refresh and inbox move to POST, `peers` live-only and
+  deduplicated (R-C944).
+- Launch posture: no public launch until P2 parity (R-C945).
 
 ## Open decisions
 
