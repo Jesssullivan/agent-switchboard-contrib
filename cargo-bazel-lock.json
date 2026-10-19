@@ -1,5 +1,5 @@
 {
-  "checksum": "c7a0807f47033d099716465fe755ac8570cb19f206f0676206901ce6d90a9c6c",
+  "checksum": "20182e35106bb8005faea66a0f3abcefebcd38bd661824efe59388252291f82d",
   "crates": {
     "android_system_properties 0.1.6": {
       "name": "android_system_properties",
@@ -6342,9 +6342,9 @@
       ],
       "license_file": "LICENSE"
     },
-    "swb 0.2.2": {
+    "swb 0.3.0": {
       "name": "swb",
-      "version": "0.2.2",
+      "version": "0.3.0",
       "package_url": "https://github.com/xoxd-ai/agent-switchboard",
       "repository": null,
       "targets": [],
@@ -6367,15 +6367,15 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.2"
+        "version": "0.3.0"
       },
       "license": null,
       "license_ids": [],
       "license_file": null
     },
-    "swb-agentd 0.2.2": {
+    "swb-agentd 0.3.0": {
       "name": "swb-agentd",
-      "version": "0.2.2",
+      "version": "0.3.0",
       "package_url": "https://github.com/xoxd-ai/agent-switchboard",
       "repository": null,
       "targets": [
@@ -6398,15 +6398,15 @@
           "**"
         ],
         "edition": "2024",
-        "version": "0.2.2"
+        "version": "0.3.0"
       },
       "license": null,
       "license_ids": [],
       "license_file": null
     },
-    "swb-broker 0.2.2": {
+    "swb-broker 0.3.0": {
       "name": "swb-broker",
-      "version": "0.2.2",
+      "version": "0.3.0",
       "package_url": "https://github.com/xoxd-ai/agent-switchboard",
       "repository": null,
       "targets": [
@@ -6463,15 +6463,15 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.2"
+        "version": "0.3.0"
       },
       "license": null,
       "license_ids": [],
       "license_file": null
     },
-    "swb-proto 0.2.2": {
+    "swb-proto 0.3.0": {
       "name": "swb-proto",
-      "version": "0.2.2",
+      "version": "0.3.0",
       "package_url": "https://github.com/xoxd-ai/agent-switchboard",
       "repository": null,
       "targets": [
@@ -6512,15 +6512,15 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.2"
+        "version": "0.3.0"
       },
       "license": null,
       "license_ids": [],
       "license_file": null
     },
-    "swb-store 0.2.2": {
+    "swb-store 0.3.0": {
       "name": "swb-store",
-      "version": "0.2.2",
+      "version": "0.3.0",
       "package_url": "https://github.com/xoxd-ai/agent-switchboard",
       "repository": null,
       "targets": [
@@ -6568,7 +6568,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.2.2"
+        "version": "0.3.0"
       },
       "license": null,
       "license_ids": [],
@@ -8900,11 +8900,11 @@
   },
   "binary_crates": [],
   "workspace_members": {
-    "swb 0.2.2": "crates/swb",
-    "swb-agentd 0.2.2": "crates/swb-agentd",
-    "swb-broker 0.2.2": "crates/swb-broker",
-    "swb-proto 0.2.2": "crates/swb-proto",
-    "swb-store 0.2.2": "crates/swb-store"
+    "swb 0.3.0": "crates/swb",
+    "swb-agentd 0.3.0": "crates/swb-agentd",
+    "swb-broker 0.3.0": "crates/swb-broker",
+    "swb-proto 0.3.0": "crates/swb-proto",
+    "swb-store 0.3.0": "crates/swb-store"
   },
   "conditions": {
     "aarch64-apple-darwin": [
