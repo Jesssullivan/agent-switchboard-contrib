@@ -343,9 +343,11 @@ as_dave() {
     SWB_PROC_START=2026-10-19T09:00:03Z SWB_STATE_DIR="$demo/state-dave" SWB_AGENT_ID="$DAVE" "$@"
 }
 claim_view() {
-  jq -c '{outcome, subject, holder, exclusive, claim_id}
-    + (if .overlaps then {overlaps: [.overlaps[].holder]} else {} end)
-    + (if .held_by then {held_by: [.held_by[].holder]} else {} end)
+  # Holder lists are sorted here: claims made in the same second have no
+  # stable order between runs.
+  jq -c '({outcome, subject, holder, exclusive, claim_id} | with_entries(select(.value != null)))
+    + (if .overlaps then {overlaps: ([.overlaps[].holder] | sort)} else {} end)
+    + (if .held_by then {held_by: ([.held_by[].holder] | sort)} else {} end)
     + (if .handoff_from then {handoff_from} else {} end)'
 }
 carol_claim() { as_carol env SWB_AGENT_ID="$CAROL" swb claim TIN-4655 --note changelog |

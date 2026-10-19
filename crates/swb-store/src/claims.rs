@@ -1069,7 +1069,8 @@ mod tests {
         assert_eq!(accepted["outcome"], "recorded");
         assert_eq!(accepted["exclusive"], false);
         assert_eq!(holders(&accepted["overlaps"]), [C]);
-        assert_eq!(holders(&json!(listed(&s, "TIN-1"))), [B, C]);
+        // holders() sorts: "codex:..." before "pi:...".
+        assert_eq!(holders(&json!(listed(&s, "TIN-1"))), [C, B]);
     }
 
     #[test]
