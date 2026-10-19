@@ -2,11 +2,17 @@
 //! SWB-R33, SWB-R46). Audit output omits bodies until SWB-R33/34 proof.
 //! Every route on the main listener passes the Host/Origin guard
 //! ([`RequestGuard`], ADR-0001 → Exposure and auth).
+//!
+//! v0.3.0 (R-C944): every state-changing call is a POST with a JSON body
+//! (`GET /v1/inbox` and `GET /v1/peers?me=` answer 405), `end` needs the
+//! end token `register` returned, errors are typed JSON
+//! (`{"error": <message>, "code": <code>}`), and `/healthz` answers on both
+//! listeners.
 
 use axum::{
     Json, Router,
-    extract::{Query, Request, State},
-    http::{HeaderMap, StatusCode, Uri, header, uri::Authority as UriAuthority},
+    extract::{Query, Request, State, rejection::JsonRejection},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header, uri::Authority as UriAuthority},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -24,29 +30,61 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use std::{collections::HashMap, future::Future, io, sync::Arc, time::Duration};
-use swb_proto::Authority;
-use swb_store::Store;
+use swb_proto::{Authority, VERSION};
+use swb_store::{ErrorKind, PeersQuery, Store, StoreError};
 
 pub const HOOK_TIMEOUT_MS: u64 = 2_000;
+/// Production retention interval. The store no longer prunes inside `send`
+/// or the 250 ms inbox long-poll (R-C944).
+pub const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 pub fn stamped_authority() -> Authority {
     Authority::Peer
 }
 
-fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, String> {
+/// An optional field that must have one JSON type when present.
+fn opt<'a, T>(
+    args: &'a Value,
+    key: &str,
+    read: impl Fn(&'a Value) -> Option<T>,
+) -> Result<Option<T>, StoreError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => read(value)
+            .map(Some)
+            .ok_or_else(|| format!("invalid {key}").into()),
+    }
+}
+
+fn peers_op(store: &Store, args: &Value) -> Result<Value, StoreError> {
+    let limit = opt(args, "limit", Value::as_u64)?;
+    store.peers(&PeersQuery {
+        me: opt(args, "me", Value::as_str)?,
+        all: opt(args, "all", Value::as_bool)?.unwrap_or(false),
+        host: opt(args, "host", Value::as_str)?,
+        limit: limit.map(|n| n.min(u64::from(u32::MAX)) as u32),
+        cursor: opt(args, "cursor", Value::as_str)?,
+        proc_start: opt(args, "proc_start", Value::as_str)?,
+    })
+}
+
+fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError> {
     let mut created = true;
     let result = match name {
         "register" => store.register(args),
-        "end" => store.end(
-            args.get("me").and_then(Value::as_str).ok_or("missing me")?,
-            args.get("proc_start")
-                .and_then(Value::as_str)
-                .ok_or("missing proc_start")?,
-        ),
-        "peers" => store.peers(
-            args.get("me")
-                .map(|v| v.as_str().ok_or("invalid me"))
-                .transpose()?,
-        ),
+        "end" => {
+            if args.get("end_token").is_none() && args.get("proc_start").is_some() {
+                return Err(
+                    "end needs end_token; proc_start is no longer accepted (v0.3.0)".into(),
+                );
+            }
+            store.end(
+                args.get("me").and_then(Value::as_str).ok_or("missing me")?,
+                args.get("end_token")
+                    .and_then(Value::as_str)
+                    .ok_or("missing end_token")?,
+            )
+        }
+        "peers" => peers_op(store, args),
         "send" => {
             let outcome = store.send(args)?;
             created = outcome.created;
@@ -54,14 +92,10 @@ fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, String> {
         }
         "inbox" => {
             let me = args.get("me").and_then(Value::as_str).ok_or("missing me")?;
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
+            let limit = opt(args, "limit", Value::as_u64)?
                 .unwrap_or(20)
-                .min(100) as u32;
-            let wait = args
-                .get("wait_seconds")
-                .and_then(Value::as_u64)
+                .clamp(1, 100) as u32;
+            let wait = opt(args, "wait_seconds", Value::as_u64)?
                 .unwrap_or(0)
                 .min(25);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
@@ -98,6 +132,8 @@ fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, String> {
     Ok(result)
 }
 
+/// The audit line. It names fields explicitly, so neither the message body
+/// nor a register's `end_token` can reach it.
 fn audit_record(name: &str, args: &Value, result: &Value, body_hmac: Option<&str>) -> Value {
     let body_size = result
         .get("body")
@@ -112,15 +148,66 @@ fn audit_record(name: &str, args: &Value, result: &Value, body_hmac: Option<&str
     })
 }
 
+/// The typed error body every REST and MCP failure carries (R-C944).
+pub fn error_body(code: &str, message: &str) -> Value {
+    json!({"error": message, "code": code})
+}
+
+fn status_of(kind: ErrorKind) -> StatusCode {
+    match kind {
+        ErrorKind::Invalid => StatusCode::BAD_REQUEST,
+        ErrorKind::Unregistered | ErrorKind::Unavailable => StatusCode::NOT_FOUND,
+        ErrorKind::Conflict => StatusCode::CONFLICT,
+        ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+const AGENT_ID: &str = "Agent id <harness>:<host>:<pid>:<session_id>; harness is one of claude, kimi, codex, junie, opencode, pi; the other parts use [A-Za-z0-9._-]; at most 512 bytes";
+const ULID_DESC: &str = "Canonical 26-character Crockford base32 ULID";
+
 fn tools() -> Vec<Tool> {
     [
-        ("register", "Register a self-asserted agent session", json!({"type":"object","required":["harness","host","pid","session_id","proc_start"],"properties":{"harness":{"type":"string"},"host":{"type":"string"},"pid":{"type":"integer"},"session_id":{"type":"string"},"proc_start":{"type":"string"}}})),
-        ("peers", "List session leases; optional registered me renews only that caller's lease; omission is passive discovery", json!({"type":"object","properties":{"me":{"type":"string"}}})),
-        ("send", "Send a peer-authority message", json!({"type":"object","required":["from","to","ticket","body"],"properties":{"from":{"type":"string"},"to":{"type":"string"},"ticket":{"type":"string"},"body":{"type":"string"},"msg_id":{"type":"string"},"thread_id":{"type":"string"},"in_reply_to":{"type":"string"},"operator_directed":{"type":"boolean"},"ruling":{"type":"string","minLength":1,"maxLength":512},"reply_expires":{"type":"string","format":"date-time"},"reply_format":{"type":"string","maxLength":512},"artifacts":{"type":"array","maxItems":20,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":2048}},"ttl_hours":{"type":"integer"}}})),
-        ("inbox", "Fetch unacked messages", json!({"type":"object","required":["me"],"properties":{"me":{"type":"string"},"limit":{"type":"integer"},"wait_seconds":{"type":"integer"}}})),
-        ("ack", "Acknowledge a received message", json!({"type":"object","required":["me","msg_id"],"properties":{"me":{"type":"string"},"msg_id":{"type":"string"}}})),
+        ("register", "Register (or re-register) a self-asserted agent session. Returns agent_id, lease_seconds and end_token. Every register mints a new end_token and invalidates earlier ones. Over MCP the token is part of this result and so enters the caller's context; an adapter that ends sessions itself should keep it and strip it before the model sees it. Never repeat it.", json!({"type":"object","required":["harness","host","pid","session_id","proc_start"],"properties":{
+            "harness":{"type":"string","enum":["claude","kimi","codex","junie","opencode","pi"],"description":"The harness kind"},
+            "host":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"Short host name"},
+            "pid":{"type":"integer","minimum":1,"description":"The harness launcher's process id"},
+            "session_id":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"The harness's own session id"},
+            "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Opaque process start stamp. peers never returns it; a caller may filter peers on its own."}}})),
+        ("end", "End this session. Needs the end_token its latest register returned; any other token answers state unknown and ends nothing.", json!({"type":"object","required":["me","end_token"],"properties":{
+            "me":{"type":"string","description":AGENT_ID},
+            "end_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The end_token register returned"}}})),
+        ("peers", "List sessions: live only by default, one row per harness, host and session id (latest registration wins), paginated. A registered me also renews that caller's own lease; omitting me is passive discovery.", json!({"type":"object","properties":{
+            "me":{"type":"string","description":format!("{AGENT_ID}. Optional; renews only this caller's lease")},
+            "all":{"type":"boolean","description":"Include idle, gone and ended sessions (default false: live only)"},
+            "host":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"Only sessions on this host"},
+            "limit":{"type":"integer","minimum":1,"maximum":200,"description":"Page size, default 50, at most 200"},
+            "cursor":{"type":"string","description":"next_cursor from the previous page"},
+            "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Only sessions whose latest registration used this proc_start (the caller's own stamp; rows never show it)"}}})),
+        ("send", "Send a peer-authority message. The broker stamps authority peer whatever the sender claims.", json!({"type":"object","required":["from","to","ticket","body"],"properties":{
+            "from":{"type":"string","description":format!("Sender. {AGENT_ID}")},
+            "to":{"type":"string","description":format!("Recipient. {AGENT_ID}")},
+            "ticket":{"type":"string","pattern":"^(TIN-[0-9]+|none)$","maxLength":64,"description":"TIN-<digits> or none"},
+            "body":{"type":"string","maxLength":16384,"description":"Message text, at most 16 KiB; control characters are removed"},
+            "msg_id":{"type":"string","description":format!("{ULID_DESC}. Optional idempotency key; a retry with the same sender and body returns the stored envelope")},
+            "thread_id":{"type":"string","description":format!("{ULID_DESC}. Defaults to msg_id")},
+            "in_reply_to":{"type":"string","description":format!("{ULID_DESC} of the message answered")},
+            "operator_directed":{"type":"boolean","description":"The sender's claim that the operator directed this; needs ruling"},
+            "ruling":{"type":"string","minLength":1,"maxLength":512,"description":"Ruling the sender cites"},
+            "reply_expires":{"type":"string","format":"date-time","description":"RFC 3339 time after which a reply is no longer useful"},
+            "reply_format":{"type":"string","maxLength":512,"description":"Requested reply shape"},
+            "artifacts":{"type":"array","maxItems":20,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":2048},"description":"Up to 20 artifact references"},
+            "ttl_hours":{"type":"integer","minimum":1,"maximum":336,"description":"Message lifetime, default 72 h, clamped to 1..336"}}})),
+        ("inbox", "Fetch this caller's unacknowledged messages, oldest first. Each fetch counts a delivery and renews the caller's lease.", json!({"type":"object","required":["me"],"properties":{
+            "me":{"type":"string","description":AGENT_ID},
+            "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Page size, default 20, at most 100"},
+            "wait_seconds":{"type":"integer","minimum":0,"maximum":25,"description":"Long-poll up to this many seconds when the mailbox is empty (default 0)"}}})),
+        ("ack", "Acknowledge a received message so it is not delivered again.", json!({"type":"object","required":["me","msg_id"],"properties":{
+            "me":{"type":"string","description":AGENT_ID},
+            "msg_id":{"type":"string","description":ULID_DESC}}})),
     ].into_iter().map(|(name,description,schema)| Tool::new(name,description,Arc::new(schema.as_object().expect("static object schema").clone()))).collect()
 }
+
+const TOOL_NAMES: [&str; 6] = ["register", "end", "peers", "send", "inbox", "ack"];
 
 #[derive(Clone)]
 struct BrokerMcp {
@@ -129,7 +216,7 @@ struct BrokerMcp {
 impl ServerHandler for BrokerMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("agent-switchboard", "0.2.2"))
+            .with_server_info(Implementation::new("agent-switchboard", VERSION))
     }
     async fn list_tools(
         &self,
@@ -147,68 +234,163 @@ impl ServerHandler for BrokerMcp {
         _: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.into_owned();
-        if !matches!(
-            name.as_str(),
-            "register" | "peers" | "send" | "inbox" | "ack"
-        ) {
+        if !TOOL_NAMES.contains(&name.as_str()) {
             return Err(McpError::invalid_params("unknown tool", None));
         }
         let args = Value::Object(request.arguments.unwrap_or_default());
         let store = Arc::clone(&self.store);
         match tokio::task::spawn_blocking(move || operation(&store, &name, &args)).await {
             Ok(Ok(value)) => Ok(CallToolResult::structured(value).into()),
-            Ok(Err(error)) => Ok(CallToolResult::error(vec![ContentBlock::text(error)]).into()),
+            Ok(Err(error)) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                error_body(error.code(), &error.message).to_string(),
+            )])
+            .into()),
             Err(error) => Err(McpError::internal_error(error.to_string(), None)),
         }
     }
 }
 
+fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    (status, Json(error_body(code, message))).into_response()
+}
+
 async fn run_operation(store: Arc<Store>, name: &'static str, args: Value) -> Response {
     match tokio::task::spawn_blocking(move || operation(&store, name, &args)).await {
         Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
-        Ok(Err(error)) => {
-            let status = if error == "msg_id conflict" {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (status, Json(json!({"error":error}))).into_response()
-        }
-        Err(_) => (
+        Ok(Err(error)) => error_response(status_of(error.kind), error.code(), &error.message),
+        Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":"broker unavailable"})),
+            "internal",
+            "broker unavailable",
+        ),
+    }
+}
+
+/// A JSON request body, or the typed error for a missing, mistyped or
+/// malformed one. A JSON body needs `Content-Type: application/json`, which
+/// a browser can only send after a CORS preflight.
+fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Response> {
+    match body {
+        Ok(Json(value @ Value::Object(_))) => Ok(value),
+        Ok(Json(_)) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            "request body must be a JSON object",
+        )),
+        Err(JsonRejection::MissingJsonContentType(_)) => Err(error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "Content-Type must be application/json",
+        )),
+        Err(_) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            "request body is not valid JSON",
+        )),
+    }
+}
+
+macro_rules! post_operation {
+    ($handler:ident, $name:literal) => {
+        async fn $handler(
+            State(store): State<Arc<Store>>,
+            body: Result<Json<Value>, JsonRejection>,
+        ) -> Response {
+            match json_body(body) {
+                Ok(args) => run_operation(store, $name, args).await,
+                Err(response) => response,
+            }
+        }
+    };
+}
+post_operation!(register, "register");
+post_operation!(end, "end");
+post_operation!(send, "send");
+post_operation!(ack, "ack");
+post_operation!(peers_post, "peers");
+post_operation!(inbox_post, "inbox");
+
+fn method_not_allowed(allow: &'static str, message: &str) -> Response {
+    let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", message);
+    response
+        .headers_mut()
+        .insert(header::ALLOW, HeaderValue::from_static(allow));
+    response
+}
+
+/// `GET /v1/peers` is passive discovery only (`all`, `host`, `limit`,
+/// `cursor`). A lease refresh (`me`) moved to `POST /v1/peers` in v0.3.0,
+/// and is refused here rather than silently ignored.
+async fn peers_get(
+    State(store): State<Arc<Store>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if query.contains_key("me") {
+        return method_not_allowed(
+            "POST",
+            "lease refresh moved to POST /v1/peers with a JSON body {\"me\": ...} in v0.3.0",
+        );
+    }
+    let mut args = serde_json::Map::new();
+    for (key, value) in &query {
+        let parsed = match key.as_str() {
+            "all" => match value.as_str() {
+                "1" | "true" => json!(true),
+                "0" | "false" => json!(false),
+                _ => return error_response(StatusCode::BAD_REQUEST, "invalid_argument", "invalid all"),
+            },
+            "limit" => match value.parse::<u64>() {
+                Ok(n) => json!(n),
+                Err(_) => {
+                    return error_response(StatusCode::BAD_REQUEST, "invalid_argument", "invalid limit");
+                }
+            },
+            "host" | "cursor" => json!(value),
+            _ => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    &format!("unknown query parameter {}", key.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect::<String>()),
+                );
+            }
+        };
+        args.insert(key.clone(), parsed);
+    }
+    run_operation(store, "peers", Value::Object(args)).await
+}
+
+async fn inbox_get() -> Response {
+    method_not_allowed(
+        "POST",
+        "GET /v1/inbox was removed in v0.3.0; POST /v1/inbox with a JSON body {\"me\": ..., \"limit\": ..., \"wait_seconds\": ...}",
+    )
+}
+
+async fn not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "not_found", "no such route")
+}
+
+async fn wrong_method() -> Response {
+    error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "method not allowed on this route",
+    )
+}
+
+/// `GET /healthz`: 200 with the version when the store answers a read, 503
+/// otherwise. No identity, no body, no write.
+async fn healthz(State(store): State<Arc<Store>>) -> Response {
+    match tokio::task::spawn_blocking(move || store.health()).await {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({"status":"ok","version":VERSION}))).into_response(),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status":"unavailable","version":VERSION})),
         )
             .into_response(),
     }
 }
-async fn register(State(store): State<Arc<Store>>, Json(args): Json<Value>) -> Response {
-    run_operation(store, "register", args).await
-}
-async fn end(State(store): State<Arc<Store>>, Json(args): Json<Value>) -> Response {
-    run_operation(store, "end", args).await
-}
-async fn send(State(store): State<Arc<Store>>, Json(args): Json<Value>) -> Response {
-    run_operation(store, "send", args).await
-}
-async fn ack(State(store): State<Arc<Store>>, Json(args): Json<Value>) -> Response {
-    run_operation(store, "ack", args).await
-}
-async fn peers(
-    State(store): State<Arc<Store>>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    let args = query
-        .get("me")
-        .map_or_else(|| json!({}), |me| json!({"me":me}));
-    run_operation(store, "peers", args).await
-}
-async fn inbox(
-    State(store): State<Arc<Store>>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    let args = json!({"me":query.get("me"),"limit":query.get("limit").and_then(|v|v.parse::<u64>().ok()),"wait_seconds":query.get("wait_seconds").and_then(|v|v.parse::<u64>().ok())});
-    run_operation(store, "inbox", args).await
-}
+
 async fn metrics(State(store): State<Arc<Store>>) -> Response {
     match tokio::task::spawn_blocking(move || store.metrics()).await {
         Ok(Ok(value)) => (
@@ -225,13 +407,14 @@ async fn metrics(State(store): State<Arc<Store>>) -> Response {
 }
 
 /// The metrics listener's router. It carries no Host/Origin guard: it serves
-/// three aggregate counters with no identity, body or write path, it is a
-/// separate listener (`SWB_METRICS_LISTEN`) that a deployment keeps off the
-/// tailnet Service, and Prometheus scrapes it by pod address, a Host no
-/// broker allowlist names.
+/// three aggregate counters and `/healthz`, with no identity, body or write
+/// path, it is a separate listener (`SWB_METRICS_LISTEN`) that a deployment
+/// keeps off the tailnet Service, and Prometheus and kubelet probes reach it
+/// by pod address, a Host no broker allowlist names.
 fn metrics_router(store: Arc<Store>) -> Router {
     Router::new()
         .route("/metrics", get(metrics))
+        .route("/healthz", get(healthz))
         .with_state(store)
 }
 
@@ -483,12 +666,15 @@ fn router_with_config(
     );
     Router::new()
         .nest_service("/mcp", service)
+        .route("/healthz", get(healthz))
         .route("/v1/register", post(register))
         .route("/v1/end", post(end))
-        .route("/v1/peers", get(peers))
+        .route("/v1/peers", post(peers_post).get(peers_get))
         .route("/v1/send", post(send))
-        .route("/v1/inbox", get(inbox))
+        .route("/v1/inbox", post(inbox_post).get(inbox_get))
         .route("/v1/ack", post(ack))
+        .method_not_allowed_fallback(wrong_method)
+        .fallback(not_found)
         .with_state(store)
         .merge(extra)
         .layer(middleware::from_fn_with_state(
@@ -501,7 +687,7 @@ pub async fn serve(store: Arc<Store>, listen: &str, metrics_listen: &str) -> io:
         store,
         listen,
         metrics_listen,
-        Duration::from_secs(3600),
+        PRUNE_INTERVAL,
         Duration::from_secs(30),
         shutdown_signal(),
     )
@@ -693,14 +879,20 @@ pub mod test_clock {
     pub const MAX_ADVANCE_SECONDS: u64 = 400 * 86_400;
 
     /// `POST /v1/test/clock {"advance_seconds": n}` moves the clock forward
-    /// by n seconds (0 reads it) and returns `{"now": <unix seconds>}`.
-    pub fn router(clock: Arc<ManualClock>) -> Router {
+    /// by n seconds (0 reads it), runs one retention prune, and returns
+    /// `{"now": <unix seconds>}`. The prune stands in for the production
+    /// interval, which runs on the wall clock (R-C944: `send` and `inbox` no
+    /// longer prune).
+    pub fn router(clock: Arc<ManualClock>, store: Arc<Store>) -> Router {
         Router::new()
             .route("/v1/test/clock", post(advance))
-            .with_state(clock)
+            .with_state((clock, store))
     }
 
-    async fn advance(State(clock): State<Arc<ManualClock>>, Json(args): Json<Value>) -> Response {
+    async fn advance(
+        State((clock, store)): State<(Arc<ManualClock>, Arc<Store>)>,
+        Json(args): Json<Value>,
+    ) -> Response {
         match args
             .get("advance_seconds")
             .and_then(Value::as_u64)
@@ -708,13 +900,20 @@ pub mod test_clock {
         {
             Some(n) => {
                 let now = clock.advance(n as u32);
-                (StatusCode::OK, Json(json!({"now":now}))).into_response()
+                match tokio::task::spawn_blocking(move || store.prune()).await {
+                    Ok(Ok(())) => (StatusCode::OK, Json(json!({"now":now}))).into_response(),
+                    _ => error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal",
+                        "retention prune failed",
+                    ),
+                }
             }
-            None => (
+            None => error_response(
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error":"invalid advance_seconds"})),
-            )
-                .into_response(),
+                "invalid_argument",
+                "invalid advance_seconds",
+            ),
         }
     }
 
@@ -739,14 +938,15 @@ pub mod test_clock {
     ) -> io::Result<()> {
         require_loopback(listen)?;
         require_loopback(metrics_listen)?;
+        let extra = router(clock, Arc::clone(&store));
         serve_until_with(
             store,
             listen,
             metrics_listen,
-            Duration::from_secs(3600),
+            PRUNE_INTERVAL,
             Duration::from_secs(30),
             shutdown_signal(),
-            router(clock),
+            extra,
         )
         .await
     }
@@ -762,7 +962,7 @@ pub mod test_clock {
         async fn clock_route_drives_store_time() {
             let clock = Arc::new(ManualClock::new(1_700_000_000));
             let store = Arc::new(Store::memory_with_clock(clock.clone()).unwrap());
-            let app = router(clock).merge(super::super::router(
+            let app = router(clock, Arc::clone(&store)).merge(super::super::router(
                 Arc::clone(&store),
                 vec!["localhost".into()],
             ));
@@ -796,6 +996,34 @@ pub mod test_clock {
         }
 
         #[tokio::test]
+        async fn clock_advance_runs_the_retention_prune() {
+            let clock = Arc::new(ManualClock::new(1_700_000_000));
+            let store = Arc::new(Store::memory_with_clock(clock.clone()).unwrap());
+            let to = "pi:sting:2:b";
+            let id = store
+                .send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"x"}))
+                .unwrap()
+                .envelope["msg_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            store.ack(to, &id).unwrap();
+            let app = router(clock, Arc::clone(&store));
+            let response = app
+                .oneshot(
+                    Request::post("/v1/test/clock")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"advance_seconds":604800}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            // The acked row is gone: a second ack is no longer "already acked".
+            assert_eq!(store.ack(to, &id).unwrap_err(), "message unavailable");
+        }
+
+        #[tokio::test]
         async fn clock_route_is_behind_the_host_guard() {
             let clock = Arc::new(ManualClock::new(1_700_000_000));
             let store = Arc::new(Store::memory_with_clock(clock.clone()).unwrap());
@@ -803,7 +1031,7 @@ pub mod test_clock {
                 Arc::clone(&store),
                 StreamableHttpServerConfig::default(),
                 RequestGuard::new(&["127.0.0.1".into()], &[]).unwrap(),
-                router(clock),
+                router(clock, Arc::clone(&store)),
             );
             let post = |host: &'static str| {
                 Request::post("/v1/test/clock")
@@ -965,7 +1193,8 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            stream.write_all(b"GET /v1/inbox?me=pi:sting:2:b&wait_seconds=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+            let body = r#"{"me":"pi:sting:2:b","wait_seconds":1}"#;
+            write!(stream, "POST /v1/inbox HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             let mut response = String::new();
             stream.read_to_string(&mut response).unwrap();
             response
@@ -1117,15 +1346,27 @@ mod tests {
         assert_eq!(store.send(&invalid).unwrap_err(), "unknown envelope field");
     }
     #[test]
-    fn lists_five_typed_tools() {
-        assert_eq!(tools().len(), 5);
-        assert!(
-            tools()
-                .iter()
-                .all(|t| t.input_schema.contains_key("properties"))
+    fn lists_six_typed_and_described_tools() {
+        assert_eq!(tools().len(), 6);
+        assert_eq!(
+            tools().iter().map(|t| t.name.to_string()).collect::<Vec<_>>(),
+            TOOL_NAMES
         );
+        for tool in tools() {
+            let props = tool.input_schema["properties"].as_object().unwrap();
+            for (key, schema) in props {
+                assert!(
+                    schema["description"].as_str().is_some_and(|d| !d.is_empty()),
+                    "{}.{key} has no description",
+                    tool.name
+                );
+            }
+        }
         let peers = tools().into_iter().find(|t| t.name == "peers").unwrap();
         assert_eq!(peers.input_schema["properties"]["me"]["type"], "string");
+        assert_eq!(peers.input_schema["properties"]["all"]["type"], "boolean");
+        let end = tools().into_iter().find(|t| t.name == "end").unwrap();
+        assert_eq!(end.input_schema["required"], json!(["me", "end_token"]));
         let send = tools().into_iter().find(|t| t.name == "send").unwrap();
         let props = &send.input_schema["properties"];
         for key in ["artifacts", "reply_expires", "reply_format"] {
@@ -1183,6 +1424,7 @@ mod tests {
         )
         .await;
         assert_eq!(first["agent_id"], from);
+        let token = first["end_token"].as_str().unwrap().to_owned();
         let second = mcp_call(
             &app,
             &session,
@@ -1204,6 +1446,13 @@ mod tests {
         assert_eq!(acked["state"], "acked");
         let empty = mcp_call(&app, &session, 9, "inbox", json!({"me":to})).await;
         assert!(empty["messages"].as_array().unwrap().is_empty());
+        let ended = mcp_call(&app, &session, 10, "end", json!({"me":from,"end_token":token})).await;
+        assert_eq!(ended["state"], "ended");
+        let live = mcp_call(&app, &session, 11, "peers", json!({})).await;
+        assert_eq!(live["peers"].as_array().unwrap().len(), 1);
+        let every = mcp_call(&app, &session, 12, "peers", json!({"all":true})).await;
+        assert_eq!(every["peers"].as_array().unwrap().len(), 2);
+        assert!(!every.to_string().contains("proc_start"));
     }
     /// Every state-bearing route on the main listener, with a request body
     /// that would mutate or read state if the guard let it through.
@@ -1216,15 +1465,15 @@ mod tests {
         (
             "POST",
             "/v1/end",
-            r#"{"me":"claude:honey:1:a","proc_start":"1"}"#,
+            r#"{"me":"claude:honey:1:a","end_token":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
         ),
-        ("GET", "/v1/peers?me=claude:honey:1:a", ""),
+        ("POST", "/v1/peers", r#"{"me":"claude:honey:1:a"}"#),
         (
             "POST",
             "/v1/send",
             r#"{"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"rebound"}"#,
         ),
-        ("GET", "/v1/inbox?me=pi:sting:2:b", ""),
+        ("POST", "/v1/inbox", r#"{"me":"pi:sting:2:b"}"#),
         (
             "POST",
             "/v1/ack",
@@ -1262,6 +1511,18 @@ mod tests {
             .to_owned()
     }
 
+    async fn json_of(response: Response) -> Value {
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn every() -> PeersQuery<'static> {
+        PeersQuery {
+            all: true,
+            ..PeersQuery::default()
+        }
+    }
+
     fn seeded_store() -> Arc<Store> {
         let store = Arc::new(Store::memory().unwrap());
         store
@@ -1274,7 +1535,7 @@ mod tests {
 
     fn state_snapshot(store: &Store) -> (usize, String) {
         (
-            store.peers(None).unwrap()["peers"]
+            store.peers(&every()).unwrap()["peers"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -1464,27 +1725,48 @@ mod tests {
     async fn unknown_paths_are_guarded_and_metrics_is_not() {
         let store = seeded_store();
         let app = router(Arc::clone(&store), vec!["localhost".into()]);
-        let refused = app
-            .clone()
-            .oneshot(guarded_request(
-                "GET",
-                "/healthz",
-                "",
-                &[("host", "attacker.example")],
-            ))
-            .await
-            .unwrap();
-        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        for path in ["/nope", "/healthz"] {
+            let refused = app
+                .clone()
+                .oneshot(guarded_request(
+                    "GET",
+                    path,
+                    "",
+                    &[("host", "attacker.example")],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{path}");
+        }
         let not_found = app
-            .oneshot(guarded_request(
-                "GET",
-                "/healthz",
-                "",
-                &[("host", "localhost")],
-            ))
+            .clone()
+            .oneshot(guarded_request("GET", "/nope", "", &[("host", "localhost")]))
             .await
             .unwrap();
         assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            json_of(not_found).await,
+            json!({"error":"no such route","code":"not_found"})
+        );
+        let health = app
+            .oneshot(guarded_request("GET", "/healthz", "", &[("host", "localhost")]))
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(
+            json_of(health).await,
+            json!({"status":"ok","version":VERSION})
+        );
+        let probe = metrics_router(Arc::clone(&store))
+            .oneshot(guarded_request(
+                "GET",
+                "/healthz",
+                "",
+                &[("host", "10.42.0.17:9090")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), StatusCode::OK);
         // The metrics listener is deliberately unguarded (see metrics_router):
         // Prometheus scrapes it by pod address, and it serves only aggregate
         // counters.
@@ -1591,11 +1873,146 @@ mod tests {
             let response = app.clone().oneshot(request).await.unwrap();
             if body == "B" {
                 assert_eq!(response.status(), StatusCode::CONFLICT);
-                let content = to_bytes(response.into_body(), 65536).await.unwrap();
-                assert_eq!(content.as_ref(), br#"{"error":"msg_id conflict"}"#);
+                assert_eq!(
+                    json_of(response).await,
+                    json!({"error":"msg_id conflict","code":"msg_id_conflict"})
+                );
             } else {
                 assert_eq!(response.status(), StatusCode::OK);
             }
         }
+    }
+
+    async fn call(app: &Router, method: &str, uri: &str, body: &str) -> Response {
+        app.clone()
+            .oneshot(guarded_request(method, uri, body, &[("host", "localhost")]))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn state_changing_gets_answer_405_and_change_nothing() {
+        let store = seeded_store();
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        store
+            .send(&json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"x"}))
+            .unwrap();
+        let before = state_snapshot(&store);
+        for uri in [
+            "/v1/inbox?me=pi:sting:2:b",
+            "/v1/inbox",
+            "/v1/peers?me=pi:sting:2:b",
+        ] {
+            let response = call(&app, "GET", uri, "").await;
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{uri}");
+            assert_eq!(response.headers()[header::ALLOW], "POST", "{uri}");
+            let body = json_of(response).await;
+            assert_eq!(body["code"], "method_not_allowed", "{uri}");
+            assert!(body["error"].as_str().unwrap().contains("POST /v1/"), "{uri}");
+        }
+        assert_eq!(state_snapshot(&store), before);
+        let inbox = store.inbox("pi:sting:2:b", 10).unwrap();
+        assert_eq!(inbox["messages"][0]["delivery_count"], 1, "a GET fetched");
+        let wrong = call(&app, "DELETE", "/v1/send", "").await;
+        assert_eq!(wrong.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(json_of(wrong).await["code"], "method_not_allowed");
+    }
+
+    #[tokio::test]
+    async fn post_peers_and_inbox_take_a_json_body() {
+        let store = seeded_store();
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let refreshed = call(&app, "POST", "/v1/peers", r#"{"me":"pi:sting:2:b","all":true}"#).await;
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        let body = json_of(refreshed).await;
+        assert_eq!(body["peers"][0]["agent_id"], "pi:sting:2:b");
+        assert_eq!(body["next_cursor"], Value::Null);
+        let passive = call(&app, "GET", "/v1/peers?all=1&host=sting&limit=5", "").await;
+        assert_eq!(passive.status(), StatusCode::OK);
+        assert_eq!(json_of(passive).await["peers"].as_array().unwrap().len(), 1);
+        for (uri, code) in [
+            ("/v1/peers?all=maybe", "invalid_argument"),
+            ("/v1/peers?limit=-1", "invalid_argument"),
+            ("/v1/peers?bogus=1", "invalid_argument"),
+            ("/v1/peers?host=a%2Fb", "invalid_argument"),
+        ] {
+            let response = call(&app, "GET", uri, "").await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(json_of(response).await["code"], code, "{uri}");
+        }
+        let inbox = call(&app, "POST", "/v1/inbox", r#"{"me":"pi:sting:2:b","limit":1}"#).await;
+        assert_eq!(inbox.status(), StatusCode::OK);
+        assert!(json_of(inbox).await["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn errors_are_typed_json() {
+        let app = router(seeded_store(), vec!["localhost".into()]);
+        let cases: [(&str, &str, StatusCode, &str); 7] = [
+            ("/v1/peers", r#"{"me":"codex:honey:3:nobody"}"#, StatusCode::NOT_FOUND, "unregistered"),
+            ("/v1/ack", r#"{"me":"pi:sting:2:b","msg_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#, StatusCode::NOT_FOUND, "message_unavailable"),
+            ("/v1/send", r#"{"from":"x","to":"y","ticket":"none","body":"b"}"#, StatusCode::BAD_REQUEST, "invalid_argument"),
+            ("/v1/peers", r#"{"all":"yes"}"#, StatusCode::BAD_REQUEST, "invalid_argument"),
+            ("/v1/send", "{not json", StatusCode::BAD_REQUEST, "invalid_json"),
+            ("/v1/send", "[]", StatusCode::BAD_REQUEST, "invalid_json"),
+            ("/v1/inbox", r#"{"me":"pi:sting:2:b","wait_seconds":"5"}"#, StatusCode::BAD_REQUEST, "invalid_argument"),
+        ];
+        for (uri, body, status, code) in cases {
+            let response = call(&app, "POST", uri, body).await;
+            assert_eq!(response.status(), status, "{uri} {body}");
+            let value = json_of(response).await;
+            assert_eq!(value["code"], code, "{uri} {body}: {value}");
+            assert!(value["error"].as_str().is_some_and(|e| !e.is_empty()));
+        }
+        let untyped = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/send")
+                    .header("host", "localhost")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(untyped.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(json_of(untyped).await["code"], "unsupported_media_type");
+    }
+
+    #[tokio::test]
+    async fn end_over_rest_needs_the_registered_token() {
+        let store = Arc::new(Store::memory().unwrap());
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let registered = json_of(
+            call(&app, "POST", "/v1/register", GUARDED_ROUTES[0].2).await,
+        )
+        .await;
+        let token = registered["end_token"].as_str().unwrap();
+        let legacy = call(&app, "POST", "/v1/end", r#"{"me":"claude:honey:1:a","proc_start":"1"}"#).await;
+        assert_eq!(legacy.status(), StatusCode::BAD_REQUEST);
+        assert!(error_of(legacy).await.contains("end_token"));
+        let forged = call(&app, "POST", "/v1/end", GUARDED_ROUTES[1].2).await;
+        assert_eq!(json_of(forged).await["state"], "unknown");
+        let listed = json_of(call(&app, "GET", "/v1/peers", "").await).await;
+        assert_eq!(listed["peers"][0]["state"], "live");
+        assert!(listed["peers"][0].get("proc_start").is_none());
+        let body = json!({"me":"claude:honey:1:a","end_token":token}).to_string();
+        let ended = call(&app, "POST", "/v1/end", &body).await;
+        assert_eq!(json_of(ended).await["state"], "ended");
+        let listed = json_of(call(&app, "GET", "/v1/peers", "").await).await;
+        assert!(listed["peers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn audit_never_carries_the_end_token() {
+        let store = Store::memory().unwrap();
+        let args = json!({"harness":"claude","host":"honey","pid":1,"session_id":"a","proc_start":"secret-start"});
+        let result = store.register(&args).unwrap();
+        let token = result["end_token"].as_str().unwrap();
+        let line = audit_record("register", &args, &result, None).to_string();
+        assert!(!line.contains(token), "{line}");
+        assert_eq!(audit_record("register", &args, &result, None)["agent_id"], "claude:honey:1:a");
     }
 }

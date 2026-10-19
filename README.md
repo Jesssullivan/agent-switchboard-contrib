@@ -126,23 +126,33 @@ SWB_AGENT_ID="$b" "$swb" ack <msg_id>
 | `SWB_BROKER_URL` | every client verb | none | `http://host:port` only: no path, no trailing `/`, no `https` |
 | `SWB_HOST` | `hook`, `whoami`, `doctor` | none | host part of the agent id |
 | `SWB_SESSION_PID` | `hook`, `whoami`, `doctor` | none | nonzero integer |
-| `SWB_PROC_START` | `hook`, `whoami`, `doctor` | none | also the check on `/v1/end` |
+| `SWB_PROC_START` | `hook`, `whoami`, `doctor`, `channel` | none | process start stamp; `channel` filters its own row on it. `/v1/end` checks the end token, not this (v0.3.0) |
 | `SWB_HARNESS` | `hook`, `whoami`, `doctor` | hook: its argument | `claude`, `kimi`, `codex`, `junie`, `opencode` or `pi` |
+| `SWB_STATE_DIR` | `hook`, `whoami --register`, `doctor --register` | `$XDG_STATE_HOME/swb`, then `$HOME/.local/state/swb` | where end tokens are kept (`sessions/<agent_id>.token`, dir 0700, file 0600); files not rewritten for 7 days are pruned |
 | `SWB_SESSION_ID` | `whoami`, `doctor` | none | hooks read `session_id` from stdin instead |
 | `SWB_AGENT_ID` | `inbox`, `send`, `ack`, `doctor`, `channel` | none | `harness:host:pid:session_id`, as `register` returned it; `channel` falls back to the launcher identity |
 | `SWB_CHANNEL_POLL_SECONDS` | `channel` | `5` | inbox poll interval, clamped to 2–60 |
 | `SWB_METRICS_URL` | `doctor` | none | `http://host:port` of `SWB_METRICS_LISTEN`; unset skips the `/metrics` check |
 
-REST routes: `POST /v1/register`, `POST /v1/end`, `GET /v1/peers[?me=]`,
-`POST /v1/send`, `GET /v1/inbox?me=[&limit=&wait_seconds=]`, `POST /v1/ack`.
-MCP tools at `/mcp`: `register`, `peers`, `send`, `inbox`, `ack`. A `ticket`
-is `TIN-<digits>` or `none`; a body is at most 16 KiB.
+REST routes (v0.3.0, R-C944): `POST /v1/register` (returns `end_token`),
+`POST /v1/end {me, end_token}`, `POST /v1/peers` (optional `me` renews its
+lease; `all`, `host`, `limit`, `cursor`, `proc_start` filter), passive
+`GET /v1/peers[?all=&host=&limit=&cursor=]`, `POST /v1/send`,
+`POST /v1/inbox {me, limit, wait_seconds}`, `POST /v1/ack` and `GET /healthz`.
+`GET /v1/peers?me=` and `GET /v1/inbox` answer 405. Errors are
+`{"error", "code"}` with a status per kind. MCP tools at `/mcp`: `register`,
+`end`, `peers`, `send`, `inbox`, `ack`. A `ticket` is `TIN-<digits>` or
+`none`; a body is at most 16 KiB. Upgrade notes:
+[docs/releases/v0.3.0-migration.md](docs/releases/v0.3.0-migration.md).
 
-CLI verbs: `serve`, `hook <harness> <event>`, `whoami`, `inbox`,
+CLI verbs: `serve`, `hook <harness> <event>`, `whoami [--register]` (plain
+`whoami` makes no broker call), `inbox`,
 `send <to> <ticket> [--ruling ID] [--operator-directed] [--in-reply-to ULID]
 [--thread ULID] [--msg-id ULID] < body`, `ack <msg_id>`, `peers`,
-`doctor [--register]`, `channel` and `version`. `agentd` is planned for P2 and exits 3.
-`peers` never passes `me`, so it refreshes no lease. Exit codes: 0 ok,
+`doctor [--register]`, `channel` and `version` (also `--version`; `--help`
+prints usage and exits 0). `agentd` is planned for P2 and exits 3; it is
+not in the usage text. `peers [--all] [--host H] [--limit N] [--cursor ID]`
+never passes `me`, so it refreshes no lease. Exit codes: 0 ok,
 2 usage, 3 missing setting, broker error or a failed `doctor` check, 1
 `serve` failure; `hook` always exits 0, and `channel` exits 0 when Claude
 Code closes its stdin.

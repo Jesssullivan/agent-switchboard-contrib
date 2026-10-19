@@ -1,4 +1,4 @@
--- | Runs the five trace properties against the pure model, and against a
+-- | Runs the seven trace properties against the pure model, and against a
 -- live broker when SWB_SPEC_BROKER_URL names one on loopback (R-C229). With
 -- SWB_SPEC_LIVE_CLOCK=1 the live run also generates 'Tick', which needs a
 -- broker on the R-C262 test clock.

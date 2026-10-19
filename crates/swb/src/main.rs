@@ -3,23 +3,42 @@
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use swb_proto::VERSION;
 
 mod channel;
 
-/// The release version `swb version` and the channel's `serverInfo` report.
-/// Bazel does not set CARGO_PKG_VERSION from Cargo.toml, so keep this equal
-/// to the workspace version by hand.
-const VERSION: &str = "0.2.2";
+const USAGE: &str = "usage: swb <command> [args]
+
+commands:
+  serve                     run the broker (SWB_DB_PATH, SWB_LISTEN, SWB_METRICS_LISTEN)
+  hook <harness> <event>    harness hook for SessionStart, UserPromptSubmit, Stop or
+                            SessionEnd; reads the hook JSON on stdin and always exits 0
+  whoami [--register]       print this session's agent id from the SWB_* environment;
+                            --register also registers it and saves its end token
+  inbox                     fetch one unacknowledged message for SWB_AGENT_ID
+  send <to-agent-id> <ticket> [--ruling ID] [--operator-directed] [--in-reply-to ULID]
+       [--thread ULID] [--msg-id ULID]
+                            send a peer message; the body is read from stdin
+  ack <msg_id>              acknowledge a message for SWB_AGENT_ID
+  peers [--all] [--host HOST] [--limit N] [--cursor AGENT_ID]
+                            list live sessions (--all adds idle, gone and ended)
+  doctor [--register]       check the SWB_* settings and the broker
+  channel                   Claude Code channel (stdio MCP server)
+  version                   print the version
+
+options:
+  -h, --help                print this help
+  -V, --version             print the version";
 const LIMIT: Duration = Duration::from_millis(1500);
 const HOOK_LIMIT: Duration = Duration::from_millis(1800);
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 // A valid envelope can contain a 16 KiB body and 40 KiB of artifact paths;
 // JSON escaping can enlarge the latter up to sixfold. Use one-message pages.
 const CLI_INBOX_PAGE: u32 = 1;
-const SEND_USAGE: &str = "usage: swb send <to-agent-id> <ticket> [--ruling ID] [--operator-directed] [--in-reply-to ULID] [--thread ULID] [--msg-id ULID] < body";
 
 fn bounded<T, F>(limit: Duration, work: F) -> Result<T, String>
 where
@@ -36,10 +55,6 @@ where
     receiver
         .recv_timeout(limit)
         .map_err(|_| "broker deadline exceeded".to_string())?
-}
-
-fn env(name: &str) -> Result<String, String> {
-    need(&process_env, name)
 }
 
 /// Where a command reads `SWB_*` settings. Production passes [`process_env`];
@@ -73,10 +88,6 @@ fn parse_endpoint(name: &str, url: &str) -> Result<(String, u16), String> {
         host.into(),
         port.parse().map_err(|_| format!("invalid {name} port"))?,
     ))
-}
-
-fn call(method: &str, path: &str, data: Option<&Value>) -> Result<Value, String> {
-    call_with(&process_env, method, path, data)
 }
 
 fn call_with(
@@ -188,42 +199,218 @@ fn blocking_call(
     Ok(result)
 }
 
-fn register(harness: &str, session_id: &str) -> Result<Value, String> {
-    if !matches!(
-        harness,
-        "claude" | "kimi" | "codex" | "junie" | "opencode" | "pi"
-    ) {
+fn launcher_pid(lookup: Lookup) -> Result<u32, String> {
+    need(lookup, "SWB_SESSION_PID")?
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "invalid SWB_SESSION_PID".into())
+}
+
+/// `POST /v1/register` for this launcher process. The response carries the
+/// session's end token; callers save it with [`save_token`] and never print
+/// it.
+fn register_with(lookup: Lookup, harness: &str, session_id: &str) -> Result<Value, String> {
+    if !HARNESSES.contains(&harness) {
         return Err("invalid harness".into());
     }
-    let pid: u32 = env("SWB_SESSION_PID")?
-        .parse()
-        .map_err(|_| "invalid SWB_SESSION_PID")?;
-    if pid == 0 || session_id.is_empty() {
+    let pid = launcher_pid(lookup)?;
+    if session_id.is_empty() {
         return Err("missing session identity".into());
     }
-    call(
+    call_with(
+        lookup,
         "POST",
         "/v1/register",
         Some(&json!({
-            "harness":harness, "host":env("SWB_HOST")?, "pid":pid,
-            "session_id":session_id, "proc_start":env("SWB_PROC_START")?
+            "harness":harness, "host":need(lookup, "SWB_HOST")?, "pid":pid,
+            "session_id":session_id, "proc_start":need(lookup, "SWB_PROC_START")?
         })),
     )
 }
 
-fn inbox(me: &str) -> Result<Value, String> {
-    if me.is_empty()
-        || !me
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-:".contains(&b))
-    {
+fn inbox_with(lookup: Lookup, me: &str) -> Result<Value, String> {
+    if !valid_agent_id(me) {
         return Err("invalid SWB_AGENT_ID".into());
     }
-    call(
-        "GET",
-        &format!("/v1/inbox?me={me}&limit={CLI_INBOX_PAGE}&wait_seconds=0"),
-        None,
+    call_with(
+        lookup,
+        "POST",
+        "/v1/inbox",
+        Some(&json!({"me":me,"limit":CLI_INBOX_PAGE,"wait_seconds":0})),
     )
+}
+
+// ---- R-C944 end tokens ------------------------------------------------------
+//
+// `register` returns a per-session end token and `/v1/end` accepts nothing
+// else. The hook that registers at SessionStart is a different process from
+// the one that ends the session at SessionEnd, so the token is kept in a
+// private file: `$SWB_STATE_DIR/sessions/<agent_id>.token`, where
+// SWB_STATE_DIR defaults to `$XDG_STATE_HOME/swb`, then
+// `$HOME/.local/state/swb`. The directory is 0700 and the file 0600. The
+// token is never printed, logged or put on a command line.
+
+fn token_dir(lookup: Lookup) -> Option<PathBuf> {
+    let absolute = |name: &str| lookup(name).filter(|v| v.starts_with('/'));
+    absolute("SWB_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| absolute("XDG_STATE_HOME").map(|d| PathBuf::from(d).join("swb")))
+        .or_else(|| absolute("HOME").map(|h| PathBuf::from(h).join(".local/state/swb")))
+        .map(|d| d.join("sessions"))
+}
+
+fn token_path(lookup: Lookup, agent_id: &str) -> Result<PathBuf, String> {
+    // A valid id holds only [A-Za-z0-9._-] and ':', so it is a safe name.
+    if !valid_agent_id(agent_id) || agent_id.len() > 240 {
+        return Err("agent id cannot name a token file".into());
+    }
+    let dir = token_dir(lookup).ok_or("no SWB_STATE_DIR, XDG_STATE_HOME or HOME for the end token")?;
+    Ok(dir.join(format!("{agent_id}.token")))
+}
+
+fn valid_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Saves the end token from a register response, if it carries one. Returns
+/// the file it wrote, or `None` when the response had no token.
+fn save_token(lookup: Lookup, response: &Value) -> Result<Option<PathBuf>, String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let (Some(agent_id), Some(token)) = (
+        response.get("agent_id").and_then(Value::as_str),
+        response.get("end_token").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    if !valid_token(token) {
+        return Err("broker returned a malformed end token".into());
+    }
+    let path = token_path(lookup, agent_id)?;
+    if std::fs::read_to_string(&path).is_ok_and(|saved| saved == token) {
+        return Ok(Some(path));
+    }
+    let dir = path.parent().ok_or("token path has no directory")?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    let temp = dir.join(format!(".{agent_id}.{}.tmp", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .and_then(|mut file| file.write_all(token.as_bytes()))
+        .and_then(|()| std::fs::rename(&temp, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    prune_stale_tokens(dir, TOKEN_FILE_MAX_AGE);
+    Ok(Some(path))
+}
+
+/// How long a token file may go unwritten before a later save removes it.
+/// Every register rewrites the live session's file, so only a session that
+/// crashed without SessionEnd (or idled a week) leaves one this old, and its
+/// row has long since decayed to gone.
+const TOKEN_FILE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Removes token files (and abandoned temp files) in `dir` not written for
+/// `max_age`. Best effort: any error leaves the file in place.
+fn prune_stale_tokens(dir: &std::path::Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.ends_with(".token") || (name.starts_with('.') && name.ends_with(".tmp"))) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| m.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > max_age);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn load_token(lookup: Lookup, agent_id: &str) -> Result<String, String> {
+    let path = token_path(lookup, agent_id)?;
+    let token = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    valid_token(token.trim())
+        .then(|| token.trim().to_owned())
+        .ok_or_else(|| format!("{}: not an end token", path.display()))
+}
+
+/// SessionEnd: end this session with its saved token, then forget the
+/// token. Without a saved token there is nothing to do: the session decays
+/// from live to idle to gone on its own.
+fn end_session(lookup: Lookup, harness: &str, session_id: &str) -> Result<Value, String> {
+    let me = format!(
+        "{harness}:{}:{}:{session_id}",
+        need(lookup, "SWB_HOST")?,
+        launcher_pid(lookup)?
+    );
+    let token = load_token(lookup, &me)?;
+    let result = call_with(
+        lookup,
+        "POST",
+        "/v1/end",
+        Some(&json!({"me":me,"end_token":token})),
+    )?;
+    // Ended, or a token the broker no longer knows: either way it is spent.
+    let _ = std::fs::remove_file(token_path(lookup, &me)?);
+    Ok(result)
+}
+
+/// `swb whoami`: the agent id this session's environment names. It makes no
+/// broker call. `--register` also registers the session, saves its end
+/// token, and prints the response without the token.
+fn whoami_cmd(lookup: Lookup, live_register: bool) -> Result<Value, String> {
+    let (payload, agent_id) = match predicted_identity(lookup) {
+        Ok(Identity::Full { payload, agent_id }) => (payload, agent_id),
+        Ok(Identity::Partial { prefix, unknown }) => {
+            return Err(format!(
+                "{} unknown (launcher identity {prefix}); set SWB_HARNESS and SWB_SESSION_ID, \
+                 or SWB_AGENT_ID",
+                unknown.join(" and ")
+            ));
+        }
+        Err(Check::Fail { detail, fix }) => return Err(format!("{detail} ({fix})")),
+        Err(other) => return Err(format!("{other:?}")),
+    };
+    if !live_register {
+        return Ok(json!({"agent_id":agent_id,"registered":false}));
+    }
+    let mut response = call_with(lookup, "POST", "/v1/register", Some(&payload))?;
+    let saved = save_token(lookup, &response);
+    if let Some(map) = response.as_object_mut() {
+        map.remove("end_token");
+        map.insert("registered".into(), json!(true));
+        map.insert(
+            "end_token_file".into(),
+            match &saved {
+                Ok(Some(path)) => json!(path.display().to_string()),
+                _ => Value::Null,
+            },
+        );
+    }
+    if let Err(e) = saved {
+        eprintln!("swb whoami: end token not saved: {e}");
+    }
+    Ok(response)
 }
 
 // ---- R-C275 client verbs: send, ack, peers, doctor -------------------------
@@ -381,10 +568,78 @@ fn ack_cmd(lookup: Lookup, msg_id: &str) -> Result<Value, String> {
     )
 }
 
+/// Options for `swb peers`.
+#[derive(Debug, Default, PartialEq)]
+struct PeersArgs {
+    all: bool,
+    host: Option<String>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+fn parse_peers_args(args: &[String]) -> Result<PeersArgs, String> {
+    let mut out = PeersArgs::default();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = |flag: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match arg.as_str() {
+            "--all" => out.all = true,
+            "--host" => {
+                let host = value("--host")?;
+                if !valid_part(&host) {
+                    return Err("invalid --host".into());
+                }
+                out.host = Some(host);
+            }
+            "--limit" => {
+                out.limit = Some(
+                    value("--limit")?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| (1..=200).contains(n))
+                        .ok_or("--limit must be 1..200")?,
+                )
+            }
+            "--cursor" => {
+                let cursor = value("--cursor")?;
+                if !valid_agent_id(&cursor) {
+                    return Err("invalid --cursor (an agent id)".into());
+                }
+                out.cursor = Some(cursor);
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    Ok(out)
+}
+
 /// `swb peers` is a read-only listing: it never passes `me`, so it does not
-/// refresh a lease or fail for an unregistered caller.
-fn peers_cmd(lookup: Lookup) -> Result<Value, String> {
-    call_with(lookup, "GET", "/v1/peers", None)
+/// refresh a lease or fail for an unregistered caller. Every query value is
+/// validated to [A-Za-z0-9._:-], so none needs escaping.
+fn peers_cmd(lookup: Lookup, args: &PeersArgs) -> Result<Value, String> {
+    let mut query = Vec::new();
+    if args.all {
+        query.push("all=1".to_owned());
+    }
+    if let Some(host) = &args.host {
+        query.push(format!("host={host}"));
+    }
+    if let Some(limit) = args.limit {
+        query.push(format!("limit={limit}"));
+    }
+    if let Some(cursor) = &args.cursor {
+        query.push(format!("cursor={cursor}"));
+    }
+    let path = if query.is_empty() {
+        "/v1/peers".to_owned()
+    } else {
+        format!("/v1/peers?{}", query.join("&"))
+    };
+    call_with(lookup, "GET", &path, None)
 }
 
 #[derive(Debug, PartialEq)]
@@ -592,9 +847,9 @@ fn doctor_checks(lookup: Lookup, live_register: bool) -> Vec<(&'static str, Chec
         if !broker_ok {
             Check::Skip("no valid SWB_BROKER_URL".into())
         } else {
-            match peers_cmd(lookup) {
+            match peers_cmd(lookup, &PeersArgs::default()) {
                 Ok(v) if v.get("peers").is_some_and(Value::is_array) => Check::Ok(format!(
-                    "GET /v1/peers listed {} session(s)",
+                    "GET /v1/peers listed {} live session(s)",
                     v["peers"].as_array().map_or(0, Vec::len)
                 )),
                 Ok(_) => fail(
@@ -653,6 +908,8 @@ fn doctor_checks(lookup: Lookup, live_register: bool) -> Vec<(&'static str, Chec
                 true,
             ) => match call_with(lookup, "POST", "/v1/register", Some(payload)) {
                 Ok(v) if v.get("agent_id").and_then(Value::as_str) == Some(id.as_str()) => {
+                    // Keep the hook's saved end token current (R-C944).
+                    let _ = save_token(lookup, &v);
                     Check::Ok(format!("POST /v1/register returned {id}"))
                 }
                 Ok(v) => fail(
@@ -721,31 +978,22 @@ fn hook(harness_arg: &str, event: &str) {
     };
     let harness = std::env::var("SWB_HARNESS").unwrap_or_else(|_| harness_arg.into());
     if event == "SessionEnd" {
-        let Ok(pid) = env("SWB_SESSION_PID") else {
-            return;
-        };
-        let Ok(host) = env("SWB_HOST") else { return };
-        let Ok(proc_start) = env("SWB_PROC_START") else {
-            return;
-        };
-        let me = format!("{harness}:{host}:{pid}:{session_id}");
-        let _ = call(
-            "POST",
-            "/v1/end",
-            Some(&json!({"me":me,"proc_start":proc_start})),
-        );
+        let _ = end_session(&process_env, &harness, session_id);
         return;
     }
-    let Ok(identity) = register(&harness, session_id) else {
+    let Ok(identity) = register_with(&process_env, &harness, session_id) else {
         return;
     };
+    let _ = save_token(&process_env, &identity);
     if event != "UserPromptSubmit" {
         return;
     }
     let Some(me) = identity.get("agent_id").and_then(Value::as_str) else {
         return;
     };
-    let Ok(batch) = inbox(me) else { return };
+    let Ok(batch) = inbox_with(&process_env, me) else {
+        return;
+    };
     let Some(messages) = batch.get("messages").and_then(Value::as_array) else {
         return;
     };
@@ -790,20 +1038,47 @@ fn notice(me: &str, sender: &str, ticket: &str) -> String {
     )
 }
 
+/// Help and version requests, which print to stdout and exit 0.
+fn meta(first: Option<&str>) -> Option<String> {
+    match first {
+        Some("-h" | "--help" | "help") => Some(USAGE.to_owned()),
+        Some("-V" | "--version" | "version") => Some(format!(
+            "swb {VERSION} envelope v{}",
+            swb_proto::ENVELOPE_VERSION
+        )),
+        _ => None,
+    }
+}
+
+fn usage_error(verb: &str, error: &str) -> ExitCode {
+    let prefix = if verb.is_empty() {
+        "swb".to_owned()
+    } else {
+        format!("swb {verb}")
+    };
+    eprintln!("{prefix}: {error}\n{USAGE}");
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(text) = meta(argv.first().map(String::as_str)) {
+        println!("{text}");
+        return ExitCode::SUCCESS;
+    }
+    // `swb <verb> --help` prints the same help and exits 0. Only the word
+    // right after the verb counts, so a flag value such as `--ruling -h`
+    // is still a value.
+    if argv.get(1).is_some_and(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    let mut args = argv.into_iter();
     match args.next().as_deref() {
-        Some("version") => {
-            println!("swb {VERSION} envelope v{}", swb_proto::ENVELOPE_VERSION);
-            ExitCode::SUCCESS
-        }
         Some("send") => {
             let rest: Vec<String> = args.collect();
             match parse_send_args(&rest) {
-                Err(e) => {
-                    eprintln!("swb send: {e}\n{SEND_USAGE}");
-                    ExitCode::from(2)
-                }
+                Err(e) => usage_error("send", &e),
                 Ok(parsed) => print_result(
                     "send",
                     read_body(std::io::stdin().lock())
@@ -813,26 +1088,20 @@ fn main() -> ExitCode {
         }
         Some("ack") => match (args.next(), args.next()) {
             (Some(msg_id), None) => print_result("ack", ack_cmd(&process_env, &msg_id)),
-            _ => {
-                eprintln!("usage: swb ack <msg_id>");
-                ExitCode::from(2)
-            }
+            _ => usage_error("ack", "expected <msg_id>"),
         },
-        Some("peers") => match args.next() {
-            None => print_result("peers", peers_cmd(&process_env)),
-            Some(_) => {
-                eprintln!("usage: swb peers");
-                ExitCode::from(2)
+        Some("peers") => {
+            let rest: Vec<String> = args.collect();
+            match parse_peers_args(&rest) {
+                Ok(parsed) => print_result("peers", peers_cmd(&process_env, &parsed)),
+                Err(e) => usage_error("peers", &e),
             }
-        },
+        }
         Some("doctor") => {
             let live = match (args.next().as_deref(), args.next()) {
                 (None, None) => false,
                 (Some("--register"), None) => true,
-                _ => {
-                    eprintln!("usage: swb doctor [--register]");
-                    return ExitCode::from(2);
-                }
+                _ => return usage_error("doctor", "expected [--register]"),
             };
             let checks = doctor_checks(&process_env, live);
             if render_doctor(&checks, &mut std::io::stdout().lock()) {
@@ -853,26 +1122,19 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("whoami") => {
-            match env("SWB_HARNESS").and_then(|h| register(&h, &env("SWB_SESSION_ID")?)) {
-                Ok(v) => {
-                    println!("{v}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("swb whoami: {e}");
-                    ExitCode::from(3)
-                }
-            }
+            let live = match (args.next().as_deref(), args.next()) {
+                (None, None) => false,
+                (Some("--register"), None) => true,
+                _ => return usage_error("whoami", "expected [--register]"),
+            };
+            print_result("whoami", whoami_cmd(&process_env, live))
         }
-        Some("inbox") => match env("SWB_AGENT_ID").and_then(|me| inbox(&me)) {
-            Ok(v) => {
-                println!("{v}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("swb inbox: {e}");
-                ExitCode::from(3)
-            }
+        Some("inbox") => match args.next() {
+            None => print_result(
+                "inbox",
+                need(&process_env, "SWB_AGENT_ID").and_then(|me| inbox_with(&process_env, &me)),
+            ),
+            Some(_) => usage_error("inbox", "takes no arguments"),
         },
         Some("serve") => {
             let path =
@@ -918,21 +1180,17 @@ fn main() -> ExitCode {
                 );
                 ExitCode::SUCCESS
             }
-            Some(_) => {
-                eprintln!("usage: swb channel");
-                ExitCode::from(2)
-            }
+            Some(_) => usage_error("channel", "takes no arguments"),
         },
         Some("agentd") => {
-            eprintln!("swb agentd: planned for P2");
+            eprintln!("swb agentd: not implemented yet (planned for P2)");
             ExitCode::from(3)
         }
-        _ => {
-            eprintln!(
-                "usage: swb <serve|agentd|hook <harness> <event>|whoami|inbox|send|ack|peers|doctor|channel|version>"
-            );
-            ExitCode::from(2)
-        }
+        Some(other) => usage_error(
+            &other.chars().filter(|c| c.is_ascii_graphic()).take(32).collect::<String>(),
+            "unknown command",
+        ),
+        None => usage_error("", "missing command"),
     }
 }
 
@@ -1009,7 +1267,7 @@ mod tests {
             assert!(request.starts_with("POST /v1/register HTTP/1.1"));
             assert!(request.contains("\"session_id\":\"session-1\""));
             assert!(request.contains("\"proc_start\":\"start-1\""));
-            let body = r#"{"agent_id":"pi:honey:123:session-1","lease_seconds":900}"#;
+            let body = r#"{"agent_id":"pi:honey:123:session-1","lease_seconds":900,"end_token":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1017,24 +1275,32 @@ mod tests {
             )
             .unwrap();
         });
-        // One test owns these process-wide variables; no other test in this
-        // binary mutates them. The broker URL is intentionally loopback only.
-        unsafe {
-            std::env::set_var("SWB_BROKER_URL", format!("http://127.0.0.1:{port}"));
-            std::env::set_var("SWB_HOST", "honey");
-            std::env::set_var("SWB_SESSION_PID", "123");
-            std::env::set_var("SWB_PROC_START", "start-1");
-        }
-        let result = register("pi", "session-1").unwrap();
+        let url = format!("http://127.0.0.1:{port}");
+        let lookup = lookup_of(&[
+            ("SWB_BROKER_URL", &url),
+            ("SWB_HOST", "honey"),
+            ("SWB_SESSION_PID", "123"),
+            ("SWB_PROC_START", "start-1"),
+        ]);
+        let result = register_with(&lookup, "pi", "session-1").unwrap();
         assert_eq!(result["agent_id"], "pi:honey:123:session-1");
         server.join().unwrap();
     }
 
     #[test]
-    fn inbox_rejects_request_path_injection() {
+    fn inbox_rejects_invalid_ids_and_posts_a_json_body() {
         assert_eq!(
-            inbox("pi:honey:1:session?limit=1000").unwrap_err(),
+            inbox_with(&lookup_of(&[]), "pi:honey:1:session?limit=1000").unwrap_err(),
             "invalid SWB_AGENT_ID"
+        );
+        let (url, server) = mock(vec![(200, "application/json", r#"{"messages":[]}"#)]);
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url)]);
+        inbox_with(&lookup, ME).unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("POST /v1/inbox HTTP/1.1"));
+        assert_eq!(
+            request_json(&requests[0]),
+            json!({"me":ME,"limit":CLI_INBOX_PAGE,"wait_seconds":0})
         );
     }
 
@@ -1076,41 +1342,14 @@ mod tests {
             response.len() < MAX_RESPONSE_BYTES,
             "one valid escaped page must fit"
         );
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0u8; 512];
-                let n = stream.read(&mut chunk).unwrap();
-                assert!(n > 0);
-                request.extend_from_slice(&chunk[..n]);
-                if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            assert!(String::from_utf8_lossy(&request).contains("limit=1&wait_seconds=0"));
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-                response.len()
-            )
-            .unwrap();
-        });
-        let received = blocking_call(
-            "127.0.0.1",
-            port,
-            "GET",
-            &format!("/v1/inbox?me={to}&limit={CLI_INBOX_PAGE}&wait_seconds=0"),
-            None,
-        )
-        .unwrap();
+        let reply: &'static str = Box::leak(response.into_boxed_str());
+        let (url, server) = mock(vec![(200, "application/json", reply)]);
+        let received = inbox_with(&lookup_of(&[("SWB_BROKER_URL", &url)]), to).unwrap();
         assert_eq!(
             received["messages"][0]["body"].as_str().unwrap().len(),
             16384
         );
-        server.join().unwrap();
+        assert_eq!(request_json(&server.join().unwrap()[0])["limit"], 1);
     }
 
     #[test]
@@ -1367,12 +1606,158 @@ mod tests {
             r#"{"peers":[{"agent_id":"codex:sting:42:t-1","state":"live"}]}"#,
         )]);
         let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_AGENT_ID", ME)]);
-        let result = peers_cmd(&lookup).unwrap();
+        let result = peers_cmd(&lookup, &PeersArgs::default()).unwrap();
         assert_eq!(result["peers"][0]["agent_id"], PEER);
         let requests = server.join().unwrap();
         // No `me`: listing never refreshes a lease or needs registration.
         assert!(requests[0].starts_with("GET /v1/peers HTTP/1.1"));
+        let (url, server) = mock(vec![(200, "application/json", r#"{"peers":[]}"#)]);
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url)]);
+        let args = parse_peers_args(&strings(&[
+            "--all", "--host", "sting", "--limit", "5", "--cursor", PEER,
+        ]))
+        .unwrap();
+        peers_cmd(&lookup, &args).unwrap();
+        assert!(server.join().unwrap()[0].starts_with(
+            "GET /v1/peers?all=1&host=sting&limit=5&cursor=codex:sting:42:t-1 HTTP/1.1"
+        ));
+        for bad in [
+            &["--host", "a/b"][..],
+            &["--limit", "0"],
+            &["--limit", "201"],
+            &["--cursor", "x&me=y"],
+            &["--bogus"],
+            &["--host"],
+        ] {
+            assert!(parse_peers_args(&strings(bad)).is_err(), "{bad:?}");
+        }
     }
+
+    #[test]
+    fn help_and_version_are_successful_meta_commands() {
+        for flag in ["-h", "--help", "help"] {
+            let text = meta(Some(flag)).unwrap();
+            assert!(text.starts_with("usage: swb <command>"), "{flag}");
+            assert!(text.contains("whoami [--register]"));
+            assert!(!text.contains("agentd"), "agentd is not implemented");
+        }
+        for flag in ["-V", "--version", "version"] {
+            assert_eq!(
+                meta(Some(flag)).unwrap(),
+                format!("swb {VERSION} envelope v3")
+            );
+        }
+        assert_eq!(meta(Some("send")), None);
+        assert_eq!(meta(None), None);
+    }
+
+    fn scratch_state_dir(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "swb-state-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        dir.display().to_string()
+    }
+
+    const TOKEN: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn end_tokens_are_private_files_and_end_spends_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = scratch_state_dir("end");
+        let (url, server) = mock(vec![(
+            200,
+            "application/json",
+            r#"{"agent_id":"claude:neo:41:s-1","state":"ended"}"#,
+        )]);
+        let lookup = lookup_of(&[
+            ("SWB_BROKER_URL", &url),
+            ("SWB_STATE_DIR", &state),
+            ("SWB_HOST", "neo"),
+            ("SWB_SESSION_PID", "+041"),
+        ]);
+        let saved = save_token(&lookup, &json!({"agent_id":ME,"end_token":TOKEN}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved, PathBuf::from(&state).join("sessions/claude:neo:41:s-1.token"));
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&saved), 0o600);
+        assert_eq!(mode(saved.parent().unwrap()), 0o700);
+        assert_eq!(load_token(&lookup, ME).unwrap(), TOKEN);
+        // No token in the response: nothing to save.
+        assert_eq!(save_token(&lookup, &json!({"agent_id":ME})).unwrap(), None);
+        assert!(save_token(&lookup, &json!({"agent_id":ME,"end_token":"short"})).is_err());
+        let ended = end_session(&lookup, "claude", "s-1").unwrap();
+        assert_eq!(ended["state"], "ended");
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("POST /v1/end HTTP/1.1"));
+        assert_eq!(request_json(&requests[0]), json!({"me":ME,"end_token":TOKEN}));
+        assert!(!saved.exists(), "a spent token stays on disk");
+        // Without a saved token, SessionEnd makes no broker call.
+        assert!(end_session(&lookup, "claude", "s-1").is_err());
+        // Token files nobody rewrote within the bound are pruned on a later
+        // save; fresh ones stay.
+        let dir = PathBuf::from(&state).join("sessions");
+        let fresh = dir.join("claude:neo:8:recent.token");
+        let old = dir.join("claude:neo:9:crashed.token");
+        std::fs::write(&fresh, TOKEN).unwrap();
+        std::fs::write(&old, TOKEN).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - TOKEN_FILE_MAX_AGE * 2)
+            .unwrap();
+        save_token(&lookup, &json!({"agent_id":ME,"end_token":TOKEN})).unwrap();
+        assert!(fresh.exists(), "a fresh token file was pruned");
+        assert!(!old.exists(), "a stale token file survived");
+        let _ = std::fs::remove_dir_all(&state);
+        // With no usable state directory the token cannot be saved.
+        assert!(save_token(&lookup_of(&[]), &json!({"agent_id":ME,"end_token":TOKEN})).is_err());
+    }
+
+    #[test]
+    fn whoami_does_not_register_unless_asked_and_never_prints_the_token() {
+        // No SWB_BROKER_URL at all: plain whoami makes no broker call.
+        let pairs = identity_env("");
+        let borrowed: Vec<(&str, &str)> = pairs
+            .iter()
+            .filter(|(k, _)| *k != "SWB_BROKER_URL")
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
+        assert_eq!(
+            whoami_cmd(&lookup_of(&borrowed), false).unwrap(),
+            json!({"agent_id":"claude:neo:41:s-1","registered":false})
+        );
+        let launcher = launcher_env("http://127.0.0.1:1");
+        let borrowed: Vec<(&str, &str)> = launcher.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert!(
+            whoami_cmd(&lookup_of(&borrowed), false)
+                .unwrap_err()
+                .contains("harness and session id unknown")
+        );
+        let state = scratch_state_dir("whoami");
+        let (url, server) = mock(vec![(
+            200,
+            "application/json",
+            r#"{"agent_id":"claude:neo:41:s-1","lease_seconds":900,"end_token":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"}"#,
+        )]);
+        let mut pairs = identity_env(&url);
+        pairs.push(("SWB_STATE_DIR", state.clone()));
+        let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let out = whoami_cmd(&lookup_of(&borrowed), true).unwrap();
+        assert_eq!(out["registered"], true);
+        assert!(!out.to_string().contains(TOKEN), "{out}");
+        assert!(out["end_token_file"].as_str().unwrap().ends_with("claude:neo:41:s-1.token"));
+        assert!(server.join().unwrap()[0].starts_with("POST /v1/register "));
+        assert_eq!(load_token(&lookup_of(&borrowed), ME).unwrap(), TOKEN);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
 
     #[test]
     fn doctor_with_nothing_set_fails_with_fixes() {
@@ -1443,7 +1828,7 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("ok    env identity: would register as claude:neo:41:s-1"));
         assert!(text.contains("FAIL  env SWB_AGENT_ID: claude:neo:41:other differs"));
-        assert!(text.contains("ok    broker REST: GET /v1/peers listed 0 session(s)"));
+        assert!(text.contains("ok    broker REST: GET /v1/peers listed 0 live session(s)"));
         assert!(text.contains("ok    register: dry run: payload valid for claude:neo:41:s-1"));
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);

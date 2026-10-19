@@ -6,6 +6,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The release version: `swb --version`, the broker's MCP `serverInfo`, the
+/// channel's `serverInfo` and `/healthz` all report it. Bazel does not set
+/// CARGO_PKG_VERSION from Cargo.toml, so this is kept equal to the workspace
+/// version by hand; a test checks the two agree.
+pub const VERSION: &str = "0.3.0";
+
 /// Envelope version this crate speaks.
 pub const ENVELOPE_VERSION: u32 = 3;
 
@@ -31,5 +37,19 @@ mod tests {
         let schema: serde_json::Value = serde_json::from_str(ENVELOPE_V3_SCHEMA).unwrap();
         assert_eq!(schema["properties"]["authority"]["const"], "peer");
         assert_eq!(schema["properties"]["v"]["const"], ENVELOPE_VERSION);
+    }
+
+    #[test]
+    fn version_matches_the_workspace() {
+        let workspace = include_str!("../../../Cargo.toml");
+        assert!(
+            workspace.contains(&format!("\nversion = \"{VERSION}\"\n")),
+            "VERSION {VERSION} differs from the workspace version in Cargo.toml"
+        );
+        let module = include_str!("../../../MODULE.bazel");
+        assert!(
+            module.contains(&format!("version = \"{VERSION}\"")),
+            "VERSION {VERSION} differs from MODULE.bazel"
+        );
     }
 }

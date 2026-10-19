@@ -5,14 +5,21 @@
 //! (R-C262). Production uses [`SystemClock`], which reads the same Unix
 //! seconds SQLite `unixepoch()` returned before the seam existed. Tests and
 //! the spec live adapter use [`ManualClock`], which moves only when told to.
+//!
+//! v0.3.0 (R-C944): `register` returns a fresh end token (each register
+//! invalidates the last) that only `end` accepts, `peers` lists live
+//! sessions by default (bounded, paginated, one row per harness, host and
+//! session id) and never returns `proc_start`, and retention
+//! pruning runs on the broker's interval instead of inside `send`/`inbox`.
 
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::Sha256;
+use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use ulid::Ulid;
 
@@ -20,12 +27,99 @@ pub const RETENTION_ACKED_DAYS: u32 = 7;
 pub const RETENTION_UNACKED_DAYS: u32 = 30;
 pub const DEFAULT_TTL_HOURS: u32 = 72;
 pub const MAX_TTL_DAYS: u32 = 14;
+/// Lease length `register` reports, and the live band of `peers`.
+pub const LEASE_SECONDS: i64 = 900;
+/// Upper bound of the idle band; older non-ended sessions are gone.
+pub const IDLE_MAX_AGE_SECONDS: i64 = 21_600;
+/// `peers` page size when the caller names none, and the largest it accepts.
+pub const PEERS_DEFAULT_LIMIT: u32 = 50;
+pub const PEERS_MAX_LIMIT: u32 = 200;
+/// Hex length of an end token (an HMAC-SHA256).
+pub const END_TOKEN_HEX_LEN: usize = 64;
 
 pub fn effective_ttl_hours(requested: Option<u32>) -> u32 {
     requested
         .unwrap_or(DEFAULT_TTL_HOURS)
         .clamp(1, MAX_TTL_DAYS * 24)
 }
+
+/// What kind of failure a store operation hit. The broker maps each kind to
+/// one HTTP status and a stable machine-readable `code` (R-C944).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// The request is malformed or names an invalid value.
+    Invalid,
+    /// `me` names no registered session.
+    Unregistered,
+    /// The message does not exist for this caller, or has expired.
+    Unavailable,
+    /// A `msg_id` was reused with a different sender or body (SWB-R46).
+    Conflict,
+    /// The store itself failed; not the caller's fault.
+    Internal,
+}
+
+impl ErrorKind {
+    /// The stable `code` the REST and MCP error bodies carry.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid_argument",
+            Self::Unregistered => "unregistered",
+            Self::Unavailable => "message_unavailable",
+            Self::Conflict => "msg_id_conflict",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// A store failure: a kind plus a short fixed message that never contains a
+/// message body or a stored receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreError {
+    pub kind: ErrorKind,
+    pub message: String,
+}
+
+impl StoreError {
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+    pub fn code(&self) -> &'static str {
+        self.kind.code()
+    }
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// A bare message is a validation failure; every other kind is explicit.
+impl From<&str> for StoreError {
+    fn from(message: &str) -> Self {
+        Self::new(ErrorKind::Invalid, message)
+    }
+}
+
+impl From<String> for StoreError {
+    fn from(message: String) -> Self {
+        Self::new(ErrorKind::Invalid, message)
+    }
+}
+
+impl PartialEq<&str> for StoreError {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
+pub type StoreResult<T> = Result<T, StoreError>;
 
 /// Source of the current time, in whole seconds since the Unix epoch
 /// (R-C262). The store asks it once per operation and binds the answer into
@@ -87,11 +181,35 @@ pub struct SendOutcome {
     pub created: bool,
 }
 
-fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
+/// A `peers` request (R-C944). The default lists live sessions only, one
+/// row per (harness, host, session id), at most [`PEERS_DEFAULT_LIMIT`] rows.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PeersQuery<'a> {
+    /// A registered caller whose own lease this call refreshes first.
+    pub me: Option<&'a str>,
+    /// Include idle, gone and ended sessions too.
+    pub all: bool,
+    /// Only sessions on this host.
+    pub host: Option<&'a str>,
+    /// Page size; clamped to 1..=[`PEERS_MAX_LIMIT`].
+    pub limit: Option<u32>,
+    /// The `next_cursor` of the previous page.
+    pub cursor: Option<&'a str>,
+    /// Only sessions whose latest registration used this `proc_start`. The
+    /// caller supplies it; listings still never return it.
+    pub proc_start: Option<&'a str>,
+}
+
+fn field<'a>(v: &'a Value, key: &str) -> StoreResult<&'a str> {
     v.get(key)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("missing {key}"))
+        .ok_or_else(|| format!("missing {key}").into())
+}
+fn valid_part(p: &str) -> bool {
+    !p.is_empty()
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
 }
 fn valid_agent_id(id: &str) -> bool {
     if id.len() > 512 {
@@ -103,13 +221,8 @@ fn valid_agent_id(id: &str) -> bool {
             parts[0],
             "claude" | "kimi" | "codex" | "junie" | "opencode" | "pi"
         )
-        && !parts[1].is_empty()
         && parts[2].parse::<u32>().is_ok()
-        && !parts[3].is_empty()
-        && parts[1..].iter().all(|p| {
-            p.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-        })
+        && parts[1..].iter().all(|p| valid_part(p))
 }
 fn valid_ulid(s: &str) -> bool {
     s.len() == 26 && s.parse::<Ulid>().is_ok_and(|id| id.to_string() == s)
@@ -149,8 +262,46 @@ fn valid_rfc3339_shape(s: &str) -> bool {
 fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
-fn sql_err(e: rusqlite::Error) -> String {
-    e.to_string()
+fn sql_err(e: rusqlite::Error) -> StoreError {
+    StoreError::new(ErrorKind::Internal, e.to_string())
+}
+fn random_bytes<const N: usize>() -> StoreResult<[u8; N]> {
+    let mut bytes = [0u8; N];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+        .map_err(|e| StoreError::new(ErrorKind::Internal, format!("randomness: {e}")))?;
+    Ok(bytes)
+}
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| {
+            text.get(i..i + 2)
+                .filter(|pair| pair.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect()
+}
+/// The session id is the fourth part of an agent id.
+fn session_of(agent_id: &str) -> &str {
+    agent_id.splitn(4, ':').nth(3).unwrap_or(agent_id)
+}
+fn lease_state(seen: i64, ended: bool, now: i64) -> &'static str {
+    if ended {
+        "ended"
+    } else if seen >= now - LEASE_SECONDS {
+        "live"
+    } else if seen >= now - IDLE_MAX_AGE_SECONDS {
+        "idle"
+    } else {
+        "gone"
+    }
 }
 
 impl Store {
@@ -158,28 +309,43 @@ impl Store {
     pub fn now(&self) -> i64 {
         self.1.now()
     }
-    pub fn prune(&self) -> Result<(), String> {
-        let db = self.0.lock().map_err(|_| "store lock poisoned")?;
+    fn db(&self) -> StoreResult<MutexGuard<'_, Connection>> {
+        self.0
+            .lock()
+            .map_err(|_| StoreError::new(ErrorKind::Internal, "store lock poisoned"))
+    }
+    /// Retention (SWB-R09): acked rows after 7 days, every other row 30 days
+    /// after creation. The broker runs this at startup and on its interval;
+    /// `send` and `inbox` no longer do (R-C944).
+    pub fn prune(&self) -> StoreResult<()> {
+        let db = self.db()?;
         let now = self.now();
         db.execute("DELETE FROM messages WHERE (state='acked' AND acked_at<=?1-604800) OR (state!='acked' AND created_at<=?1-2592000)", [now]).map_err(sql_err)?;
         Ok(())
     }
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
+    /// A cheap read that proves the store answers (`/healthz`).
+    pub fn health(&self) -> StoreResult<()> {
+        let db = self.db()?;
+        db.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
+            .map_err(sql_err)?;
+        Ok(())
+    }
+    pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         Self::open_with_clock(path, Arc::new(SystemClock))
     }
-    pub fn open_with_clock(path: impl AsRef<Path>, clock: Arc<dyn Clock>) -> Result<Self, String> {
+    pub fn open_with_clock(path: impl AsRef<Path>, clock: Arc<dyn Clock>) -> StoreResult<Self> {
         let db = Connection::open(path).map_err(sql_err)?;
         let store = Self::init(db, clock)?;
         store.prune()?;
         Ok(store)
     }
-    pub fn memory() -> Result<Self, String> {
+    pub fn memory() -> StoreResult<Self> {
         Self::memory_with_clock(Arc::new(SystemClock))
     }
-    pub fn memory_with_clock(clock: Arc<dyn Clock>) -> Result<Self, String> {
+    pub fn memory_with_clock(clock: Arc<dyn Clock>) -> StoreResult<Self> {
         Self::init(Connection::open_in_memory().map_err(sql_err)?, clock)
     }
-    fn init(db: Connection, clock: Arc<dyn Clock>) -> Result<Self, String> {
+    fn init(db: Connection, clock: Arc<dyn Clock>) -> StoreResult<Self> {
         db.busy_timeout(Duration::from_secs(5)).map_err(sql_err)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS sessions (
@@ -199,36 +365,91 @@ impl Store {
               SELECT thread_id, MAX(seq) FROM messages GROUP BY thread_id
               ON CONFLICT(thread_id) DO UPDATE SET high_water=MAX(high_water, excluded.high_water);
             CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value BLOB NOT NULL);").map_err(sql_err)?;
-        let mut key = [0u8; 32];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut key))
-            .map_err(|e| format!("audit key generation: {e}"))?;
-        db.execute(
-            "INSERT OR IGNORE INTO settings(name,value) VALUES('audit_hmac_key',?1)",
-            [&key[..]],
-        )
-        .map_err(sql_err)?;
-        Ok(Self(Mutex::new(db), clock))
-    }
-    pub fn body_hmac(&self, body: &str) -> Result<String, String> {
-        let db = self.0.lock().map_err(|_| "store lock poisoned")?;
-        let key: Vec<u8> = db
-            .query_row(
-                "SELECT value FROM settings WHERE name='audit_hmac_key'",
-                [],
-                |r| r.get(0),
+        // v0.3.0 (R-C944) session columns, added in place to a v0.2 store:
+        // the session id `peers` deduplicates on, the registration sequence
+        // that decides which row of a session is latest, and the nonce the
+        // end token is derived from. A v0.2 row has no nonce, so it cannot be
+        // ended; it decays to gone instead.
+        let columns: Vec<String> = db
+            .prepare("SELECT name FROM pragma_table_info('sessions')")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<_, _>>()
+            })
+            .map_err(sql_err)?;
+        for (column, ddl) in [
+            ("session_id", "ALTER TABLE sessions ADD COLUMN session_id TEXT"),
+            (
+                "registered_seq",
+                "ALTER TABLE sessions ADD COLUMN registered_seq INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("token_nonce", "ALTER TABLE sessions ADD COLUMN token_nonce BLOB"),
+        ] {
+            if !columns.iter().any(|c| c == column) {
+                db.execute(ddl, []).map_err(sql_err)?;
+            }
+        }
+        let unfilled: Vec<String> = db
+            .prepare("SELECT agent_id FROM sessions WHERE session_id IS NULL")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<_, _>>()
+            })
+            .map_err(sql_err)?;
+        for id in unfilled {
+            db.execute(
+                "UPDATE sessions SET session_id=?2 WHERE agent_id=?1",
+                params![id, session_of(&id)],
             )
             .map_err(sql_err)?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(&key).map_err(|e| e.to_string())?;
-        mac.update(body.as_bytes());
-        Ok(mac
-            .finalize()
-            .into_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect())
+        }
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS sessions_by_session ON sessions(session_id, registered_seq);",
+        )
+        .map_err(sql_err)?;
+        for name in ["audit_hmac_key", "end_token_key"] {
+            let key = random_bytes::<32>()?;
+            db.execute(
+                "INSERT OR IGNORE INTO settings(name,value) VALUES(?1,?2)",
+                params![name, &key[..]],
+            )
+            .map_err(sql_err)?;
+        }
+        Ok(Self(Mutex::new(db), clock))
     }
-    pub fn register(&self, input: &Value) -> Result<Value, String> {
+    fn keyed_mac(db: &Connection, key_name: &str) -> StoreResult<Hmac<Sha256>> {
+        let key: Vec<u8> = db
+            .query_row("SELECT value FROM settings WHERE name=?1", [key_name], |r| {
+                r.get(0)
+            })
+            .map_err(sql_err)?;
+        Hmac::<Sha256>::new_from_slice(&key)
+            .map_err(|e| StoreError::new(ErrorKind::Internal, e.to_string()))
+    }
+    pub fn body_hmac(&self, body: &str) -> StoreResult<String> {
+        let db = self.db()?;
+        let mut mac = Self::keyed_mac(&db, "audit_hmac_key")?;
+        mac.update(body.as_bytes());
+        Ok(hex(&mac.finalize().into_bytes()))
+    }
+    /// The end token of one registration: HMAC(end_token_key, agent id,
+    /// nonce). Nothing secret is stored beside the key, and a new nonce
+    /// (new session row, new `proc_start`, or a register after `end`)
+    /// invalidates every earlier token.
+    fn end_token_mac(db: &Connection, agent_id: &str, nonce: &[u8]) -> StoreResult<Hmac<Sha256>> {
+        let mut mac = Self::keyed_mac(db, "end_token_key")?;
+        mac.update(b"swb-end-token-v1\0");
+        mac.update(agent_id.as_bytes());
+        mac.update(b"\0");
+        mac.update(nonce);
+        Ok(mac)
+    }
+    /// Register (or re-register) a self-asserted session and return its
+    /// agent id, lease and end token (R-C944). Every registration mints a
+    /// fresh token and invalidates every earlier one, so knowing a row's
+    /// `proc_start` never retrieves the token its registrant holds. A hook
+    /// that registers on every prompt saves the newest token each time.
+    pub fn register(&self, input: &Value) -> StoreResult<Value> {
         let harness = field(input, "harness")?;
         if !matches!(
             harness,
@@ -244,31 +465,99 @@ impl Store {
             .ok_or("invalid pid")?;
         let session_id = field(input, "session_id")?;
         let proc_start = field(input, "proc_start")?;
+        if proc_start.len() > 256 || proc_start.chars().any(char::is_control) {
+            return Err("invalid proc_start".into());
+        }
         let id = format!("{harness}:{host}:{pid}:{session_id}");
         if !valid_agent_id(&id) {
             return Err("invalid agent id".into());
         }
-        let db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let mut db = self.db()?;
         let now = self.now();
-        db.execute("INSERT INTO sessions(agent_id,harness,host,proc_start,last_seen) VALUES(?1,?2,?3,?4,?5)
-                    ON CONFLICT(agent_id) DO UPDATE SET proc_start=excluded.proc_start,last_seen=excluded.last_seen,ended=0",
-            params![id,harness,host,proc_start,now]).map_err(sql_err)?;
-        Ok(json!({"agent_id":id,"lease_seconds":900}))
-    }
-    pub fn end(&self, me: &str, proc_start: &str) -> Result<Value, String> {
-        let db = self.0.lock().map_err(|_| "store lock poisoned")?;
-        let changed = db
-            .execute(
-                "UPDATE sessions SET ended=1 WHERE agent_id=?1 AND proc_start=?2",
-                params![me, proc_start],
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let nonce = random_bytes::<16>()?.to_vec();
+        tx.execute("INSERT INTO counters(name,value) VALUES('registrations',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
+        let seq: i64 = tx
+            .query_row(
+                "SELECT value FROM counters WHERE name='registrations'",
+                [],
+                |r| r.get(0),
             )
             .map_err(sql_err)?;
-        Ok(json!({"agent_id":me,"state":if changed == 1 {"ended"} else {"unknown"}}))
+        tx.execute("INSERT INTO sessions(agent_id,harness,host,proc_start,last_seen,session_id,registered_seq,token_nonce) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                    ON CONFLICT(agent_id) DO UPDATE SET proc_start=excluded.proc_start,last_seen=excluded.last_seen,ended=0,
+                      session_id=excluded.session_id,registered_seq=excluded.registered_seq,token_nonce=excluded.token_nonce",
+            params![id,harness,host,proc_start,now,session_id,seq,nonce]).map_err(sql_err)?;
+        let token = hex(&Self::end_token_mac(&tx, &id, &nonce)?
+            .finalize()
+            .into_bytes());
+        tx.commit().map_err(sql_err)?;
+        Ok(json!({"agent_id":id,"lease_seconds":LEASE_SECONDS,"end_token":token}))
     }
-    pub fn peers(&self, me: Option<&str>) -> Result<Value, String> {
-        let db = self.0.lock().map_err(|_| "store lock poisoned")?;
+    /// End a session. Only the end token its latest registration returned
+    /// ends it; any other token, or an unknown session, answers `unknown`
+    /// without saying which (R-C944).
+    pub fn end(&self, me: &str, end_token: &str) -> StoreResult<Value> {
+        if !valid_agent_id(me) {
+            return Err("invalid me".into());
+        }
+        if end_token.len() != END_TOKEN_HEX_LEN {
+            return Err("invalid end_token".into());
+        }
+        let presented = unhex(end_token).ok_or("invalid end_token")?;
+        let db = self.db()?;
+        let nonce: Option<Option<Vec<u8>>> = db
+            .query_row(
+                "SELECT token_nonce FROM sessions WHERE agent_id=?1",
+                [me],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let matches = match nonce.flatten() {
+            Some(nonce) => Self::end_token_mac(&db, me, &nonce)?
+                .verify_slice(&presented)
+                .is_ok(),
+            None => false,
+        };
+        if matches {
+            db.execute("UPDATE sessions SET ended=1 WHERE agent_id=?1", [me])
+                .map_err(sql_err)?;
+        }
+        Ok(json!({"agent_id":me,"state":if matches {"ended"} else {"unknown"}}))
+    }
+    /// List sessions (R-C944): live only unless `all`, one row per
+    /// (harness, host, session id) (the latest registration wins), ordered
+    /// by agent id, paginated by `cursor`. Rows never carry `proc_start`; a
+    /// caller may filter on one it already knows. A registered `me`
+    /// refreshes its own lease first; listing alone refreshes nothing.
+    pub fn peers(&self, query: &PeersQuery) -> StoreResult<Value> {
+        if let Some(host) = query.host
+            && !valid_part(host)
+        {
+            return Err("invalid host".into());
+        }
+        if let Some(cursor) = query.cursor
+            && !valid_agent_id(cursor)
+        {
+            return Err("invalid cursor".into());
+        }
+        if let Some(proc_start) = query.proc_start
+            && (proc_start.is_empty()
+                || proc_start.len() > 256
+                || proc_start.chars().any(char::is_control))
+        {
+            return Err("invalid proc_start".into());
+        }
+        let limit = query
+            .limit
+            .unwrap_or(PEERS_DEFAULT_LIMIT)
+            .clamp(1, PEERS_MAX_LIMIT);
+        let db = self.db()?;
         let now = self.now();
-        if let Some(me) = me {
+        if let Some(me) = query.me {
             if !valid_agent_id(me) {
                 return Err("invalid me".into());
             }
@@ -279,22 +568,53 @@ impl Store {
                 )
                 .map_err(sql_err)?;
             if updated == 0 {
-                return Err("unregistered me".into());
+                return Err(StoreError::new(ErrorKind::Unregistered, "unregistered me"));
             }
         }
-        let mut stmt = db.prepare("SELECT agent_id,harness,host,proc_start,last_seen,ended FROM sessions ORDER BY agent_id").map_err(sql_err)?;
-        let rows = stmt.query_map([], |r| {
-            let seen: i64 = r.get(4)?; let ended: i64 = r.get(5)?;
-            Ok(json!({"agent_id":r.get::<_,String>(0)?,"harness":r.get::<_,String>(1)?,"host":r.get::<_,String>(2)?,
-                "proc_start":r.get::<_,String>(3)?,"last_seen":seen,
-                "state":if ended != 0 {"ended"} else if seen >= now-900 {"live"} else if seen >= now-21600 {"idle"} else {"gone"}}))
-        }).map_err(sql_err)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map(|v| json!({"peers":v}))
-            .map_err(sql_err)
+        let mut stmt = db
+            .prepare(
+                "WITH latest AS (
+                   SELECT agent_id,harness,host,proc_start,last_seen,ended,
+                     ROW_NUMBER() OVER (PARTITION BY harness,host,COALESCE(session_id,agent_id)
+                                        ORDER BY registered_seq DESC, agent_id DESC) AS pos
+                   FROM sessions)
+                 SELECT agent_id,harness,host,last_seen,ended FROM latest
+                 WHERE pos=1 AND (?1 IS NULL OR host=?1) AND (?2 IS NULL OR agent_id>?2)
+                   AND (?3 OR (ended=0 AND last_seen>=?4-?5))
+                   AND (?7 IS NULL OR proc_start=?7)
+                 ORDER BY agent_id LIMIT ?6",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    query.host,
+                    query.cursor,
+                    query.all,
+                    now,
+                    LEASE_SECONDS,
+                    i64::from(limit) + 1,
+                    query.proc_start
+                ],
+                |r| {
+                    let seen: i64 = r.get(3)?;
+                    let ended: i64 = r.get(4)?;
+                    Ok(json!({"agent_id":r.get::<_,String>(0)?,"harness":r.get::<_,String>(1)?,
+                        "host":r.get::<_,String>(2)?,"last_seen":seen,
+                        "state":lease_state(seen, ended != 0, now)}))
+                },
+            )
+            .map_err(sql_err)?;
+        let mut peers = rows.collect::<Result<Vec<_>, _>>().map_err(sql_err)?;
+        let next_cursor = if peers.len() > limit as usize {
+            peers.truncate(limit as usize);
+            peers.last().map(|row| row["agent_id"].clone())
+        } else {
+            None
+        };
+        Ok(json!({"peers":peers,"next_cursor":next_cursor}))
     }
-    pub fn send(&self, input: &Value) -> Result<SendOutcome, String> {
-        self.prune()?;
+    pub fn send(&self, input: &Value) -> StoreResult<SendOutcome> {
         let sender = field(input, "from")?;
         let recipient = field(input, "to")?;
         if !valid_agent_id(sender) || !valid_agent_id(recipient) {
@@ -422,7 +742,7 @@ impl Store {
                 .and_then(Value::as_u64)
                 .map(|n| n.min(u32::MAX as u64) as u32),
         );
-        let mut db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let mut db = self.db()?;
         let now = self.now();
         if let Some(value) = input.get("reply_expires") {
             let stamp = value
@@ -450,9 +770,10 @@ impl Store {
         if let Some((old_sender, old_body, envelope)) = old {
             // SWB-R46: disclose neither the stored receipt nor its metadata on conflict.
             if old_sender != sender || old_body != body {
-                return Err("msg_id conflict".into());
+                return Err(StoreError::new(ErrorKind::Conflict, "msg_id conflict"));
             }
-            let envelope = serde_json::from_str(&envelope).map_err(|e| e.to_string())?;
+            let envelope = serde_json::from_str(&envelope)
+                .map_err(|e| StoreError::new(ErrorKind::Internal, e.to_string()))?;
             tx.execute(
                 "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
                 params![sender, now],
@@ -533,12 +854,11 @@ impl Store {
             created: true,
         })
     }
-    pub fn inbox(&self, me: &str, limit: u32) -> Result<Value, String> {
-        self.prune()?;
+    pub fn inbox(&self, me: &str, limit: u32) -> StoreResult<Value> {
         if !valid_agent_id(me) {
             return Err("invalid agent id".into());
         }
-        let mut db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let mut db = self.db()?;
         let now = self.now();
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -562,7 +882,8 @@ impl Store {
         let values = messages
             .into_iter()
             .map(|(id, body)| {
-                let mut v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+                let mut v: Value = serde_json::from_str(&body)
+                    .map_err(|e| StoreError::new(ErrorKind::Internal, e.to_string()))?;
                 let count: i64 = tx
                     .query_row(
                         "SELECT delivery_count FROM messages WHERE msg_id=?1",
@@ -573,15 +894,15 @@ impl Store {
                 v["delivery_count"] = json!(count);
                 Ok(v)
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<StoreResult<Vec<_>>>()?;
         tx.commit().map_err(sql_err)?;
         Ok(json!({"messages":values}))
     }
-    pub fn ack(&self, me: &str, msg_id: &str) -> Result<Value, String> {
+    pub fn ack(&self, me: &str, msg_id: &str) -> StoreResult<Value> {
         if !valid_agent_id(me) || !valid_ulid(msg_id) {
             return Err("invalid identity or msg_id".into());
         }
-        let db = self.0.lock().map_err(|_| "store lock poisoned")?;
+        let db = self.db()?;
         let now = self.now();
         let n = db.execute("UPDATE messages SET state='acked',acked_at=?3 WHERE msg_id=?1 AND recipient=?2 AND expires_at>?3 AND state IN ('queued','notified','fetched')",params![msg_id,me,now]).map_err(sql_err)?;
         if n == 0 {
@@ -594,7 +915,10 @@ impl Store {
                 .optional()
                 .map_err(sql_err)?;
             if prior.as_deref() != Some("acked") {
-                return Err("message unavailable".into());
+                return Err(StoreError::new(
+                    ErrorKind::Unavailable,
+                    "message unavailable",
+                ));
             }
         }
         db.execute(
@@ -604,8 +928,8 @@ impl Store {
         .map_err(sql_err)?;
         Ok(json!({"msg_id":msg_id,"state":"acked"}))
     }
-    pub fn metrics(&self) -> Result<String, String> {
-        let db = self.0.lock().map_err(|_| "store lock poisoned")?;
+    pub fn metrics(&self) -> StoreResult<String> {
+        let db = self.db()?;
         let now = self.now();
         let sent: i64 = db
             .query_row(
@@ -646,6 +970,26 @@ mod tests {
         (Store::memory_with_clock(clock.clone()).unwrap(), clock)
     }
 
+    fn all() -> PeersQuery<'static> {
+        PeersQuery {
+            all: true,
+            ..PeersQuery::default()
+        }
+    }
+
+    fn refresh(me: &str) -> PeersQuery<'_> {
+        PeersQuery {
+            me: Some(me),
+            all: true,
+            ..PeersQuery::default()
+        }
+    }
+
+    fn reg(s: &Store, harness: &str, host: &str, pid: u32, session: &str, proc_start: &str) -> Value {
+        s.register(&json!({"harness":harness,"host":host,"pid":pid,"session_id":session,"proc_start":proc_start}))
+            .unwrap()
+    }
+
     fn row_count(s: &Store) -> i64 {
         s.0.lock()
             .unwrap()
@@ -681,8 +1025,8 @@ mod tests {
     fn lease_bands_follow_the_injected_clock() {
         let (s, clock) = clocked();
         let me = s.register(&json!({"harness":"claude","host":"honey","pid":1,"session_id":"a","proc_start":"1"})).unwrap()["agent_id"].as_str().unwrap().to_owned();
-        let state = |s: &Store| s.peers(None).unwrap()["peers"][0]["state"].clone();
-        assert_eq!(s.peers(None).unwrap()["peers"][0]["last_seen"], T0);
+        let state = |s: &Store| s.peers(&all()).unwrap()["peers"][0]["state"].clone();
+        assert_eq!(s.peers(&all()).unwrap()["peers"][0]["last_seen"], T0);
         clock.advance(900);
         assert_eq!(state(&s), "live");
         clock.advance(1);
@@ -696,7 +1040,7 @@ mod tests {
         );
         clock.advance(1);
         assert_eq!(state(&s), "gone");
-        let renewed = s.peers(Some(&me)).unwrap();
+        let renewed = s.peers(&refresh(&me)).unwrap();
         assert_eq!(renewed["peers"][0]["state"], "live");
         assert_eq!(renewed["peers"][0]["last_seen"], T0 + 21601);
         assert!(
@@ -770,19 +1114,241 @@ mod tests {
         assert_eq!(effective_ttl_hours(Some(0)), 1);
     }
     #[test]
-    fn end_requires_matching_process_start() {
+    fn end_requires_the_latest_registration_token() {
         let s = Store::memory().unwrap();
-        let registration = s
-            .register(&json!({
-                "harness":"claude","host":"honey","pid":10,
-                "session_id":"same","proc_start":"new"
-            }))
+        let first = reg(&s, "claude", "honey", 10, "same", "start-1");
+        let me = first["agent_id"].as_str().unwrap();
+        let token = first["end_token"].as_str().unwrap().to_owned();
+        assert_eq!(token.len(), END_TOKEN_HEX_LEN);
+        // The listing never carries proc_start or a token.
+        let listed = s.peers(&all()).unwrap().to_string();
+        assert!(!listed.contains("start-1") && !listed.contains(&token), "{listed}");
+        assert!(!listed.contains("proc_start"), "{listed}");
+        // A forged or malformed token ends nothing, and says nothing.
+        let forged = "0".repeat(END_TOKEN_HEX_LEN);
+        assert_eq!(s.end(me, &forged).unwrap()["state"], "unknown");
+        assert_eq!(s.end(me, "start-1").unwrap_err(), "invalid end_token");
+        assert_eq!(s.end(me, &token.to_uppercase()).unwrap_err(), "invalid end_token");
+        assert_eq!(s.end("codex:honey:9:none", &token).unwrap()["state"], "unknown");
+        assert_eq!(s.peers(&all()).unwrap()["peers"][0]["state"], "live");
+        // Every register rotates the token, even with the same proc_start,
+        // so knowing proc_start never retrieves the live token.
+        let again = reg(&s, "claude", "honey", 10, "same", "start-1");
+        assert_ne!(again["end_token"], token.as_str());
+        assert_eq!(s.end(me, &token).unwrap()["state"], "unknown");
+        let rotated = reg(&s, "claude", "honey", 10, "same", "start-2");
+        assert_ne!(rotated["end_token"], again["end_token"]);
+        assert_eq!(s.end(me, again["end_token"].as_str().unwrap()).unwrap()["state"], "unknown");
+        let current = rotated["end_token"].as_str().unwrap().to_owned();
+        assert_eq!(s.end(me, &current).unwrap()["state"], "ended");
+        assert_eq!(s.peers(&all()).unwrap()["peers"][0]["state"], "ended");
+        // After end, a register mints a fresh token even with the same proc_start.
+        let revived = reg(&s, "claude", "honey", 10, "same", "start-2");
+        assert_ne!(revived["end_token"], current.as_str());
+        assert_eq!(s.end(me, &current).unwrap()["state"], "unknown");
+    }
+
+    #[test]
+    fn peers_defaults_to_live_bounded_and_one_row_per_session() {
+        let (s, clock) = clocked();
+        for pid in 1..=5 {
+            reg(&s, "claude", "honey", pid, &format!("s{pid}"), "p");
+        }
+        clock.advance(901);
+        reg(&s, "pi", "sting", 7, "fresh", "p");
+        // An older registration of the same session, from another process
+        // of the same harness on the same host.
+        reg(&s, "codex", "sting", 8, "shared", "p");
+        reg(&s, "codex", "sting", 9, "shared", "p");
+        // A fixed session label (a Junie IDE channel) on another host, and
+        // another harness on the same host, are different sessions.
+        reg(&s, "codex", "honey", 10, "shared", "p");
+        reg(&s, "junie", "sting", 11, "shared", "p");
+        let ids_of = |page: &Value| -> Vec<String> {
+            page["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["agent_id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let live = s.peers(&PeersQuery::default()).unwrap();
+        assert_eq!(
+            ids_of(&live),
+            vec![
+                "codex:honey:10:shared",
+                "codex:sting:9:shared",
+                "junie:sting:11:shared",
+                "pi:sting:7:fresh"
+            ]
+        );
+        assert_eq!(live["next_cursor"], Value::Null);
+        // The latest registration of a session wins, whichever is newer.
+        reg(&s, "codex", "sting", 8, "shared", "p");
+        assert_eq!(
+            ids_of(&s.peers(&PeersQuery::default()).unwrap()),
+            vec![
+                "codex:honey:10:shared",
+                "codex:sting:8:shared",
+                "junie:sting:11:shared",
+                "pi:sting:7:fresh"
+            ]
+        );
+        // A host filter never hides that host's own row behind another
+        // host's registration of the same label.
+        assert_eq!(
+            ids_of(
+                &s.peers(&PeersQuery {
+                    host: Some("honey"),
+                    ..PeersQuery::default()
+                })
+                .unwrap()
+            ),
+            vec!["codex:honey:10:shared"]
+        );
+        // A caller can filter on a proc_start it knows; rows never show it.
+        reg(&s, "claude", "honey", 12, "own", "start-x");
+        assert_eq!(
+            ids_of(
+                &s.peers(&PeersQuery {
+                    all: true,
+                    host: Some("honey"),
+                    proc_start: Some("start-x"),
+                    ..PeersQuery::default()
+                })
+                .unwrap()
+            ),
+            vec!["claude:honey:12:own"]
+        );
+        assert_eq!(
+            s.peers(&PeersQuery {
+                proc_start: Some(""),
+                ..PeersQuery::default()
+            })
+            .unwrap_err(),
+            "invalid proc_start"
+        );
+        // all=true pages through every session, idle ones included.
+        let mut cursor: Option<String> = None;
+        let mut seen = Vec::new();
+        loop {
+            let page = s
+                .peers(&PeersQuery {
+                    all: true,
+                    limit: Some(2),
+                    cursor: cursor.as_deref(),
+                    ..PeersQuery::default()
+                })
+                .unwrap();
+            let rows = page["peers"].as_array().unwrap();
+            assert!(rows.len() <= 2);
+            seen.extend(rows.iter().map(|p| p["agent_id"].as_str().unwrap().to_owned()));
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 10, "{seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]));
+        let sting = s
+            .peers(&PeersQuery {
+                all: true,
+                host: Some("sting"),
+                ..PeersQuery::default()
+            })
             .unwrap();
-        let me = registration["agent_id"].as_str().unwrap();
-        assert_eq!(s.end(me, "old").unwrap()["state"], "unknown");
-        assert_eq!(s.peers(None).unwrap()["peers"][0]["state"], "live");
-        assert_eq!(s.end(me, "new").unwrap()["state"], "ended");
-        assert_eq!(s.peers(None).unwrap()["peers"][0]["state"], "ended");
+        assert_eq!(sting["peers"].as_array().unwrap().len(), 3);
+        let bounded = s
+            .peers(&PeersQuery {
+                all: true,
+                limit: Some(10_000),
+                ..PeersQuery::default()
+            })
+            .unwrap();
+        assert_eq!(bounded["peers"].as_array().unwrap().len(), 10);
+        assert_eq!(
+            s.peers(&PeersQuery {
+                cursor: Some("not an id"),
+                ..PeersQuery::default()
+            })
+            .unwrap_err(),
+            "invalid cursor"
+        );
+        assert_eq!(
+            s.peers(&PeersQuery {
+                host: Some("a/b"),
+                ..PeersQuery::default()
+            })
+            .unwrap_err(),
+            "invalid host"
+        );
+    }
+
+    #[test]
+    fn a_v02_store_gains_the_new_columns_and_its_rows_cannot_be_ended() {
+        let path = std::env::temp_dir().join(format!("swb-migrate-{}.sqlite3", Ulid::new()));
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch("CREATE TABLE sessions (
+                agent_id TEXT PRIMARY KEY, harness TEXT NOT NULL, host TEXT NOT NULL,
+                proc_start TEXT NOT NULL, last_seen INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0);
+                INSERT INTO sessions VALUES('claude:honey:1:old','claude','honey','p',unixepoch(),0);").unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let listed = s.peers(&PeersQuery::default()).unwrap();
+        assert_eq!(listed["peers"][0]["agent_id"], "claude:honey:1:old");
+        let session: String =
+            s.0.lock()
+                .unwrap()
+                .query_row("SELECT session_id FROM sessions", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(session, "old");
+        assert_eq!(
+            s.end("claude:honey:1:old", &"a".repeat(64)).unwrap()["state"],
+            "unknown"
+        );
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn send_and_inbox_leave_retention_to_the_interval() {
+        let (s, clock) = clocked();
+        let to = "pi:sting:2:b";
+        let id = s
+            .send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"x"}))
+            .unwrap()
+            .envelope["msg_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        s.ack(to, &id).unwrap();
+        clock.advance(604_800);
+        s.send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"y"}))
+            .unwrap();
+        s.inbox(to, 10).unwrap();
+        assert_eq!(row_count(&s), 2, "send or inbox pruned");
+        s.prune().unwrap();
+        assert_eq!(row_count(&s), 1);
+    }
+
+    #[test]
+    fn errors_carry_a_kind_and_a_code() {
+        let s = Store::memory().unwrap();
+        assert_eq!(
+            s.ack("pi:sting:2:b", "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+                .unwrap_err()
+                .code(),
+            "message_unavailable"
+        );
+        assert_eq!(s.inbox("nope", 1).unwrap_err().code(), "invalid_argument");
+        let input = json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"a","msg_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"});
+        s.send(&input).unwrap();
+        let mut other = input;
+        other["body"] = json!("b");
+        assert_eq!(s.send(&other).unwrap_err().code(), "msg_id_conflict");
     }
     #[test]
     fn thread_sequence_survives_pruned_latest_ack() {
@@ -886,11 +1452,11 @@ mod tests {
         let sent = s
             .send(&json!({"from":from,"to":to,"ticket":"none","body":"hello"}))
             .unwrap();
-        let peers = s.peers(None).unwrap();
+        let peers = s.peers(&all()).unwrap();
         assert_eq!(peers["peers"][0]["state"], "live");
         assert_eq!(peers["peers"][1]["state"], "gone");
         s.inbox(to, 1).unwrap();
-        let peers = s.peers(None).unwrap();
+        let peers = s.peers(&all()).unwrap();
         assert_eq!(peers["peers"][1]["state"], "live");
         s.0.lock()
             .unwrap()
@@ -898,7 +1464,7 @@ mod tests {
             .unwrap();
         s.ack(to, sent.envelope["msg_id"].as_str().unwrap())
             .unwrap();
-        let peers = s.peers(None).unwrap();
+        let peers = s.peers(&all()).unwrap();
         assert_eq!(peers["peers"][0]["state"], "gone");
         assert_eq!(peers["peers"][1]["state"], "live");
     }
@@ -917,15 +1483,19 @@ mod tests {
             .unwrap()
             .execute("UPDATE sessions SET last_seen=unixepoch()-30000", [])
             .unwrap();
-        let passive = s.peers(None).unwrap();
+        let passive = s.peers(&all()).unwrap();
         assert_eq!(passive["peers"][0]["state"], "gone");
         assert_eq!(passive["peers"][1]["state"], "gone");
         assert_eq!(
-            s.peers(Some("codex:honey:3:unknown")).unwrap_err(),
+            s.peers(&refresh("codex:honey:3:unknown")).unwrap_err(),
             "unregistered me"
         );
-        assert_eq!(s.peers(Some("invalid")).unwrap_err(), "invalid me");
-        let active = s.peers(Some(caller)).unwrap();
+        assert_eq!(s.peers(&refresh("invalid")).unwrap_err(), "invalid me");
+        assert_eq!(
+            s.peers(&refresh("codex:honey:3:unknown")).unwrap_err().kind,
+            ErrorKind::Unregistered
+        );
+        let active = s.peers(&refresh(caller)).unwrap();
         assert_eq!(active["peers"][0]["agent_id"], caller);
         assert_eq!(active["peers"][0]["state"], "live");
         assert_eq!(active["peers"][1]["agent_id"], other);

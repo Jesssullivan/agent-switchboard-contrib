@@ -87,30 +87,42 @@ registered once on the tailnet so that new harness instances spawn nothing.
     the stdio Claude Code channel emitter (SWB-R56, v0.2.0). `agentd` is
     planned for P2 and exits 3;
   - `serve` exposes `:8080/mcp`, a REST twin `/v1/*` for hooks, and
-    `:9090/metrics` inside the cluster.
+    `:9090/metrics` inside the cluster. `/healthz` answers on both
+    listeners (v0.3.0, R-C944).
 - **Storage:**
   - SQLite (WAL, `synchronous=FULL`, single writer) on a 1 GiB PVC, in a
     one-replica StatefulSet;
   - a Litestream sidecar replicates to RustFS;
   - it holds coordination state only. Findings stay in repo notes or Linear.
 - **Identity:** `harness:host:pid:session_id`, plus `proc_start` to guard
-  against PID reuse. How each harness supplies it:
+  against PID reuse. Since v0.3.0 (R-C944) `register` returns a per-session
+  end token, and `end` accepts nothing else. Every `register` mints a new
+  token and invalidates the earlier one. `peers` never returns `proc_start`
+  or a token. The token means a caller cannot end a session without
+  registering it: since v0.2, `peers` handed out the `proc_start` that
+  `end` checked. It is **not** takeover-proof. Identity stays
+  self-asserted, so anyone who can register may re-register any agent id,
+  receive a fresh token and end that session. Over MCP the token is part
+  of the `register` result and so enters the calling model's context. `swb whoami` prints the identity without a broker
+  call, and `swb whoami --register` registers it (details:
+  `docs/releases/v0.3.0-migration.md`). How each harness supplies it:
   - Claude and Kimi: the SessionStart hook passes `session_id`, and
     `kimi-claude.sh` exports `SWB_HARNESS=kimi`.
-  - Codex: `swb whoami` calls `register`, the same path as Junie, OpenCode
+  - Codex: `swb whoami --register` (plain `swb whoami` before v0.3.0) calls `register`, the same path as Junie, OpenCode
     and Pi. Codex's `notify` is a runtime-owned top-level scalar that
     already carries the computer-use `turn-ended` hook on neo, so Home
     Manager declares no `notify` and no new table for the switchboard
     (critique fix adopted 2026-09-25 under R0 ruling 3; evidence in
     ADR-0002 → Enrollment). A fan-out `notify` wrapper that chains the
-    existing program would need its own ruling. **How `swb whoami` binds
-    to the calling Codex session is unproven** (no lane evidence): the
+    existing program would need its own ruling. **How `swb whoami --register`
+    binds to the calling Codex session is unproven** (no lane evidence): the
     binding must be something Codex hands the tool process — an
     environment variable or a per-session path it exposes — recorded with
     evidence in the P1b receipt, and never derived from pid ancestry
     (the R-N11 corollary). Until then Codex registration is its own P1b
     sub-exit, and the round trip does not silently depend on it.
-  - Junie, OpenCode, Pi: `swb whoami` reads `~/.junie/processes/*.json` and
+  - Junie, OpenCode, Pi: `swb whoami --register` (plain `swb whoami`
+    before v0.3.0) reads `~/.junie/processes/*.json` and
     `~/.pi/agent/sessions` read-only, then calls `register`.
   - Every tool takes an explicit `me`, because the mcp-mux gateway hides
     Junie's MCP session id.
@@ -285,11 +297,13 @@ registered once on the tailnet so that new harness instances spawn nothing.
     the session's `SWB_*` environment (R-C273). It finds its agent id from
     `SWB_AGENT_ID`, or from `SWB_HARNESS` plus `SWB_SESSION_ID`, or else
     from the newest non-ended broker row for this `SWB_HOST` and
-    `SWB_SESSION_PID` (and `SWB_PROC_START`, while `peers` lists it).
+    `SWB_SESSION_PID`, filtered by the broker on its own `SWB_PROC_START`
+    (`POST /v1/peers {all, host, proc_start}`; v0.3.0 never lists
+    `proc_start`), so a crashed session that reused the pid is not picked.
     Claude Code exports no session id to an MCP server, and the hook
     registers the row at SessionStart. The lookup follows `/clear` and
     resume.
-  - It reads `GET /v1/inbox?wait_seconds=0` every `SWB_CHANNEL_POLL_SECONDS`
+  - It reads `POST /v1/inbox` with `wait_seconds=0` (a GET before v0.3.0) every `SWB_CHANNEL_POLL_SECONDS`
     (default 5 s, clamped to 2–60 s), each request on the 1.5 s bounded
     client. When every unacknowledged message on the page was already
     emitted it waits 30 s. A failed poll backs off, doubling up to 60 s,
@@ -469,17 +483,20 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
     a delivery. A cross-site page that already knows an agent id
     (`harness:host:pid:session_id`) can trigger these blind. It cannot read
     the reply, cannot register, send or ack, and fetched messages stay
-    deliverable. Closing it means making those reads side-effect free or
-    moving the heartbeat to a POST, which changes the REST contract and
-    needs its own ruling.
+    deliverable. **Closed in v0.3.0 (R-C944):** the lease refresh and the
+    inbox fetch moved to `POST /v1/peers` and `POST /v1/inbox` with JSON
+    bodies, and `GET /v1/peers?me=` and `GET /v1/inbox` answer 405. A JSON
+    POST needs a CORS preflight from a browser, and the Origin check refuses
+    it in any case. Passive `GET /v1/peers` stays, with no side effect.
   - Every refusal is HTTP 403 with a JSON `error` (`missing host`, `host not
     allowed` or `origin not allowed`), returned before any handler reads a
     body or touches the store.
   - **Metrics is not guarded.** `/metrics` lives on the separate metrics
     listener, serves three aggregate counters with no agent id or body, and
     Prometheus scrapes it by pod address, which no Host allowlist names.
-    The deployment keeps that listener off the tailnet Service. There is no
-    `/healthz`; if one is added on the main listener it is guarded too.
+    The deployment keeps that listener off the tailnet Service. `/healthz`
+    (v0.3.0, R-C944) is Host-guarded on the main listener and open on the
+    metrics listener for probes; it carries no identity.
   - The guard ships as v0.2.2 (SWB-R59, #28 merge `daa6d59f`).
 - **Accepted trade-off:** anything that reaches `tag:k8s:*` can reach the
   broker. `authority: peer` stamping limits the damage. So does the fact that
@@ -719,7 +736,8 @@ that stops, restarts or scales a process is performed by the operator
     the rendered `settingsJson.telemetry.enabled` key is checked against
     upstream and removed if it is the inert key the research found, or the
     reason it stays is recorded ("remove false artifacts as you go").
-  - Codex registers through `swb whoami` (Identity). No `notify` change.
+  - Codex registers through `swb whoami --register` (Identity; plain
+    `swb whoami` registered before v0.3.0). No `notify` change.
   - Lab adds a new `peer-dialog` skill, with #1920 as its degraded transport
     and the ADR-0002 lookup recipes with their caveats.
   - Pi's `agents` profile lands here (SWB-R37) through lab's

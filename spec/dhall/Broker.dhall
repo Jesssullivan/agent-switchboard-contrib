@@ -19,12 +19,24 @@ let LeaseState =
       -- peers() classification in swb-store: ended wins, then age bands.
       < live | idle | gone | ended >
 
-in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229" ]
+in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C944" ]
     , session =
       { lease_seconds = 900
       , live_max_age_seconds = 900
       , idle_max_age_seconds = 21600
       , states = [ LeaseState.live, LeaseState.idle, LeaseState.gone, LeaseState.ended ]
+      , -- R-C944 (v0.3.0): register returns a 64-hex end token; end accepts
+        -- nothing else. Every register rotates it and invalidates the old one.
+        end_token_hex_length = 64
+      }
+    , peers =
+      -- R-C944 (v0.3.0): peers lists live sessions unless asked for all, one
+      -- row per (harness, host, session id) (the latest registration wins),
+      -- paginated, and never returns proc_start.
+      { default_states = [ LeaseState.live ]
+      , default_limit = 50
+      , max_limit = 200
+      , dedup_key = [ "harness", "host", "session_id" ]
       }
     , message =
       { ttl_default_hours = 72
