@@ -5,6 +5,7 @@
 -- while another session holds any active claim on the subject; a
 -- non-exclusive request is always recorded and lists every other holder; a
 -- repeat exclusive request by the current exclusive holder renews its claim;
+-- any other repeat request by a holder updates its one claim on the subject;
 -- and ending a session releases its claims.
 -- Time is an abstract clock in seconds that only 'Tick' advances.
 --
@@ -219,11 +220,17 @@ step c op s = case op of
         let expiry = now s + claimLeaseSeconds c lease
             live r = crSubject r == subj && crUntil r > now s
             others = sort (nub [crHolder r | r <- claims s, live r, crHolder r /= h])
-            own r = live r && crHolder r == h && crExclusive r
-            renew r = if own r then r {crUntil = max (crUntil r) expiry} else r
+            mine r = live r && crHolder r == h
+            ownEx r = mine r && crExclusive r
+            -- A session holds at most one active claim per subject: a repeat
+            -- request extends it, and only ever adds exclusivity.
+            update r
+              | mine r = r {crUntil = max (crUntil r) expiry, crExclusive = crExclusive r || ex}
+              | otherwise = r
             (outcome, s')
-              | ex && any own (claims s) = (Renewed, s {claims = map renew (claims s)})
+              | ex && any ownEx (claims s) = (Renewed, s {claims = map update (claims s)})
               | ex && not (null others) = (Refused others, s)
+              | any mine (claims s) = (Recorded others, s {claims = map update (claims s)})
               | otherwise = (Recorded others, s {claims = claims s ++ [ClaimRec h subj ex expiry]})
          in (RClaimed outcome, refresh h s')
   ListClaims ->

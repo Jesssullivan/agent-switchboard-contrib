@@ -42,6 +42,9 @@ pub const CLAIM_RETENTION_SECONDS: i64 = 604_800;
 /// `claims` page size when the caller names none, and the largest it accepts.
 pub const CLAIMS_DEFAULT_LIMIT: u32 = 100;
 pub const CLAIMS_MAX_LIMIT: u32 = 500;
+/// The most open handoffs `claims {me}` lists; `handoffs_truncated` says
+/// when there were more.
+pub const HANDOFFS_LISTED: u32 = 100;
 /// `thread` page size when the caller names none, and the largest it accepts.
 pub const THREAD_DEFAULT_LIMIT: u32 = 20;
 pub const THREAD_MAX_LIMIT: u32 = 100;
@@ -171,8 +174,19 @@ fn active_on(db: &Connection, subject: &str, now: i64) -> StoreResult<Vec<Active
     rows.collect::<Result<_, _>>().map_err(sql_err)
 }
 
+/// One row per holder, in first-claim order: a holder is listed once even
+/// if a store from before claims were per-holder kept two rows, and its
+/// exclusive claim, when it has one, is the one shown.
 fn holder_rows(db: &Connection, claims: &[&Active], now: i64) -> StoreResult<Vec<Value>> {
-    claims
+    let mut picked: Vec<&Active> = Vec::with_capacity(claims.len());
+    for c in claims {
+        match picked.iter_mut().find(|p| p.holder == c.holder) {
+            Some(p) if c.exclusive && !p.exclusive => *p = c,
+            Some(_) => {}
+            None => picked.push(c),
+        }
+    }
+    picked
         .iter()
         .map(|c| {
             Ok(json!({
@@ -382,9 +396,9 @@ impl Store {
             ],
         )?;
         let me = me_of(input)?;
-        let exclusive = match input.get("exclusive") {
-            None | Some(Value::Null) => false,
-            Some(Value::Bool(b)) => *b,
+        let requested_exclusive = match input.get("exclusive") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(b)) => Some(*b),
             Some(_) => return Err("invalid exclusive".into()),
         };
         let lease_hours = match input.get("lease_hours") {
@@ -423,6 +437,7 @@ impl Store {
         // Accepting a handoff: the offer must be open, addressed to me, and
         // its source claim still active in its offerer's hands.
         let mut handoff_from = None;
+        let mut source_exclusive = false;
         let subject = if let Some(hid) = handoff_id {
             let offer: Option<(String, String, String, String)> = tx
                 .query_row(
@@ -439,28 +454,50 @@ impl Store {
             if recipient != me || subject_arg.is_some_and(|s| s != subject) {
                 return Err(unavailable("handoff"));
             }
-            let moved = tx
-                .execute(
-                    "UPDATE claims SET state='handed_off', ended_at=?3, end_reason='handoff'
+            let source_row: Option<i64> = tx
+                .query_row(
+                    "SELECT exclusive FROM claims
                      WHERE claim_id=?1 AND holder=?2 AND state='active' AND expires_at>?3",
                     params![source, sender, now],
+                    |r| r.get(0),
                 )
+                .optional()
                 .map_err(sql_err)?;
-            if moved == 0 {
+            let Some(source_ex) = source_row else {
                 return Err(unavailable("handoff"));
-            }
+            };
+            source_exclusive = source_ex != 0;
+            tx.execute(
+                "UPDATE claims SET state='handed_off', ended_at=?2, end_reason='handoff'
+                 WHERE claim_id=?1",
+                params![source, now],
+            )
+            .map_err(sql_err)?;
             handoff_from = Some(source);
             subject
         } else {
             subject_arg.unwrap_or_default().to_owned()
         };
+        // An accepted handoff keeps the source's exclusivity unless the
+        // receiver asks otherwise; a plain claim is non-exclusive by default.
+        let exclusive = requested_exclusive.unwrap_or(source_exclusive);
+        // Accepting an exclusive claim moves an existing guard rather than
+        // asking for a new one, so it is not refused over the non-exclusive
+        // claims that were already recorded beside it.
+        let transfers_guard = handoff_from.is_some() && source_exclusive && exclusive;
 
+        // A session holds at most one active claim per subject: a repeat
+        // request updates that claim in place.
         let active = active_on(&tx, &subject, now)?;
-        let own_exclusive = active.iter().find(|c| c.holder == me && c.exclusive);
+        let own = active
+            .iter()
+            .find(|c| c.holder == me && c.exclusive)
+            .or_else(|| active.iter().find(|c| c.holder == me));
         let others: Vec<&Active> = active.iter().filter(|c| c.holder != me).collect();
         let overlaps = holder_rows(&tx, &others, now)?;
+        let own_exclusive = own.is_some_and(|c| c.exclusive);
 
-        if exclusive && own_exclusive.is_none() && !others.is_empty() {
+        if exclusive && !own_exclusive && !transfers_guard && !others.is_empty() {
             // R-C950 (1) and SWB-R16: refused, nothing recorded. The lease
             // refresh still counts, like every other call by a registered
             // session; a handoff acceptance is undone with the rest.
@@ -472,20 +509,32 @@ impl Store {
             }));
         }
 
-        let (claim_id, outcome, expires_at) = match own_exclusive {
-            // R-C950 (3): idempotent renewal, same claim id, expiry extended.
-            Some(held) if exclusive => {
+        let (claim_id, outcome, expires_at, exclusive) = match own {
+            // R-C950 (3): a repeat exclusive request by the exclusive holder
+            // is an idempotent renewal. A repeat non-exclusive request, or an
+            // exclusive one over the caller's own advisory claim, updates the
+            // same claim too: it is still recorded (R-C950 (2)), but never a
+            // second row, so a holder appears once in overlaps and held_by.
+            // Exclusivity is only ever added here, never dropped.
+            Some(held) => {
                 let expires = held.expires_at.max(now + lease);
+                let keeps = held.exclusive || exclusive;
                 tx.execute(
-                    "UPDATE claims SET renewed_at=?2, expires_at=?3, note=COALESCE(?4, note)
+                    "UPDATE claims SET renewed_at=?2, expires_at=?3, note=COALESCE(?4, note),
+                            exclusive=?5, handoff_from=COALESCE(?6, handoff_from)
                      WHERE claim_id=?1",
-                    params![held.claim_id, now, expires, note],
+                    params![held.claim_id, now, expires, note, keeps, handoff_from],
                 )
                 .map_err(sql_err)?;
-                (held.claim_id.clone(), "renewed", expires)
+                let outcome = if held.exclusive && exclusive {
+                    "renewed"
+                } else {
+                    "recorded"
+                };
+                (held.claim_id.clone(), outcome, expires, keeps)
             }
             // R-C950 (2) and an unopposed exclusive request: recorded.
-            _ => {
+            None => {
                 let id = Ulid::new().to_string();
                 tx.execute(
                     "INSERT INTO claims(claim_id,subject,holder,exclusive,note,created_at,renewed_at,expires_at,handoff_from)
@@ -499,7 +548,7 @@ impl Store {
                     [],
                 )
                 .map_err(sql_err)?;
-                (id, "recorded", now + lease)
+                (id, "recorded", now + lease, exclusive)
             }
         };
         if let Some(hid) = handoff_id {
@@ -721,7 +770,7 @@ impl Store {
                         query.holder,
                         query.all,
                         now,
-                        i64::from(limit)
+                        i64::from(limit) + 1
                     ],
                     |r| {
                         Ok(ClaimRow {
@@ -742,6 +791,10 @@ impl Store {
                 .map_err(sql_err)?;
             mapped.collect::<Result<_, _>>().map_err(sql_err)?
         };
+        // One row past the page says whether the listing was cut short.
+        let mut rows = rows;
+        let truncated = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
         let mut claims = Vec::with_capacity(rows.len());
         for c in rows {
             let live = c.state == "active" && c.expires_at > now;
@@ -771,7 +824,7 @@ impl Store {
             }
             claims.push(row);
         }
-        let mut result = json!({"claims": claims});
+        let mut result = json!({"claims": claims, "truncated": truncated});
         if let Some(me) = query.me {
             let mut stmt = db
                 .prepare(
@@ -779,11 +832,11 @@ impl Store {
                      FROM handoffs h JOIN claims c ON c.claim_id=h.claim_id
                      WHERE h.state='offered' AND (h.recipient=?1 OR h.sender=?1)
                        AND c.state='active' AND c.expires_at>?2
-                     ORDER BY h.created_at, h.handoff_id LIMIT 100",
+                     ORDER BY h.created_at, h.handoff_id LIMIT ?3",
                 )
                 .map_err(sql_err)?;
-            let offers = stmt
-                .query_map(params![me, now], |r| {
+            let mut offers = stmt
+                .query_map(params![me, now, i64::from(HANDOFFS_LISTED) + 1], |r| {
                     let note: Option<String> = r.get(5)?;
                     Ok(json!({
                         "handoff_id": r.get::<_, String>(0)?, "claim_id": r.get::<_, String>(1)?,
@@ -794,6 +847,8 @@ impl Store {
                 .map_err(sql_err)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(sql_err)?;
+            result["handoffs_truncated"] = json!(offers.len() > HANDOFFS_LISTED as usize);
+            offers.truncate(HANDOFFS_LISTED as usize);
             result["handoffs"] = json!(offers);
         }
         Ok(result)
@@ -948,10 +1003,96 @@ mod tests {
     #[test]
     fn own_advisory_claim_does_not_block_own_exclusive_request() {
         let (s, _) = clocked();
-        claim(&s, A, "TIN-1", false);
+        let first = claim(&s, A, "TIN-1", false);
         let own = claim(&s, A, "TIN-1", true);
         assert_eq!(own["outcome"], "recorded");
         assert_eq!(own["overlaps"], json!([]));
+        // The advisory claim becomes the exclusive one; no second row.
+        assert_eq!(own["claim_id"], first["claim_id"]);
+        assert_eq!(own["exclusive"], true);
+        let rows = listed(&s, "TIN-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["exclusive"], true);
+        assert_eq!(claim(&s, B, "TIN-1", true)["outcome"], "refused");
+    }
+
+    #[test]
+    fn a_repeat_advisory_claim_updates_the_same_claim() {
+        let (s, clock) = clocked();
+        let first = claim(&s, A, "TIN-1", false);
+        clock.advance(60);
+        let again = claim(&s, A, "TIN-1", false);
+        assert_eq!(again["outcome"], "recorded");
+        assert_eq!(again["claim_id"], first["claim_id"]);
+        assert_eq!(again["lease_seconds"], 4 * 3600);
+        assert_eq!(listed(&s, "TIN-1").len(), 1);
+        // Another holder sees A once, in overlaps and in held_by.
+        let b = claim(&s, B, "TIN-1", false);
+        assert_eq!(holders(&b["overlaps"]), [A]);
+        let refused = claim(&s, C, "TIN-1", true);
+        assert_eq!(holders(&refused["held_by"]), [A, B]);
+        // An advisory request never drops an exclusive claim's guard.
+        let (s, _) = clocked();
+        let ex = claim(&s, A, "TIN-2", true);
+        let weaker = claim(&s, A, "TIN-2", false);
+        assert_eq!(weaker["claim_id"], ex["claim_id"]);
+        assert_eq!(weaker["exclusive"], true);
+        assert_eq!(claim(&s, B, "TIN-2", true)["outcome"], "refused");
+        assert!(s.metrics().unwrap().contains("swb_claims_active 1"));
+    }
+
+    #[test]
+    fn an_accepted_exclusive_handoff_keeps_the_guard() {
+        let (s, _) = clocked();
+        let held = claim(&s, A, "TIN-1", true);
+        // An advisory claim beside the exclusive holder is recorded (R-C950 (2)).
+        claim(&s, C, "TIN-1", false);
+        let source = held["claim_id"].as_str().unwrap();
+        let hid = s
+            .handoff(&json!({"me":A,"claim_id":source,"to":B}))
+            .unwrap()["handoff_id"]
+            .clone();
+        // Accepting without --exclusive keeps the source's exclusivity, and
+        // moving that guard is not refused over C's advisory claim.
+        let accepted = s.claim(&json!({"me":B,"handoff_id":hid})).unwrap();
+        assert_eq!(accepted["outcome"], "recorded");
+        assert_eq!(accepted["exclusive"], true);
+        assert_eq!(holders(&accepted["overlaps"]), [C]);
+        assert_eq!(claim(&s, A, "TIN-1", true)["outcome"], "refused");
+    }
+
+    #[test]
+    fn accepting_a_handoff_onto_an_own_claim_records_where_it_came_from() {
+        let (s, _) = clocked();
+        let a = claim(&s, A, "TIN-1", false);
+        let mine = claim(&s, B, "TIN-1", false);
+        let hid = s
+            .handoff(&json!({"me":A,"claim_id":a["claim_id"],"to":B}))
+            .unwrap()["handoff_id"]
+            .clone();
+        let accepted = s.claim(&json!({"me":B,"handoff_id":hid})).unwrap();
+        assert_eq!(accepted["claim_id"], mine["claim_id"]);
+        assert_eq!(accepted["handoff_from"], a["claim_id"]);
+        let rows = listed(&s, "TIN-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["handoff_from"], a["claim_id"]);
+    }
+
+    #[test]
+    fn a_short_page_says_it_was_cut() {
+        let (s, _) = clocked();
+        claim(&s, A, "TIN-1", false);
+        claim(&s, B, "TIN-1", false);
+        let page = |limit| {
+            s.claims(&ClaimsQuery {
+                limit: Some(limit),
+                ..ClaimsQuery::default()
+            })
+            .unwrap()
+        };
+        assert_eq!(page(1)["claims"].as_array().unwrap().len(), 1);
+        assert_eq!(page(1)["truncated"], true);
+        assert_eq!(page(2)["truncated"], false);
     }
 
     #[test]

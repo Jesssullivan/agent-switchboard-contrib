@@ -174,7 +174,23 @@ fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreErro
             println!("{line}");
         }
     }
+    // The one refusal (R-C950 (1)) is logged too, so a blocked exclusive
+    // request leaves a trace; nothing about it was recorded in the store.
+    if name == "claim" && result["outcome"] == json!("refused") {
+        println!("{}", audit_record(name, args, &result, None));
+    }
     if created && matches!(name, "claim" | "release" | "handoff") {
+        // An accepted handoff ends its source claim: that transition gets
+        // its own line, before the receiver's claim.
+        if name == "claim"
+            && let Some(source) = result.get("handoff_from").filter(|v| v.is_string())
+        {
+            let mut line = audit_record("handed_off", args, &result, None);
+            line["claim_id"] = source.clone();
+            line["state"] = json!("handed_off");
+            line["outcome"] = Value::Null;
+            println!("{line}");
+        }
         let mut line = audit_record(name, args, &result, None);
         if name == "release" {
             line["reason"] = json!("released");

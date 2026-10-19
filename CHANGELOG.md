@@ -65,18 +65,23 @@ fallback. Details and the upgrade order:
     holders, nothing recorded) while another session holds any active claim
     on the subject;
   - repeating your own exclusive claim renews it (same `claim_id`, later
-    expiry);
+    expiry); a session holds at most one active claim per subject, so any
+    other repeat updates that claim and a holder is listed once;
   - `end` releases the session's claims at once, returns them in
     `released_claims`, and the broker logs one `release` audit line each.
   - Leases default to 4 h, clamped to 1..24 h; a claim whose holder is
     `gone` shows `orphaned` and is never revoked.
   - `handoff` creates an `offered` receipt; the receiver accepts it with
-    `claim --handoff`, which moves the claim. `release` and `handoff` act
+    `claim --handoff`, which moves the claim and keeps its exclusivity
+    unless the receiver says otherwise. `release` and `handoff` act
     only on the caller's own claims (`claim_unavailable`, 404, otherwise).
   - The store gains `claims` and `handoffs` tables in place on open; claims
     and handoffs are pruned 7 days after they stop being active.
   - `/metrics` adds `swb_claims_active`, `swb_claim_overlaps` and
     `swb_handoffs_total`.
+  - `swb claim` exits 4 when an exclusive claim is refused; refusals and
+    the source side of an accepted handoff each get an audit line; `claims`
+    reports `truncated`.
   - The Linear handoff-receipt comment (SWB-R15) is not posted yet.
 - Formal spec: `Broker.dhall` replaces the `Unruled` cases with the R-C950
   `claim.rules`; the QuickCheck model, `exclusiveRefusal` and

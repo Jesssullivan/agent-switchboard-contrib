@@ -97,6 +97,11 @@ it is never written to the audit log. Never put a secret in either.
 - Repeating your own exclusive claim renews it: `outcome: renewed`, the same
   `claim_id`, and the expiry moves to the later of the old one and now plus
   the new lease.
+- A session holds at most one active claim per subject. Any other repeat
+  claim by its holder updates that claim (`outcome: recorded`, the same
+  `claim_id`, the later expiry), so a holder is listed once in `overlaps[]`
+  and `held_by`. An exclusive request over your own advisory claim makes it
+  exclusive; an advisory request never drops exclusivity.
 - Leases default to 4 h and are clamped to 1..24 h. Every claim call renews
   the caller's session lease.
 - `end` releases every claim the session holds at once and returns them in
@@ -108,9 +113,18 @@ it is never written to the audit log. Never put a secret in either.
   a receipt in `offered`. The receiver accepts it with
   `claim {me, handoff_id}` (`swb claim --handoff <id>`): in one transaction
   the source becomes `handed_off` and the receiver's claim is recorded under
-  the same rules, so an exclusive acceptance can be refused and leaves the
-  offer open. Releasing a claim, or ending its session, cancels its open
-  offers.
+  the same rules. The accepted claim keeps the source's exclusivity unless
+  the receiver passes `exclusive`. Accepting an exclusive source moves its
+  guard and is never refused; asking for `exclusive` on a non-exclusive
+  source is a new exclusive request, which can be refused and then leaves
+  the offer open. A receiver that already holds a claim on the subject
+  keeps that claim, now with `handoff_from` set. Releasing a claim, or
+  ending its session, cancels its open offers.
+- `claims` returns `truncated: true` when more claims matched than the
+  page holds, and with `me`, `handoffs_truncated` when more than 100 open
+  handoffs did.
+- The audit log has a line for each recorded, renewed or refused claim, and
+  an accepted handoff adds a `handed_off` line for its source claim.
 - `release` and `handoff` act only on your own claims; another session's
   claim, or an unknown id, answers `claim_unavailable`.
 
@@ -152,7 +166,8 @@ makes no broker call), `inbox`,
 - `agentd` is planned for P2 and exits 3; it is not in the usage text.
 
 Exit codes: 0 ok, 2 usage, 3 missing setting, broker error or a failed
-`doctor` check, 1 `serve` failure; `hook` always exits 0, and `channel`
+`doctor` check, 4 a refused exclusive `claim` (the answer is still printed),
+1 `serve` failure; `hook` always exits 0, and `channel`
 exits 0 when Claude Code closes its stdin.
 
 ## Claude Code channel

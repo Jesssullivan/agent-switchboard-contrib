@@ -31,7 +31,8 @@ commands:
                             read one thread's messages that SWB_AGENT_ID sent or received
   claim <subject> [--exclusive] [--lease-hours N] [--note TEXT]
   claim --handoff <ULID> [--exclusive]
-                            claim a subject (advisory), or accept a handoff offered to you
+                            claim a subject (advisory), or accept a handoff offered to you;
+                            a refused exclusive claim prints its answer and exits 4
   release <claim_id>        release one of SWB_AGENT_ID's claims
   handoff <claim_id> <to-agent-id> [--note TEXT]
                             offer one of your claims to another session
@@ -1219,6 +1220,29 @@ fn print_result(verb: &str, result: Result<Value, String>) -> ExitCode {
     }
 }
 
+/// Exit code of a refused exclusive claim (R-C950 (1)): the broker answers
+/// 200 with `outcome: refused`, and the CLI still prints that answer, but a
+/// script running `swb claim X --exclusive && ...` must not go on.
+const EXIT_CLAIM_REFUSED: u8 = 4;
+
+fn claim_exit(result: &Value) -> ExitCode {
+    if result["outcome"] == json!("refused") {
+        ExitCode::from(EXIT_CLAIM_REFUSED)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn print_claim_result(result: Result<Value, String>) -> ExitCode {
+    match result {
+        Ok(v) => {
+            println!("{v}");
+            claim_exit(&v)
+        }
+        Err(e) => print_result("claim", Err(e)),
+    }
+}
+
 fn hook(harness_arg: &str, event: &str) {
     if !matches!(
         event,
@@ -1365,7 +1389,7 @@ fn main() -> ExitCode {
         Some("claim") => {
             let rest: Vec<String> = args.collect();
             match parse_claim_args(&rest) {
-                Ok(parsed) => print_result("claim", claim_cmd(&process_env, &parsed)),
+                Ok(parsed) => print_claim_result(claim_cmd(&process_env, &parsed)),
                 Err(e) => usage_error("claim", &e),
             }
         }
@@ -2440,5 +2464,16 @@ mod tests {
         assert!(
             matches!(&checks[5].1, Check::Fail { detail, .. } if detail.starts_with("POST /v1/register: "))
         );
+    }
+
+    #[test]
+    fn a_refused_exclusive_claim_exits_non_zero() {
+        assert_eq!(
+            claim_exit(&json!({"outcome":"refused","recorded":false})),
+            ExitCode::from(EXIT_CLAIM_REFUSED)
+        );
+        for outcome in ["recorded", "renewed"] {
+            assert_eq!(claim_exit(&json!({"outcome":outcome})), ExitCode::SUCCESS);
+        }
     }
 }

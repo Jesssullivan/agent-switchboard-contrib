@@ -182,17 +182,20 @@ atLeastOnceUntilAck c tr = go M.empty M.empty M.empty (clocked tr)
 -- | Claims that are recorded and not released, with their expiry.
 data Rec = Rec {rHolder :: Agent, rSubject :: Subject, rExclusive :: Bool, rUntil :: Integer} deriving (Eq, Show)
 
--- | Replay one step's effect on the recorded claims: a recorded claim is
--- added, a renewal extends the holder's own exclusive claim (never shortens
--- it), and a successful 'End' releases every claim of that agent (R-C950).
+-- | Replay one step's effect on the recorded claims. A holder has at most
+-- one active claim per subject: a recorded or renewed request extends it
+-- (never shortens it, and only ever adds exclusivity), or adds it when the
+-- holder has none; a successful 'End' releases every claim of that agent
+-- (R-C950).
 replayClaims :: Constants -> Integer -> Op -> Res -> [Rec] -> [Rec]
 replayClaims c t (Claim h s ex lease) (RClaimed out) rs = case out of
-  Recorded _ -> rs ++ [Rec h s ex until']
-  Renewed -> [if mine x then x {rUntil = max (rUntil x) until'} else x | x <- rs]
   Refused _ -> rs
+  _
+    | any mine rs -> [if mine x then x {rUntil = max (rUntil x) until', rExclusive = rExclusive x || ex} else x | x <- rs]
+    | otherwise -> rs ++ [Rec h s ex until']
   where
     until' = t + claimLeaseSeconds c lease
-    mine x = rHolder x == h && rSubject x == s && rExclusive x && rUntil x > t
+    mine x = rHolder x == h && rSubject x == s && rUntil x > t
 replayClaims _ _ (End a _) (REnded True) rs = filter ((/= a) . rHolder) rs
 replayClaims _ _ _ _ rs = rs
 
