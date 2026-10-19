@@ -49,7 +49,7 @@ class ReceiptTests(unittest.TestCase):
                     return str(bindir) + "\n"
                 raise AssertionError(command)
             output = base / "receipt"
-            with patch.dict(e2e.os.environ, {"MALLOC_ARENA_MAX": "256", "GLIBC_TUNABLES": "glibc.malloc.arena_max=256"}), patch.object(sys, "argv", ["e2e", "--output", str(output)]), patch.object(e2e.platform, "system", return_value="Linux"), patch.object(e2e.resource, "getrlimit", return_value=(e2e.resource.RLIM_INFINITY, e2e.resource.RLIM_INFINITY)), patch.object(e2e.resource, "setrlimit"), patch.object(e2e.os, "sched_getaffinity", side_effect=[{12, 13, 14, 15, 16}, {12, 13, 14, 15}], create=True), patch.object(e2e.os, "sched_setaffinity", side_effect=OSError("fixture affinity denial") if affinity_error else None, create=True) as affinity, patch.object(e2e.subprocess, "check_output", side_effect=check_output), patch.object(e2e.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+            with patch.dict(e2e.os.environ, {"MALLOC_ARENA_MAX": "256", "GLIBC_TUNABLES": "glibc.malloc.arena_max=256"}), patch.object(sys, "argv", ["e2e", "--output", str(output)]), patch.object(e2e.platform, "system", return_value="Linux"), patch.object(e2e, "own_cgroup", return_value="/user.slice/user-1000.slice/tinyland-heavy.slice/heavy-test.scope"), patch.object(e2e.os, "sched_getaffinity", side_effect=[{12, 13, 14, 15, 16}, {12, 13, 14, 15}], create=True), patch.object(e2e.os, "sched_setaffinity", side_effect=OSError("fixture affinity denial") if affinity_error else None, create=True) as affinity, patch.object(e2e.subprocess, "check_output", side_effect=check_output), patch.object(e2e.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
                 if affinity_error:
                     with self.assertRaises(SystemExit) as refused:
                         e2e.main()
@@ -66,7 +66,8 @@ class ReceiptTests(unittest.TestCase):
         code, receipt, env = self.exercise()
         self.assertEqual(code, 0)
         self.assertTrue(receipt["source_clean"])
-        self.assertEqual(receipt["memory_limit_bytes_per_process"], 6 * 1024**3)
+        self.assertEqual(receipt["memory_bound"], {"kind": "cgroup", "cgroup": "/user.slice/user-1000.slice/tinyland-heavy.slice/heavy-test.scope"})
+        self.assertNotIn("memory_limit_bytes_per_process", receipt)
         self.assertFalse(receipt["live_acceptance"])
         self.assertEqual(receipt["cpu_affinity"], [12, 13, 14, 15])
         self.assertEqual(receipt["glibc_malloc_arena_max"], 2)

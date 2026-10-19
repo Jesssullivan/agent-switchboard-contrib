@@ -12,7 +12,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import resource
 import shutil
 import subprocess
 import sys
@@ -63,6 +62,15 @@ EXPECTED = {
 }
 RULINGS = ["R-C949", "TIN-6688", "TIN-4655", "SWB-R49", "R-N13"]
 
+def own_cgroup():
+    try:
+        lines = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        return None
+    # cgroup v2 has the single line "0::<path>".
+    paths = [line.split(":", 2)[2] for line in lines if line.startswith("0::")]
+    return paths[0] if paths else None
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path)
@@ -102,12 +110,11 @@ def main():
         p.error(f"owned CPU affinity admission failed: {exc}")
     plan["cpu_affinity"] = sorted(admitted_cpus)
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
-    memory_limit = 6 * 1024 ** 3
-    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-    if hard != resource.RLIM_INFINITY:
-        memory_limit = min(memory_limit, hard)
-    resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
-    plan["memory_limit_bytes_per_process"] = memory_limit
+    # Memory is bounded by the caller's cgroup (on sting, tinyland-heavy's
+    # slice), not by RLIMIT_AS: an address-space limit counts reservations,
+    # and the Nix evaluator behind rules_nixpkgs fails a 6 GiB one with
+    # "allocating arena using mmap: Cannot allocate memory" (sting, 2026-10-19).
+    plan["memory_bound"] = {"kind": "cgroup", "cgroup": own_cgroup()}
     plan["jvm_heap_limit_mib"] = 512
     plan["glibc_malloc_arena_max"] = 2
     env = dict(os.environ)
