@@ -129,6 +129,7 @@ routes, verbs and the channel setup are in
 | [docs/REFERENCE.md](docs/REFERENCE.md) | Settings, REST routes, MCP tools, CLI verbs, exit codes, Claude Code channel |
 | [docs/releases/v0.3.0-migration.md](docs/releases/v0.3.0-migration.md) | What v0.3.0 changes on the wire and in the CLI, and the upgrade order |
 | [integrations/](integrations/) | Harness configuration: Claude Code plugin, Codex and Pi snippets |
+| [examples/](examples/) | One-host and two-host (tailnet) examples, and the scripted demo of every mode ([recording](docs/demo/)) |
 | [docs/PRODUCT.md](docs/PRODUCT.md) | Users, stories and what holds today, known friction, open decisions |
 | [docs/adr/0001-agent-switchboard.md](docs/adr/0001-agent-switchboard.md) | The broker design and its rulings |
 | [docs/adr/0002-lgtm-plane.md](docs/adr/0002-lgtm-plane.md) | Observability plane (Tempo, Loki, Mimir) and phase order |
@@ -147,6 +148,7 @@ routes, verbs and the channel setup are in
 | `crates/swb` | The single `swb` binary |
 | `schemas/` | Envelope v3 JSON schema |
 | `integrations/` | Harness-side configuration |
+| `examples/` | Runnable examples and the scripted demo |
 | `spec/` | Formal spec |
 | `deploy/` | Digest-addressed OCI image |
 
