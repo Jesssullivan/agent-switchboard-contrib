@@ -226,7 +226,24 @@ remote-spec-check host="sting" dir="~/scratch/agent-switchboard-spec":
     rsync -a --delete --exclude '/bazel-*' --exclude '/target/' --exclude '/.git' --exclude '/spec/haskell/dist-newstyle/' ./ {{host}}:{{dir}}/
     ssh {{host}} 'cd {{dir}} && just spec-check'
 
-# Stub (P1b): end-to-end round trip against a live broker.
+# Not implemented: the round trip on the deployed broker across a pod
+# restart (P1b item d, TIN-6688). The owned-fixture lane is `e2e-fixtures`.
 e2e:
-    @echo "e2e: lands with the P1b broker MVP (ADR-0001, phase P1b exit)" >&2
+    @echo "e2e: the deployed-broker round trip (P1b item d, TIN-6688) is not implemented; run 'just e2e-fixtures <output>' for the owned-fixture lane" >&2
     @exit 1
+
+# R-C949 / TIN-6688 (carried from PR #32): the owned-fixture lane. Runs the
+# broker service round trip across restarts, the CLI and store fixtures and
+# the blackholed-broker hook test, then writes a receipt to a new `output`
+# directory outside the source. Build hosts only, never neo; on sting run it
+# under `tinyland-heavy`. No live broker, harness or process action.
+e2e-fixtures output cpus="4":
+    python3 scripts/e2e-fixtures.py --output {{ quote(output) }} --cpus {{ quote(cpus) }}
+
+# Print the fixture lane's exact command and expected cases; runs nothing.
+e2e-fixtures-plan:
+    python3 scripts/e2e-fixtures.py --plan
+
+# The fixture driver's own receipts, with mocks only; no Bazel or endpoint.
+e2e-fixture-driver-test:
+    python3 -m unittest discover -s scripts -p test_e2e_fixtures.py
