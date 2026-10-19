@@ -15,14 +15,20 @@ e2e = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(e2e)
 
 class ReceiptTests(unittest.TestCase):
-    def exercise(self, dirty=False, info_error=False, broker_missing=False, affinity_error=False):
+    def exercise(self, dirty=False, info_error=False, broker_missing=False, affinity_error=False, no_route=False):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             logs = base / "testlogs"
             for target, cases in e2e.EXPECTED.items():
                 path = logs / target.replace(":", "/") / "test.log"
                 path.parent.mkdir(parents=True)
-                path.write_text("" if broker_missing and "swb-broker" in target else "\n".join(cases.values()))
+                if broker_missing and "swb-broker" in target:
+                    text = ""
+                elif no_route and "hook_blackhole" in target:
+                    text = "NO-ROUTE: all hook cases returned exit 0 within 2 s, but no closed-stdin case waited on connect; the blackhole path did not run"
+                else:
+                    text = "\n".join(cases.values())
+                path.write_text(text)
             bindir = base / "bin"
             binary = bindir / "crates/swb/swb"
             binary.parent.mkdir(parents=True)
@@ -92,6 +98,12 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(receipt["verdict"], "failed")
         self.assertFalse(receipt["cases"]["crates/swb-broker:swb_broker_test"]["rmcp_streamable_http_initialize_and_tools"])
+
+    def test_no_route_hook_run_is_not_blackhole_evidence(self):
+        code, receipt, env = self.exercise(no_route=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt["verdict"], "failed")
+        self.assertFalse(receipt["cases"]["crates/swb:hook_blackhole_test"]["hook_blackholed_broker_exit_0_within_2s"])
 
     def test_same_head_dirty_source_refuses(self):
         code, receipt, env = self.exercise(dirty=True)

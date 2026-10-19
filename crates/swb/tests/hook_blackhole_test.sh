@@ -4,13 +4,25 @@
 #
 # The broker address is 192.0.2.1:9 (RFC 5737 TEST-NET-1, never routed), so
 # a SYN gets no answer and connect() waits until the client's own deadline.
-# Where the sandbox has no route at all, connect fails at once instead; the
-# assertions hold either way and the printed elapsed times show which path
-# ran. A second case holds stdin open with no EOF, which deterministically
-# exercises the hook's own bound on its stdin read.
+# Where the sandbox has no route at all, connect fails at once instead. The
+# exit/output/budget assertions hold either way, but that run never reaches
+# the blackhole path, so it ends with a NO-ROUTE line instead of the pass
+# line: the fixture driver (scripts/e2e-fixtures.py) matches only the pass
+# line and so does not count a NO-ROUTE run as blackhole evidence. A second
+# case holds stdin open with no EOF, which deterministically exercises the
+# hook's own bound on its stdin read.
+#
+# Timing margin: the SWB-R10 ceiling is 2 s and the hook's own bound is
+# HOOK_LIMIT = 1800 ms (crates/swb/src/main.rs), leaving about 200 ms for
+# fork/exec of env, sh and swb. On a CPU-capped slice that headroom can be
+# lost to scheduling, so a case that is correct apart from overshooting the
+# 2 s ceiling is run once more; a second overshoot fails. A hook that hangs
+# or prints still fails on its first run.
 #
 # Cases: the compiled `swb hook claude <event>` directly, and the Claude Code
 # wrapper `integrations/claude-code/scripts/swb-hook.sh`, for every event.
+# Arguments after the second (for example the fixture driver's
+# --test-threads=1, which Bazel passes to every test) are ignored.
 set -euo pipefail
 
 swb="$1"
@@ -19,6 +31,9 @@ wrapper="$2"
 [ -f "$wrapper" ] || { echo "missing wrapper: $wrapper" >&2; exit 1; }
 
 budget_us=2000000
+# A closed-stdin case that reached the blackhole waits on connect for most of
+# HOOK_LIMIT; one that failed at once (no route) returns in a few ms.
+blackhole_min_us=1000000
 scratch="${TEST_TMPDIR:-$(mktemp -d)}/hook-blackhole"
 mkdir -p "$scratch/bin" "$scratch/state"
 chmod 700 "$scratch/state"
@@ -43,15 +58,19 @@ now_us() {
     local t="${EPOCHREALTIME/[.,]/}"
     echo "$t"
   else
-    echo $(($(date +%s%N) / 1000))
+    # bash 3.2 (macOS) has no EPOCHREALTIME and BSD date has no %N.
+    perl -MTime::HiRes=time -e 'printf "%d\n", time() * 1000000'
   fi
 }
 
 failures=0
-run_case() {
-  local name="$1" stdin_mode="$2"
-  shift 2
-  local out="$scratch/out" start end elapsed status=0
+blackholed=0
+# Runs one case; sets case_status, case_elapsed and case_bytes.
+attempt() {
+  local stdin_mode="$1"
+  shift
+  local out="$scratch/out" start end
+  case_status=0
   start="$(now_us)"
   if [ "$stdin_mode" = "open" ]; then
     # A writer that never writes or closes: the hook sees no EOF.
@@ -60,22 +79,38 @@ run_case() {
     mkfifo "$fifo"
     sleep 30 >"$fifo" &
     local holder=$!
-    "$@" <"$fifo" >"$out" 2>/dev/null || status=$?
+    "$@" <"$fifo" >"$out" 2>/dev/null || case_status=$?
     kill "$holder" 2>/dev/null || true
     wait "$holder" 2>/dev/null || true
   else
     printf '%s' '{"session_id":"blackhole-session","hook_event_name":"x"}' \
-      | "$@" >"$out" 2>/dev/null || status=$?
+      | "$@" >"$out" 2>/dev/null || case_status=$?
   fi
   end="$(now_us)"
-  elapsed=$((end - start))
+  case_elapsed=$((end - start))
+  case_bytes="$(wc -c <"$out" | tr -d ' ')"
+}
+
+run_case() {
+  local name="$1" stdin_mode="$2"
+  shift 2
   local verdict=ok
-  if [ "$status" -ne 0 ] || [ "$elapsed" -ge "$budget_us" ] || [ -s "$out" ]; then
+  attempt "$stdin_mode" "$@"
+  if [ "$case_status" -eq 0 ] && [ "$case_bytes" -eq 0 ] && [ "$case_elapsed" -ge "$budget_us" ]; then
+    printf 'RETRY %-47s exit=%d elapsed_ms=%d (timing only; once)\n' \
+      "$name" "$case_status" $((case_elapsed / 1000))
+    attempt "$stdin_mode" "$@"
+  fi
+  if [ "$case_status" -ne 0 ] || [ "$case_elapsed" -ge "$budget_us" ] || [ "$case_bytes" -ne 0 ]; then
     verdict=FAIL
     failures=$((failures + 1))
   fi
-  printf '%-4s %-48s exit=%d elapsed_ms=%d stdout_bytes=%d\n' \
-    "$verdict" "$name" "$status" $((elapsed / 1000)) "$(wc -c <"$out")"
+  if [ "$stdin_mode" = "closed" ] && [ "$case_elapsed" -ge "$blackhole_min_us" ]; then
+    blackholed=$((blackholed + 1))
+  fi
+  printf '%-5s %-47s exit=%d elapsed_ms=%d margin_ms=%d stdout_bytes=%d\n' \
+    "$verdict" "$name" "$case_status" $((case_elapsed / 1000)) \
+    $(((budget_us - case_elapsed) / 1000)) "$case_bytes"
 }
 
 for event in SessionStart UserPromptSubmit Stop SessionEnd; do
@@ -93,4 +128,10 @@ if [ "$failures" -ne 0 ]; then
   echo "$failures case(s) exceeded the 2 s budget, exited non-zero or printed output" >&2
   exit 1
 fi
-echo "all hook cases returned exit 0 within 2 s against a blackholed broker"
+if [ "$blackholed" -eq 0 ]; then
+  # Every closed-stdin case returned in under 1 s: connect failed at once, so
+  # the blackhole path did not run. Not a contract break, and not evidence.
+  echo "NO-ROUTE: all hook cases returned exit 0 within 2 s, but no closed-stdin case waited on connect; the blackhole path did not run"
+  exit 0
+fi
+echo "all hook cases returned exit 0 within 2 s against a blackholed broker ($blackholed closed-stdin cases waited on connect)"

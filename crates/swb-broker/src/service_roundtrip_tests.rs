@@ -77,7 +77,12 @@ async fn fixture_service(
 
 #[tokio::test]
 async fn owned_http_round_trip_survives_graceful_service_reopen() {
-    let path = std::env::temp_dir().join(format!(
+    // Bazel's per-test TEST_TMPDIR is removed with the test even after a
+    // panic; std::env::temp_dir() is the cargo fallback.
+    let dir = std::env::var_os("TEST_TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join(format!(
         "swb-owned-service-{}-{}.sqlite3",
         std::process::id(),
         std::time::SystemTime::now()
