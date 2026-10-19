@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "swb-channel": {
+      "command": "swb",
+      "args": ["channel"]
+    }
+  }
+}
