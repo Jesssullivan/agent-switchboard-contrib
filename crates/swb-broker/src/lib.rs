@@ -31,7 +31,7 @@ use rmcp::{
 use serde_json::{Value, json};
 use std::{collections::HashMap, future::Future, io, sync::Arc, time::Duration};
 use swb_proto::{Authority, VERSION};
-use swb_store::{ErrorKind, PeersQuery, Store, StoreError};
+use swb_store::{ClaimsQuery, ErrorKind, PeersQuery, Store, StoreError};
 
 pub const HOOK_TIMEOUT_MS: u64 = 2_000;
 /// Production retention interval. The store no longer prunes inside `send`
@@ -67,10 +67,59 @@ fn peers_op(store: &Store, args: &Value) -> Result<Value, StoreError> {
     })
 }
 
+fn claims_op(store: &Store, args: &Value) -> Result<Value, StoreError> {
+    let limit = opt(args, "limit", Value::as_u64)?;
+    store.claims(&ClaimsQuery {
+        me: opt(args, "me", Value::as_str)?,
+        subject: opt(args, "subject", Value::as_str)?,
+        holder: opt(args, "holder", Value::as_str)?,
+        all: opt(args, "all", Value::as_bool)?.unwrap_or(false),
+        limit: limit.map(|n| n.min(u64::from(u32::MAX)) as u32),
+    })
+}
+
+fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str, StoreError> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing {key}").into())
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError> {
     let mut created = true;
     let result = match name {
         "register" => store.register(args),
+        "heartbeat" => store.heartbeat(required(args, "me")?),
+        "thread" => {
+            let limit = opt(args, "limit", Value::as_u64)?;
+            store.thread(
+                required(args, "me")?,
+                required(args, "thread_id")?,
+                opt(args, "after_seq", Value::as_u64)?,
+                limit.map(|n| n.min(u64::from(u32::MAX)) as u32),
+            )
+        }
+        "claim" => {
+            let outcome = store.claim(args)?;
+            created = outcome["recorded"] == json!(true);
+            Ok(outcome)
+        }
+        "release" => {
+            let outcome = store.release(required(args, "me")?, required(args, "claim_id")?)?;
+            created = outcome["released"] == json!(true);
+            Ok(outcome)
+        }
+        "handoff" => {
+            let outcome = store.handoff(args)?;
+            created = outcome["created"] == json!(true);
+            Ok(outcome)
+        }
+        "claims" => claims_op(store, args),
         "end" => {
             if args.get("end_token").is_none() && args.get("proc_start").is_some() {
                 return Err(
@@ -117,6 +166,21 @@ fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreErro
         ),
         _ => Err("unknown operation".into()),
     }?;
+    // R-C950 (4): every claim an end released is logged as its own release.
+    if name == "end" {
+        for released in result["released_claims"].as_array().into_iter().flatten() {
+            let mut line = audit_record("release", args, released, None);
+            line["reason"] = json!("session_ended");
+            println!("{line}");
+        }
+    }
+    if created && matches!(name, "claim" | "release" | "handoff") {
+        let mut line = audit_record(name, args, &result, None);
+        if name == "release" {
+            line["reason"] = json!("released");
+        }
+        println!("{line}");
+    }
     if created && matches!(name, "register" | "send" | "ack") {
         let body = result.get("body").and_then(Value::as_str).unwrap_or("");
         let body_hmac = if name == "send" {
@@ -132,19 +196,22 @@ fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreErro
     Ok(result)
 }
 
-/// The audit line. It names fields explicitly, so neither the message body
-/// nor a register's `end_token` can reach it.
+/// The audit line. It names fields explicitly, so neither the message body,
+/// a claim or handoff note, nor a register's `end_token` can reach it.
 fn audit_record(name: &str, args: &Value, result: &Value, body_hmac: Option<&str>) -> Value {
     let body_size = result
         .get("body")
         .and_then(Value::as_str)
         .map_or(0, str::len);
     json!({
-        "ts":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0,|d|d.as_secs()),
+        "ts":now_secs(),
         "op":name,"me":args.get("me").or_else(||args.get("from")),"to":result.get("to"),
         "ticket":result.get("ticket"),"ruling":result.get("ruling"),
         "msg_id":result.get("msg_id"),"size":body_size,"body_hmac":body_hmac,
-        "agent_id":result.get("agent_id"),"state":result.get("state")
+        "agent_id":result.get("agent_id"),"state":result.get("state"),
+        "claim_id":result.get("claim_id"),"subject":result.get("subject"),
+        "handoff_id":result.get("handoff_id"),"outcome":result.get("outcome"),
+        "exclusive":result.get("exclusive")
     })
 }
 
@@ -156,7 +223,9 @@ pub fn error_body(code: &str, message: &str) -> Value {
 fn status_of(kind: ErrorKind) -> StatusCode {
     match kind {
         ErrorKind::Invalid => StatusCode::BAD_REQUEST,
-        ErrorKind::Unregistered | ErrorKind::Unavailable => StatusCode::NOT_FOUND,
+        ErrorKind::Unregistered | ErrorKind::Unavailable | ErrorKind::ClaimUnavailable => {
+            StatusCode::NOT_FOUND
+        }
         ErrorKind::Conflict => StatusCode::CONFLICT,
         ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -164,6 +233,7 @@ fn status_of(kind: ErrorKind) -> StatusCode {
 
 const AGENT_ID: &str = "Agent id <harness>:<host>:<pid>:<session_id>; harness is one of claude, kimi, codex, junie, opencode, pi; the other parts use [A-Za-z0-9._-]; at most 512 bytes";
 const ULID_DESC: &str = "Canonical 26-character Crockford base32 ULID";
+const SUBJECT_DESC: &str = "What is claimed: a ticket (TIN-4655), a path (lab:nix/hosts/sting.nix) or another token in [A-Za-z0-9._:/#@+-], at most 256 bytes";
 
 fn tools() -> Vec<Tool> {
     [
@@ -204,10 +274,51 @@ fn tools() -> Vec<Tool> {
         ("ack", "Acknowledge a received message so it is not delivered again.", json!({"type":"object","required":["me","msg_id"],"properties":{
             "me":{"type":"string","description":AGENT_ID},
             "msg_id":{"type":"string","description":ULID_DESC}}})),
+        ("heartbeat", "Renew this session's lease without reading or sending anything.", json!({"type":"object","required":["me"],"properties":{
+            "me":{"type":"string","description":AGENT_ID}}})),
+        ("thread", "Read one thread's messages that this session sent or received, in seq order. Changes no delivery state; renews the caller's lease.", json!({"type":"object","required":["me","thread_id"],"properties":{
+            "me":{"type":"string","description":AGENT_ID},
+            "thread_id":{"type":"string","description":ULID_DESC},
+            "after_seq":{"type":"integer","minimum":0,"description":"Only messages after this seq; pass next_after_seq from the previous page"},
+            "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Page size, default 20, at most 100"}}})),
+        ("claim", "Claim a subject. Advisory: a non-exclusive claim is always recorded and lists every other holder in overlaps. An exclusive claim is refused (outcome refused, held_by lists the holders, nothing recorded) while another session holds any active claim on the subject; repeating your own exclusive claim renews it (same claim_id, later expiry). With handoff_id, accept a handoff offered to you. Ending your session releases your claims.", json!({"type":"object","required":["me"],"properties":{
+            "me":{"type":"string","description":AGENT_ID},
+            "subject":{"type":"string","pattern":"^[A-Za-z0-9._:/#@+-]{1,256}$","description":format!("{SUBJECT_DESC}. Required unless handoff_id is given")},
+            "exclusive":{"type":"boolean","description":"Ask for exclusive use (default false)"},
+            "lease_hours":{"type":"integer","minimum":1,"maximum":24,"description":"Claim lease, default 4 h, clamped to 1..24"},
+            "note":{"type":"string","maxLength":512,"description":"Short note shown in claims; no control characters. Never put a secret here"},
+            "handoff_id":{"type":"string","description":format!("{ULID_DESC} of a handoff offered to you; accepting it moves the claim to you")}}})),
+        ("release", "Release one of your own claims. Releasing it again changes nothing. Another session's claim answers claim_unavailable.", json!({"type":"object","required":["me","claim_id"],"properties":{
+            "me":{"type":"string","description":AGENT_ID},
+            "claim_id":{"type":"string","description":ULID_DESC}}})),
+        ("handoff", "Offer one of your active claims to another session. Creates a receipt in offered; the claim moves only when the receiver calls claim with the handoff_id.", json!({"type":"object","required":["me","claim_id","to"],"properties":{
+            "me":{"type":"string","description":AGENT_ID},
+            "claim_id":{"type":"string","description":format!("{ULID_DESC} of your active claim")},
+            "to":{"type":"string","description":format!("Receiver. {AGENT_ID}")},
+            "note":{"type":"string","maxLength":512,"description":"Short note for the receiver; no control characters. Never put a secret here"}}})),
+        ("claims", "List claims: active ones by default, each marked orphaned while its holder is gone. With me, also lists the handoffs offered to or by you and renews your lease.", json!({"type":"object","properties":{
+            "me":{"type":"string","description":format!("{AGENT_ID}. Optional; renews only this caller's lease and adds its open handoffs")},
+            "subject":{"type":"string","pattern":"^[A-Za-z0-9._:/#@+-]{1,256}$","description":format!("Only claims on this subject. {SUBJECT_DESC}")},
+            "holder":{"type":"string","description":format!("Only claims this session holds. {AGENT_ID}")},
+            "all":{"type":"boolean","description":"Include released, handed-off and expired claims still retained (default false)"},
+            "limit":{"type":"integer","minimum":1,"maximum":500,"description":"Page size, default 100, at most 500"}}})),
     ].into_iter().map(|(name,description,schema)| Tool::new(name,description,Arc::new(schema.as_object().expect("static object schema").clone()))).collect()
 }
 
-const TOOL_NAMES: [&str; 6] = ["register", "end", "peers", "send", "inbox", "ack"];
+const TOOL_NAMES: [&str; 12] = [
+    "register",
+    "end",
+    "peers",
+    "send",
+    "inbox",
+    "ack",
+    "heartbeat",
+    "thread",
+    "claim",
+    "release",
+    "handoff",
+    "claims",
+];
 
 #[derive(Clone)]
 struct BrokerMcp {
@@ -309,6 +420,12 @@ post_operation!(send, "send");
 post_operation!(ack, "ack");
 post_operation!(peers_post, "peers");
 post_operation!(inbox_post, "inbox");
+post_operation!(heartbeat, "heartbeat");
+post_operation!(thread, "thread");
+post_operation!(claim, "claim");
+post_operation!(release, "release");
+post_operation!(handoff, "handoff");
+post_operation!(claims, "claims");
 
 fn method_not_allowed(allow: &'static str, message: &str) -> Response {
     let mut response = error_response(
@@ -697,6 +814,12 @@ fn router_with_config(
         .route("/v1/send", post(send))
         .route("/v1/inbox", post(inbox_post).get(inbox_get))
         .route("/v1/ack", post(ack))
+        .route("/v1/heartbeat", post(heartbeat))
+        .route("/v1/thread", post(thread))
+        .route("/v1/claim", post(claim))
+        .route("/v1/release", post(release))
+        .route("/v1/handoff", post(handoff))
+        .route("/v1/claims", post(claims))
         .method_not_allowed_fallback(wrong_method)
         .fallback(not_found)
         .with_state(store)
@@ -1371,8 +1494,8 @@ mod tests {
         assert_eq!(store.send(&invalid).unwrap_err(), "unknown envelope field");
     }
     #[test]
-    fn lists_six_typed_and_described_tools() {
-        assert_eq!(tools().len(), 6);
+    fn lists_twelve_typed_and_described_tools() {
+        assert_eq!(tools().len(), 12);
         assert_eq!(
             tools()
                 .iter()
@@ -1493,7 +1616,7 @@ mod tests {
     }
     /// Every state-bearing route on the main listener, with a request body
     /// that would mutate or read state if the guard let it through.
-    const GUARDED_ROUTES: [(&str, &str, &str); 7] = [
+    const GUARDED_ROUTES: [(&str, &str, &str); 13] = [
         (
             "POST",
             "/v1/register",
@@ -1516,6 +1639,28 @@ mod tests {
             "/v1/ack",
             r#"{"me":"pi:sting:2:b","msg_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
         ),
+        ("POST", "/v1/heartbeat", r#"{"me":"pi:sting:2:b"}"#),
+        (
+            "POST",
+            "/v1/thread",
+            r#"{"me":"pi:sting:2:b","thread_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
+        ),
+        (
+            "POST",
+            "/v1/claim",
+            r#"{"me":"pi:sting:2:b","subject":"TIN-1","exclusive":true}"#,
+        ),
+        (
+            "POST",
+            "/v1/release",
+            r#"{"me":"pi:sting:2:b","claim_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
+        ),
+        (
+            "POST",
+            "/v1/handoff",
+            r#"{"me":"pi:sting:2:b","claim_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","to":"claude:honey:1:a"}"#,
+        ),
+        ("POST", "/v1/claims", r#"{"subject":"TIN-1"}"#),
         (
             "POST",
             "/mcp",
@@ -2106,6 +2251,74 @@ mod tests {
         assert_eq!(json_of(ended).await["state"], "ended");
         let listed = json_of(call(&app, "GET", "/v1/peers", "").await).await;
         assert!(listed["peers"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn claims_over_rest_follow_r_c950() {
+        let store = Arc::new(Store::memory().unwrap());
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let a = json_of(call(&app, "POST", "/v1/register", GUARDED_ROUTES[0].2).await).await;
+        let token = a["end_token"].as_str().unwrap().to_owned();
+        store
+            .register(
+                &json!({"harness":"pi","host":"sting","pid":2,"session_id":"b","proc_start":"2"}),
+            )
+            .unwrap();
+        let claim = |me: &str, exclusive: bool| {
+            json!({"me":me,"subject":"TIN-1","exclusive":exclusive}).to_string()
+        };
+        let held =
+            json_of(call(&app, "POST", "/v1/claim", &claim("claude:honey:1:a", true)).await).await;
+        assert_eq!(held["outcome"], "recorded");
+        // A refusal is a 200 with outcome refused, not an error.
+        let refused = call(&app, "POST", "/v1/claim", &claim("pi:sting:2:b", true)).await;
+        assert_eq!(refused.status(), StatusCode::OK);
+        let refused = json_of(refused).await;
+        assert_eq!(refused["outcome"], "refused");
+        assert_eq!(refused["held_by"][0]["holder"], "claude:honey:1:a");
+        let beside =
+            json_of(call(&app, "POST", "/v1/claim", &claim("pi:sting:2:b", false)).await).await;
+        assert_eq!(beside["overlaps"][0]["exclusive"], true);
+        let renewed =
+            json_of(call(&app, "POST", "/v1/claim", &claim("claude:honey:1:a", true)).await).await;
+        assert_eq!(renewed["outcome"], "renewed");
+        assert_eq!(renewed["claim_id"], held["claim_id"]);
+        // Another session's claim is not releasable by id.
+        let theirs = json!({"me":"pi:sting:2:b","claim_id":held["claim_id"]}).to_string();
+        let other = call(&app, "POST", "/v1/release", &theirs).await;
+        assert_eq!(other.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_of(other).await["code"], "claim_unavailable");
+        let unregistered = call(&app, "POST", "/v1/claim", &claim("codex:neo:3:c", false)).await;
+        assert_eq!(unregistered.status(), StatusCode::NOT_FOUND);
+        // Ending the holder releases its claims at once.
+        let end = json!({"me":"claude:honey:1:a","end_token":token}).to_string();
+        let ended = json_of(call(&app, "POST", "/v1/end", &end).await).await;
+        assert_eq!(ended["released_claims"][0]["claim_id"], held["claim_id"]);
+        let listed =
+            json_of(call(&app, "POST", "/v1/claims", r#"{"subject":"TIN-1"}"#).await).await;
+        let holders: Vec<&str> = listed["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["holder"].as_str().unwrap())
+            .collect();
+        assert_eq!(holders, ["pi:sting:2:b"]);
+    }
+
+    #[test]
+    fn claim_audit_lines_carry_no_note() {
+        let store = Store::memory().unwrap();
+        store
+            .register(&json!({"harness":"claude","host":"honey","pid":1,"session_id":"a","proc_start":"1"}))
+            .unwrap();
+        let args = json!({"me":"claude:honey:1:a","subject":"TIN-1","note":"note sentinel"});
+        let result = store.claim(&args).unwrap();
+        let line = audit_record("claim", &args, &result, None).to_string();
+        assert!(!line.contains("note sentinel"), "{line}");
+        assert_eq!(
+            audit_record("claim", &args, &result, None)["subject"],
+            "TIN-1"
+        );
     }
 
     #[test]

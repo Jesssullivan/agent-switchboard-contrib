@@ -1,7 +1,13 @@
 {
   "claim": {
     "lease_default_hours": 4,
-    "lease_max_hours": 24
+    "lease_max_hours": 24,
+    "rules": [
+      "exclusive_refused_while_any_other_claim_is_held",
+      "nonexclusive_recorded_with_exclusive_holder_in_overlaps",
+      "exclusive_repeat_by_holder_renews",
+      "end_releases_holder_claims"
+    ]
   },
   "message": {
     "artifacts_max": 20,
@@ -32,7 +38,8 @@
     "SWB-R16",
     "SWB-R46",
     "R-C229",
-    "R-C944"
+    "R-C944",
+    "R-C950"
   ],
   "session": {
     "end_token_hex_length": 64,
@@ -45,10 +52,5 @@
       "gone",
       "ended"
     ]
-  },
-  "unruled": [
-    "exclusive_request_while_nonexclusive_claims_exist",
-    "nonexclusive_claim_lists_exclusive_holder_in_overlaps",
-    "exclusive_reclaim_by_the_current_exclusive_holder"
-  ]
+  }
 }

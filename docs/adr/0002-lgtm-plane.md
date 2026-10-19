@@ -1308,8 +1308,8 @@ hold the P1b broker MVP; the existing body gates still apply.
 - **P1a is blocked** on `xoxd-ai/tinyland-infra#106`, owned by the GF/infra
   lane; lab describes and does not sequence it.
 - **No-containment.** Every hook, launcher and profile added for the
-  switchboard fails open; the only refusal is broker-side
-  exclusive-vs-exclusive (SWB-R16).
+  switchboard fails open; the only refusal is broker-side: an exclusive
+  claim request against another session's active claim (SWB-R16, SWB-R60).
 
 **Facts this ADR relies on that were not verified live** (from the
 critique; each is settled by the exit that names it):

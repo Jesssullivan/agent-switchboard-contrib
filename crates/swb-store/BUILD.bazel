@@ -5,7 +5,10 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "swb_store",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/claims.rs",
+        "src/lib.rs",
+    ],
     aliases = aliases(),
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro = True),

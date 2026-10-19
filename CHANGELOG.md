@@ -55,6 +55,32 @@ fallback. Details and the upgrade order:
 
 ### Added
 
+- **Claims, release and handoff (P2, SWB-R16, R-C950, TIN-6690).** New MCP
+  tools, REST routes and CLI verbs `claim`, `release`, `handoff` and
+  `claims`, plus `heartbeat` and `thread`, completing the ADR-0001 tool set
+  (12 MCP tools with `end`). Claims are advisory:
+  - a non-exclusive claim is always recorded and lists every other holder,
+    an exclusive one included, in `overlaps[]`;
+  - an exclusive claim is refused (`outcome: refused`, `held_by` lists the
+    holders, nothing recorded) while another session holds any active claim
+    on the subject;
+  - repeating your own exclusive claim renews it (same `claim_id`, later
+    expiry);
+  - `end` releases the session's claims at once, returns them in
+    `released_claims`, and the broker logs one `release` audit line each.
+  - Leases default to 4 h, clamped to 1..24 h; a claim whose holder is
+    `gone` shows `orphaned` and is never revoked.
+  - `handoff` creates an `offered` receipt; the receiver accepts it with
+    `claim --handoff`, which moves the claim. `release` and `handoff` act
+    only on the caller's own claims (`claim_unavailable`, 404, otherwise).
+  - The store gains `claims` and `handoffs` tables in place on open; claims
+    and handoffs are pruned 7 days after they stop being active.
+  - `/metrics` adds `swb_claims_active`, `swb_claim_overlaps` and
+    `swb_handoffs_total`.
+  - The Linear handoff-receipt comment (SWB-R15) is not posted yet.
+- Formal spec: `Broker.dhall` replaces the `Unruled` cases with the R-C950
+  `claim.rules`; the QuickCheck model, `exclusiveRefusal` and
+  `noOrphanAfterExpiry` assert them, and the live adapter runs claims.
 - `GET /healthz` on the main listener (Host-guarded) and the metrics
   listener (unguarded, for probes).
 - MCP `end` tool; every MCP input field is described, with patterns and

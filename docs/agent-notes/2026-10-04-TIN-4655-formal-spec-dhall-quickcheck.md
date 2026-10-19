@@ -89,3 +89,9 @@ stopped that line of work and did not reformulate the command.
   with the secrets-scan and release edits to `ci.yml`.
 - P2 questions: the three Unruled cases, the ended-holder orphan rule, claim
   lease expiry, and whether a claim refreshes the claimant's lease.
+
+*Correction 2026-10-19 (TIN-6690):* R-C950 (TIN-5770 comment `23fdf965`)
+ruled the three cases and the ended-holder rule (ending a session releases
+its claims). `Broker.dhall` now lists `claim.rules` instead of `Unruled`, the
+model and properties assert them, and Rust implements claims, leases and the
+lease refresh.
