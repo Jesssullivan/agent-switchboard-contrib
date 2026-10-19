@@ -1,5 +1,5 @@
 {
-  "checksum": "20182e35106bb8005faea66a0f3abcefebcd38bd661824efe59388252291f82d",
+  "checksum": "da458e290a88d7a30c2e5c4fe8fef9497d6ecd32b0b2a7377adf713b78719249",
   "crates": {
     "android_system_properties 0.1.6": {
       "name": "android_system_properties",
@@ -6369,8 +6369,11 @@
         "edition": "2024",
         "version": "0.3.0"
       },
-      "license": null,
-      "license_ids": [],
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
       "license_file": null
     },
     "swb-agentd 0.3.0": {
@@ -6400,8 +6403,11 @@
         "edition": "2024",
         "version": "0.3.0"
       },
-      "license": null,
-      "license_ids": [],
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
       "license_file": null
     },
     "swb-broker 0.3.0": {
@@ -6465,8 +6471,11 @@
         "edition": "2024",
         "version": "0.3.0"
       },
-      "license": null,
-      "license_ids": [],
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
       "license_file": null
     },
     "swb-proto 0.3.0": {
@@ -6514,8 +6523,11 @@
         "edition": "2024",
         "version": "0.3.0"
       },
-      "license": null,
-      "license_ids": [],
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
       "license_file": null
     },
     "swb-store 0.3.0": {
@@ -6570,8 +6582,11 @@
         "edition": "2024",
         "version": "0.3.0"
       },
-      "license": null,
-      "license_ids": [],
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
       "license_file": null
     },
     "syn 2.0.119": {
