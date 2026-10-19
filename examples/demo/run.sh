@@ -372,7 +372,7 @@ say "(one claim per holder and subject, SWB-R61); bob's exclusive request is ref
 show "swb claim TIN-4655 --exclusive   # dave" dave_exclusive
 bob_exclusive() { as_bob swb claim TIN-4655 --exclusive | claim_view; }
 show "swb claim TIN-4655 --exclusive   # bob" bob_exclusive
-claims_view() { jq -c '.claims | sort_by(.created_at, .holder)[] | {holder, exclusive, state} + (if .end_reason then {end_reason} else {} end)'; }
+claims_view() { jq -c '.claims | sort_by(.holder)[] | {holder, exclusive, state} + (if .end_reason then {end_reason} else {} end)'; }
 all_claims() { as_bob swb claims --subject TIN-4655 --all | claims_view; }
 show "swb claims --subject TIN-4655 --all" all_claims
 say "Ending a session releases its claims at once (dave's SessionEnd hook):"

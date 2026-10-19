@@ -1203,19 +1203,21 @@ mod tests {
         claim(&s, B, "TIN-2", false);
         let ended = s.end(A, &token).unwrap();
         assert_eq!(ended["state"], "ended");
-        let released: Vec<&str> = ended["released_claims"]
+        // Both claims share one ManualClock second, so their order is the
+        // ULIDs' order, which is random within a millisecond: compare sets.
+        let mut released: Vec<&str> = ended["released_claims"]
             .as_array()
             .unwrap()
             .iter()
             .map(|c| c["claim_id"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            released,
-            [
-                one["claim_id"].as_str().unwrap(),
-                two["claim_id"].as_str().unwrap()
-            ]
-        );
+        released.sort_unstable();
+        let mut want = [
+            one["claim_id"].as_str().unwrap(),
+            two["claim_id"].as_str().unwrap(),
+        ];
+        want.sort_unstable();
+        assert_eq!(released, want);
         assert!(listed(&s, "TIN-1").is_empty());
         assert_eq!(holders(&json!(listed(&s, "TIN-2"))), [B]);
         assert_eq!(claim(&s, C, "TIN-1", true)["outcome"], "recorded");
