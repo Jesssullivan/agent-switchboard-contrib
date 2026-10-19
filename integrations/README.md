@@ -28,8 +28,11 @@ for the final routes and field names.
 | `inbox` | `GET /v1/inbox?me=…` | **`POST`** | Use a v0.3.0 `swb`; the channel and `swb inbox` change with it |
 | Lease refresh | Side effect of `GET` reads that pass `me` | **`POST` only** | Same: the hooks keep calling `swb hook`, which does the right call |
 | `peers` | Lists rows with `proc_start`, may include stale sessions | **No `proc_start`**, live sessions only, deduplicated by `session_id` | Do not read `proc_start` from `peers`; `swb channel` already matches its own row by host and pid when the field is absent |
-| Hook wrapper, `.mcp.json`, plugin manifest | — | Unchanged | Nothing; they call `swb` and never speak HTTP themselves |
+| Hook wrapper, `.mcp.json`, plugin manifest | — | Not yet known: the v0.3.0 hook update sets their final shape (where the end token is kept is still undesigned) | At least bump `version` in `plugin.json`: Claude Code keeps installed users on a set plugin version until it changes. They call `swb` and never speak HTTP themselves, so route changes alone do not touch them |
 
 Upgrade the broker and every `swb` client together. A v0.2.x client against
 a v0.3.0 broker fails on `inbox` and `end`; the hooks still exit 0, so
-a mismatch shows up as silence. Run `swb doctor` to see it.
+a mismatch shows up as silence. `swb doctor` in v0.2.x does not detect it:
+it checks `GET /v1/peers`, `/metrics` and optionally `register`, never
+`inbox` or `end`. Check `swb version` on every client against the
+broker's release instead.

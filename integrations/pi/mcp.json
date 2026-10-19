@@ -1,5 +1,4 @@
 {
-  "_comment": "UNPROVEN — pending P1b canaries (R-C949). For a Pi MCP adapter extension that reads an mcpServers map; Pi itself has no built-in MCP client. Replace the host and port with your broker's.",
   "mcpServers": {
     "swb": {
       "url": "http://swb-broker.example:8080/mcp"

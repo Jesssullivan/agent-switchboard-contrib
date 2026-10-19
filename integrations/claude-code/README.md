@@ -14,18 +14,27 @@ can also be used one at a time:
 
 ## Requirements
 
-- `swb` 0.2.0 or later on `PATH` (the channel arrived in 0.2.0). See the
-  compatibility table in [../README.md](../README.md) before mixing client
-  and broker versions.
+- `swb` 0.2.2 or later on `PATH`, broker and client both. 0.2.1 and earlier
+  are unsupported (no DNS-rebinding guard) and 0.2.0 was never published; see
+  [SECURITY.md](../../SECURITY.md). See the compatibility table in
+  [../README.md](../README.md) before mixing client and broker versions.
 - A reachable broker, and the session's `SWB_*` environment: at least
   `SWB_BROKER_URL`, plus `SWB_HOST`, `SWB_SESSION_PID` and `SWB_PROC_START`
   for the session's own identity. A launcher that starts Claude Code should
-  export these; the hook and the channel inherit them. The repository
-  README's Settings table lists every variable.
+  export these; the hook and the channel inherit them. The Settings section
+  of [docs/REFERENCE.md](../../docs/REFERENCE.md) lists every variable.
 - For push delivery: a Claude Code build with channels (research preview),
   Anthropic authentication (claude.ai or a Console API key; not Bedrock,
   Vertex/Agent Platform or Foundry) and, on a Team or Enterprise plan, an
   organization with `channelsEnabled`.
+
+> **No authentication before v0.3.0.** A v0.2.x broker accepts any client
+> that can reach it as any agent id it knows or guesses. With the channel
+> loaded, anyone who can reach your broker can put text in front of the
+> model in this session (stamped `authority: peer`, but still text the model
+> reads). Run the broker on loopback or a tailnet only, never on an
+> untrusted network; [SECURITY.md](../../SECURITY.md) has the deployment
+> rules and the v0.2.2 residuals.
 
 ## Install
 
@@ -48,8 +57,9 @@ entry into `~/.claude.json`), and the `hooks` object from
 
 If something else already installs `swb hook` in `settings.json` (a managed
 launcher or Home Manager module, for example), do not also enable this
-plugin's hooks: registration is idempotent, but the `UserPromptSubmit` notice
-would appear twice.
+plugin's hooks: both sets would run on every event, so each event registers
+twice (idempotent, but twice the broker calls) and the `UserPromptSubmit`
+notice appears twice.
 
 ## Channel push: the development flag
 
@@ -92,9 +102,9 @@ What arrives:
          msg_id="…" thread_id="…" authority="peer">…</channel>
 ```
 
-The `source` attribute is `swb-channel` for a bare server and carries a
-plugin scope (for example `plugin:swb:swb-channel`) when the server comes
-from the plugin. `swb channel` never declares the permission-relay
+The `source` attribute is `swb-channel` for a bare server. When the server
+comes from the plugin it carries a plugin scope; the exact form has not been
+checked against a live session, so match on the `swb-channel` suffix. `swb channel` never declares the permission-relay
 capability, so a peer can never approve a tool call in your session. It
 never acknowledges on its own: the model must call `reply` or `ack`.
 
@@ -106,17 +116,18 @@ Each hook runs `scripts/swb-hook.sh <event>`, which runs
 | Event | What `swb hook` does |
 | --- | --- |
 | `SessionStart` | Registers the session with the broker |
-| `UserPromptSubmit` | Registers (refreshing the lease); if mail is waiting, adds a one-line notice naming the `swb inbox` and `swb ack` commands |
+| `UserPromptSubmit` | Registers (refreshing the lease); if mail is waiting, adds a one-line notice naming the `swb inbox` and `swb ack` commands. The notice does not know about the channel: with the channel loaded it still appears for mail the channel already pushed, and the pushed copy is the one to answer |
 | `Stop` | Registers (refreshing the lease) |
 | `SessionEnd` | Ends the session at the broker |
 
 The wrapper always exits 0. It exits early when `swb` is not on `PATH` or
-`SWB_BROKER_URL` is unset, and runs `swb` under `timeout 3` when `timeout`
+`SWB_BROKER_URL` is unset, and runs `swb` under `timeout 2` when `timeout`
 exists. `swb hook` bounds its own work to 1.8 s and always exits 0, and each
-hook entry sets `"timeout": 3`, so a dead or blackholed broker costs at most
-a few seconds and never blocks a prompt or a stop. (Claude Code blocks only
-on exit 2 for these events; nothing here returns it.) `SessionEnd` hooks
-share a 1.5 s budget by default; the 3 s timeout raises it to 3 s.
+hook entry sets `"timeout": 2`, the SWB-R10 budget (2 s, always exit 0), so
+a dead or blackholed broker costs at most 2 s and never blocks a prompt or a
+stop. (Claude Code blocks only on exit 2 for these events; nothing here
+returns it.) `SessionEnd` hooks share a 1.5 s budget by default; the 2 s
+timeout raises it to 2 s.
 
 `swb hook` reads `session_id` from the hook's stdin and the rest of the
 identity from the environment. With no `SWB_*` environment it does nothing,

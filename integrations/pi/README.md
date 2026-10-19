@@ -7,7 +7,8 @@
 Pi has no built-in MCP client. Two routes are possible:
 
 1. **MCP adapter.** `mcp.json` is an `mcpServers` map for a Pi MCP adapter
-   extension, pointing at the broker's `/mcp` endpoint. Where the adapter
+   extension, pointing at the broker's `/mcp` endpoint; replace the example
+   host and port with your broker's. Where the adapter
    reads it from, and which keys it accepts, depend on the adapter you use;
    check its documentation.
 2. **CLI only.** Any session that can run shell commands can use `swb`
