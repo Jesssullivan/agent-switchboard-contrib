@@ -14,14 +14,28 @@
     "ttl_max_hours": 336,
     "ttl_min_hours": 1
   },
+  "peers": {
+    "dedup_key": [
+      "harness",
+      "host",
+      "session_id"
+    ],
+    "default_limit": 50,
+    "default_states": [
+      "live"
+    ],
+    "max_limit": 200
+  },
   "rulings": [
     "SWB-R09",
     "SWB-R14",
     "SWB-R16",
     "SWB-R46",
-    "R-C229"
+    "R-C229",
+    "R-C944"
   ],
   "session": {
+    "end_token_hex_length": 64,
     "idle_max_age_seconds": 21600,
     "lease_seconds": 900,
     "live_max_age_seconds": 900,

@@ -3,6 +3,7 @@
 -- | Thin adapter that runs the same operations against a running broker's
 -- REST API (/v1/register, /v1/end, /v1/peers, /v1/send, /v1/inbox, /v1/ack),
 -- so the properties in Swb.Properties can judge the real implementation.
+-- Every call is a POST with a JSON body, as v0.3.0 requires (R-C944).
 --
 -- It only issues HTTP requests to a broker someone else started; it never
 -- starts, stops or signals a process (R-N11). It refuses any URL that is not
@@ -24,7 +25,6 @@ import Data.Aeson (Value (..), eitherDecode, encode, object, (.=))
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import Data.Bits (shiftL, shiftR, (.&.))
-import qualified Data.ByteString.Char8 as B8
 import Data.List (isPrefixOf)
 import qualified Data.Map.Strict as M
 import Data.Maybe (mapMaybe)
@@ -57,6 +57,7 @@ data LiveSt = LiveSt
   , lsIds :: M.Map Int T.Text -- abstract message index -> msg_id
   , lsIndex :: M.Map T.Text Int -- msg_id -> abstract message index
   , lsNext :: Int
+  , lsTokens :: M.Map Agent [T.Text] -- end tokens each agent was given, newest first
   }
 
 -- | Run one generated case. The host part of every agent id is a fresh
@@ -66,23 +67,34 @@ runLive mgr base ops = do
   tag <- ("swbspec-" ++) . show <$> (randomRIO (0, 2 ^ (40 :: Int)) :: IO Integer)
   let host = T.pack tag
       pid (Agent a) = 40000 + a
-      agentId x@(Agent a) = T.concat ["claude:", host, ":", T.pack (show (pid x)), ":s", T.pack (show a)]
+      -- Agents 0 and 1 share a session id (Swb.Model.sessionOf), tagged per case.
+      sessionId x = T.concat ["s", T.pack (show (sessionOf x)), "-", host]
+      agentId x = T.concat ["claude:", host, ":", T.pack (show (pid x)), ":", sessionId x]
       ours = M.fromList [(agentId (Agent a), Agent a) | a <- [0 .. 2]]
       post path body = call =<< fmap (\r -> r {method = "POST", requestBody = RequestBodyLBS (encode body), requestHeaders = [("Content-Type", "application/json")]}) (parseRequest (base ++ path))
-      get path qs = call . setQueryString [(k, Just (B8.pack (T.unpack v))) | (k, v) <- qs] =<< parseRequest (base ++ path)
       call req = do
         resp <- httpLbs req mgr
         pure (statusCode (responseStatus resp), either (const Null) id (eitherDecode (responseBody resp)))
       stepLive (st, acc) op = do
         (r, st') <- case op of
           Register a p -> do
-            (code, _) <- post "/v1/register" (object ["harness" .= ("claude" :: T.Text), "host" .= host, "pid" .= pid a, "session_id" .= T.pack ("s" ++ show (unAgent a)), "proc_start" .= procStart p])
-            pure (if code == 200 then RRegistered else RErr (show code), st)
-          End a p -> do
-            (code, v) <- post "/v1/end" (object ["me" .= agentId a, "proc_start" .= procStart p])
+            (code, v) <- post "/v1/register" (object ["harness" .= ("claude" :: T.Text), "host" .= host, "pid" .= pid a, "session_id" .= sessionId a, "proc_start" .= procStart p])
+            case (code, str "end_token" v) of
+              (200, Just tok) -> pure (RRegistered (T.unpack tok), st {lsTokens = M.insertWith (++) a [tok] (lsTokens st)})
+              _ -> pure (RErr (show code), st)
+          End a ref -> do
+            let toks = M.findWithDefault [] a (lsTokens st)
+                forged = T.replicate 64 "0"
+                presented = case (ref, toks) of
+                  (LatestTok, t : _) -> t
+                  (PriorTok, t : older) -> case filter (/= t) older of
+                    (o : _) -> o
+                    [] -> t
+                  _ -> forged
+            (code, v) <- post "/v1/end" (object ["me" .= agentId a, "end_token" .= presented])
             pure (if code == 200 then REnded (str "state" v == Just "ended") else RErr (show code), st)
-          Peers a -> do
-            (code, v) <- get "/v1/peers" [("me", agentId a)]
+          Peers a everything -> do
+            (code, v) <- post "/v1/peers" (object ["me" .= agentId a, "all" .= everything, "host" .= host, "limit" .= (200 :: Int)])
             let row p = (,) <$> (str "agent_id" p >>= (`M.lookup` ours)) <*> (str "state" p >>= leaseState)
             pure (if code == 200 then RPeers (mapMaybe row (arr "peers" v)) else RErr (show code), st)
           Send from to th ttl -> do
@@ -94,7 +106,7 @@ runLive mgr base ops = do
                  in pure (RSent i th sq, st1 {lsIds = M.insert i mid (lsIds st1), lsIndex = M.insert mid i (lsIndex st1), lsNext = i + 1})
               _ -> pure (RErr (show code), st1)
           Inbox a limit -> do
-            (code, v) <- get "/v1/inbox" [("me", agentId a), ("limit", T.pack (show limit))]
+            (code, v) <- post "/v1/inbox" (object ["me" .= agentId a, "limit" .= limit])
             let row m = (,) <$> (str "msg_id" m >>= (`M.lookup` lsIndex st)) <*> int "delivery_count" m
                 rows = arr "messages" v
                 got = mapMaybe row rows
@@ -108,10 +120,9 @@ runLive mgr base ops = do
             pure (if code == 200 then RTicked else RErr (show code), st)
           _ -> pure (RUnsupported, st)
         pure (st', (op, r) : acc)
-  (_, acc) <- foldM stepLive (LiveSt M.empty M.empty M.empty 0, []) ops
+  (_, acc) <- foldM stepLive (LiveSt M.empty M.empty M.empty 0 M.empty, []) ops
   pure (reverse acc)
   where
-    unAgent (Agent a) = a
     procStart p = T.pack ("2026-10-04T00:00:0" ++ show p ++ "Z")
     threadId th st = case M.lookup th (lsThreads st) of
       Just t -> pure (t, st)

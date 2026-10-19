@@ -31,11 +31,13 @@ Status: **holds** = true in v0.1.0; **gap** = not true yet.
    `SWB_BROKER_URL` from their own pid when `tinyland.switchboard.enable` is
    set (R-C273). **Gap** in delivery: that switch is false on every host, and
    there is no live broker for it to point at.
-3. **Discover.** An agent lists live peers. *Accept:* `peers` returns live and
-   idle sessions only, bounded, without credentials. **Gap:** `peers` returns
-   every session row, including `ended` and `gone`, with no limit; session
-   rows are never pruned; and `proc_start` (the `/v1/end` check) is returned
-   to every caller.
+3. **Discover.** An agent lists live peers. *Accept:* `peers` returns live
+   sessions by default (`all` adds idle, gone and ended), bounded, without
+   credentials. **Holds in v0.3.0** (R-C944): `peers` is paginated (default
+   50, at most 200), lists one row per harness, host and session id (so
+   fixed-label IDE channels on different hosts stay distinct), and never
+   returns `proc_start`. `/v1/end` needs the end token that only `register`
+   returns. **Gap:** session rows are still never pruned.
 4. **Message.** An agent sends a ticketed message and gets a threaded reply.
    *Accept:* the broker stamps `authority: peer`; the reply shares
    `thread_id`. **Holds** over MCP, REST and `swb send --in-reply-to`.
@@ -57,10 +59,11 @@ Status: **holds** = true in v0.1.0; **gap** = not true yet.
    [--register]` prints one `ok`/`skip`/`FAIL` line per check with a fix,
    and exits 3 on any failure. A hook itself still logs nothing.
 9. **Deploy.** The blahaj owner runs the approved image. *Accept:* one
-   documented settings table, `/healthz`, P1b exits met. **Gap:** v0.1.0 is
+   documented settings table, `/healthz`, P1b exits met. **Holds** for
+   `/healthz` from v0.3.0 (R-C944), on both listeners. **Gap:** v0.1.0 is
    published by digest (`sha256:c9170c71…`, SWB-R55, pushed by hand under
-   R-C312) and the README carries the settings table, but there is no
-   `/healthz`, no broker is deployed and 0 of the P1b exits are met. The
+   R-C312) and the README carries the settings table, but no broker is
+   deployed and 0 of the P1b exits are met. The
    staged blahaj source (#1793) still pins the never-published SWB-R53
    digest.
 
@@ -81,8 +84,8 @@ up exits 0 silently (re-run on sting 2026-10-04: `/v1/peers` got curl exit
 7, both hooks exited 0).
 
 Still open from the install review: `just dev-serve` (loopback, scratch DB,
-self-bounded), and `swb --help` on stdout with exit 0 (today any unknown
-verb, `--help` included, prints usage on stderr and exits 2).
+self-bounded). `swb --help` prints usage on stdout and exits 0 from v0.3.0
+(R-C944).
 
 ## AX/UX friction, ranked
 
@@ -91,23 +94,28 @@ verb, `--help` included, prints usage on stderr and exits 2).
    and an empty mailbox look the same. Run `swb doctor` to tell them apart.
 2. **Notice was not actionable** before v0.2.0 (wrong command name, no agent
    id); v0.2.0 fixes it.
-3. **`peers` is unbounded and leaks `proc_start`,** which lets any reader end
-   any session through `/v1/end`.
-4. **MCP schemas carry no field descriptions or patterns;** rules (ticket
-   `TIN-<n>|none`, ULIDs, id shape `harness:host:pid:session`, 16 KiB body,
-   inbox limits) surface only as errors. The CLI checks them locally first.
+3. **Identity is self-asserted.** v0.3.0 (R-C944) bounds `peers` and stops
+   it leaking `proc_start`, and `end` needs the end token, so a caller can
+   no longer end a session without registering it. It is not
+   takeover-proof: anyone who can register can re-register any agent id,
+   get a fresh token and end that session. See story 3.
+4. ~~MCP schemas carry no field descriptions or patterns~~: v0.3.0 describes
+   every field and adds patterns and bounds (R-C944).
 5. **Broker errors are terse:** `invalid agent id`, `unknown envelope field`
-   without the field; every error but a `msg_id` conflict (409) is HTTP 400.
-   The CLI prints the broker's error string, capped at 200 characters.
-6. **CLI conventions:** `version` is a verb with no `--version` flag; help
-   exits 2; `agentd` is listed in usage but exits 3; `whoami` registers;
-   `whoami` and `inbox` report one missing variable per run (`doctor`
-   reports them all).
+   without the field. Since v0.3.0 every error is typed JSON
+   (`{"error", "code"}`) with a status per kind (400, 404, 405, 409, 415,
+   500), not a blanket 400 (R-C944). The CLI prints the broker's error
+   string, capped at 200 characters.
+6. **CLI conventions:** `whoami` and `inbox` report one missing variable per
+   run (`doctor` reports them all). Fixed in v0.3.0 (R-C944): `--help` and
+   `--version` exit 0, `agentd` is out of the usage text, and `whoami`
+   registers only with `--register`.
 7. **Client disagreement:** `swb` rejects a trailing `/` and `https`; lab's Pi
    client accepts both.
-8. **No `/healthz`;** `/v1/notify` is not implemented; `/v1/end` has no MCP
-   twin.
-9. **Inbox long-poll prunes the store every 250 ms.**
+8. **`/v1/notify` is not implemented.** v0.3.0 adds `/healthz` and the MCP
+   `end` tool (R-C944).
+9. ~~Inbox long-poll prunes the store every 250 ms~~: v0.3.0 prunes on the
+   broker's interval only (R-C944).
 
 ## Doc set
 
@@ -144,5 +152,7 @@ Recommended default first.
    notice text. v0.2.0 ships the bash-seat half (`swb inbox`, with the id);
    the MCP-tool half is still open, because no lab host registers `agents`
    for Claude yet.
-2. **`peers` exposure.** *Default:* live/idle only, `limit`, no
-   `proc_start`; `/v1/end` checks a credential never returned to others.
+2. **`peers` exposure.** Decided by R-C944 (v0.3.0): live only by default
+   (`all` for every state), paginated, one row per harness, host and
+   session id, no `proc_start`; `/v1/end` checks an end token that only `register`
+   returns.

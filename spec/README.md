@@ -19,7 +19,7 @@ adapter drives does live in `crates/`; see "Live adapter" below.
 | `dhall/ApprovedRelease.dhall` | Type of `docs/releases/approved-broker.json` (`swb.approved-release.v1`). |
 | `dhall/approved-broker.dhall` | The record itself. Its rendering must equal the committed JSON. |
 | `dhall/RustfsBucketIam.dhall` | Type of blahaj `config/rustfs-iam/owners.json` (`tinyland.blahaj.rustfs-bucket-iam.v1`), which carries the TIN-5105 `agent-switchboard-tofu-state` owner row. |
-| `dhall/Broker.dhall` | Ruled broker constants (SWB-R09, R14, R16) and the `Unruled` SWB-R16 cases. |
+| `dhall/Broker.dhall` | Ruled broker constants (SWB-R09, R14, R16; R-C944 end token and `peers` bounds) and the `Unruled` SWB-R16 cases. |
 | `dhall/generated/broker-constants.json` | Rendering of `Broker.dhall`, committed. The Haskell model reads only this file. |
 | `fixtures/blahaj-rustfs-iam-owners.json` | Snapshot of blahaj `owners.json` at commit `a54ff72480657fbecae8960946714081df2adb0e`. Check the live file with `just spec-owners <path>`. |
 | `check-dhall.sh` | The Dhall check. `just spec-dhall` and the flake check `spec-dhall` both run it. |
@@ -50,8 +50,17 @@ sessions, threads and messages. It follows the SWB-R16 text in ADR-0001 for
 claims, which Rust does not implement yet. Time is an abstract clock in
 seconds.
 
+Since v0.3.0 (R-C944) the model also covers the end token and the `peers`
+view. `register` returns a token, and `End` presents the latest token the
+caller holds, an older one, or one it never received. `Peers` asks for live
+rows or for all of them. Agents 0 and 1 share a session id (and every model
+agent shares one harness and host), so a registration by one hides the other
+from `peers`. Retention runs at each
+`Tick`, the model's stand-in for the broker's prune interval, and no longer
+inside `Send` or `Inbox`.
+
 Each property replays a trace of (operation, result) pairs and judges only the
-results. So the same five checks judge the model and, through the live
+results. So the same seven checks judge the model and, through the live
 adapter, the real broker.
 
 | Property | Ruling | Claim |
@@ -61,6 +70,8 @@ adapter, the real broker.
 | `atLeastOnceUntilAck` | SWB-R09 | Inbox returns only pending messages, and `delivery_count` goes up by one each time. A short page holds every pending message, so a message that is never acked keeps coming back. Ack succeeds exactly for my own messages that are unexpired or already acked. |
 | `exclusiveRefusal` | SWB-R16 | A non-exclusive claim is always recorded. A second exclusive claim returns `held_by` while another holder's unexpired exclusive claim exists. Otherwise the claim is recorded. |
 | `noOrphanAfterExpiry` | SWB-R16 | The claim list shows exactly the unexpired recorded claims. A claim is orphaned while its holder is gone, and not while the holder is live or idle. |
+| `endNeedsToken` | R-C944 | `End` succeeds exactly when it presents the latest token the agent's registrations returned. Every registration, even with the same `proc_start`, returns a token never handed out before. |
+| `peersView` | R-C944 | `peers` lists one row per (harness, host, session id), the one registered last, and only live rows unless the call asked for all. |
 
 **Unruled cases are never asserted.** The model answers each of these with
 `Unruled` and every property skips it:
@@ -153,9 +164,12 @@ just spec-live-clock http://127.0.0.1:18080
 
 - Wall-clock run (`just spec-live`): no `Tick`. It checks `threadSeqDense`
   and `atLeastOnceUntilAck` minus expiry, and `leaseLifecycle` only for the
-  live, ended and revive transitions.
+  live, ended and revive transitions. `endNeedsToken` and `peersView` run in
+  full, apart from rows decaying out of the live view.
 - Clocked run (`just spec-live-clock`): adds `Tick`, so `leaseLifecycle`
   covers live, idle and gone, `atLeastOnceUntilAck` covers expiry and the
-  7-day acked prune, and `threadSeqDense` covers seq after a prune.
+  7-day acked prune, and `threadSeqDense` covers seq after a prune. Each
+  `POST /v1/test/clock` runs one retention prune after it moves the clock,
+  as the model does at `Tick`.
 - Both: the claim properties stay vacuous until P2 implements claims
   (SWB-R16).

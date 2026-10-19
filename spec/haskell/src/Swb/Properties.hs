@@ -1,4 +1,4 @@
--- | Five parsimonious trace properties (R-C229). Each one replays a trace of
+-- | Seven parsimonious trace properties (R-C229, R-C944). Each one replays a trace of
 -- (operation, result) pairs and returns the violations it finds. They judge
 -- results only, so the same checks run against the pure model and against
 -- the live broker through Swb.Live.
@@ -10,6 +10,11 @@
 --   4. exclusiveRefusal    SWB-R16: the only refusal is a second exclusive claim.
 --   5. noOrphanAfterExpiry SWB-R16: listed claims are unexpired, and orphaned
 --                          exactly when the holder is gone.
+--   6. endNeedsToken       R-C944: only the latest token a session's registration
+--                          returned ends it; every registration rotates the token.
+--   7. peersView           R-C944: peers lists one row per (harness, host, session
+--                          id) (the latest registration wins), and only live rows
+--                          unless asked for all.
 --
 -- Unruled SWB-R16 cases are never asserted.
 module Swb.Properties
@@ -39,8 +44,8 @@ genOps mode = normalizeAcks <$> listOf (frequency (common ++ extra))
     agent = Agent <$> choose (0, 2)
     common =
       [ (3, Register <$> agent <*> choose (0, 1))
-      , (1, End <$> agent <*> choose (0, 1))
-      , (3, Peers <$> agent)
+      , (2, End <$> agent <*> elements [LatestTok, PriorTok, ForgedTok])
+      , (3, Peers <$> agent <*> arbitrary)
       , (5, Send <$> agent <*> agent <*> (Thread <$> choose (0, 2)) <*> oneof [pure Nothing, Just <$> elements [0, 1, 2, 72, 336, 337, 10000]])
       , (4, Inbox <$> agent <*> elements [1, 2, 3, 20, 100, 101])
       , (4, Ack <$> agent <*> choose (0, 20))
@@ -81,7 +86,7 @@ clocked = go 0
 
 -- | Which agent's lease an operation refreshed, judged from its result.
 refreshed :: Op -> Res -> Maybe Agent
-refreshed (Peers a) (RPeers _) = Just a
+refreshed (Peers a _) (RPeers _) = Just a
 refreshed (Send a _ _ _) (RSent {}) = Just a
 refreshed (Inbox a _) (RInbox _) = Just a
 refreshed (Ack a _) RAcked = Just a
@@ -92,7 +97,7 @@ refreshed _ _ = Nothing
 -- registered agents; a successful End marks ended.
 trackSessions :: Integer -> Op -> Res -> M.Map Agent Seen -> M.Map Agent Seen
 trackSessions t o r m = case (o, r) of
-  (Register a _, RRegistered) -> M.insert a (Seen t False) m
+  (Register a _, RRegistered _) -> M.insert a (Seen t False) m
   (End a _, REnded True) -> M.adjust (\x -> x {seenEnded = True}) a m
   _ -> maybe m (\a -> M.adjust (const (Seen t False)) a m) (refreshed o r)
 
@@ -229,6 +234,67 @@ noOrphanAfterExpiry c tr = go M.empty [] (clocked tr)
             _ -> []
        in bad ++ go sess' (replayClaims c t o r rs) rest
 
+-- | The tokens each agent was given, newest first.
+newtype Reg = Reg {regTokens :: [String]}
+
+-- | 6. An 'End' succeeds exactly when the token it presents is the latest
+-- one that agent's registrations returned. Every registration returns a new
+-- token, never one handed out before, so knowing proc_start never retrieves
+-- a live token.
+endNeedsToken :: Trace -> [String]
+endNeedsToken tr = go M.empty M.empty (clocked tr)
+  where
+    go _ _ [] = []
+    go regs sess ((t, o, r) : rest) =
+      let sess' = trackSessions t o r sess
+          bad = case (o, r) of
+            (Register a p, RRegistered tok) -> case M.lookup a regs of
+              Just (Reg toks) -> ["register " ++ show (a, p) ++ " reissued an old token" | tok `elem` toks]
+              _ -> []
+            (End a ref, REnded ok) ->
+              let toks = maybe [] regTokens (M.lookup a regs)
+                  presented = case (ref, toks) of
+                    (LatestTok, x : _) -> Just x
+                    (PriorTok, x : older) -> Just (case filter (/= x) older of (y : _) -> y; [] -> x)
+                    _ -> Nothing
+                  want = case toks of
+                    latest : _ -> presented == Just latest
+                    [] -> False
+               in ["end " ++ show (a, ref) ++ " gave " ++ show ok ++ " expected " ++ show want | ok /= want]
+            _ -> []
+          regs' = case (o, r) of
+            (Register a _, RRegistered tok) -> M.insert a (Reg (tok : maybe [] regTokens (M.lookup a regs))) regs
+            _ -> regs
+       in bad ++ go regs' sess' rest
+
+-- | 7. peers lists exactly one row per session id among registered agents
+-- (every generated agent shares a harness and host),
+-- the one registered last, and only those whose lease is live unless the
+-- call asked for all.
+peersView :: Constants -> Trace -> [String]
+peersView c tr = go (0 :: Int) M.empty M.empty (clocked tr)
+  where
+    go _ _ _ [] = []
+    go i order sess ((t, o, r) : rest) =
+      let sess' = trackSessions t o r sess
+          order' = case (o, r) of
+            (Register a _, RRegistered _) -> M.insert a i order
+            _ -> order
+          bad = case (o, r) of
+            (Peers _ everything, RPeers obs) ->
+              let winner a = all (\(b, j) -> sessionOf b /= sessionOf a || j <= M.findWithDefault 0 a order') (M.toList order')
+                  want =
+                    sort
+                      [ a
+                      | (a, x) <- M.toList sess'
+                      , winner a
+                      , everything || classify c t (seenAt x) (seenEnded x) == Live
+                      ]
+                  got = sort (map fst obs)
+               in ["peers all=" ++ show everything ++ " listed " ++ show got ++ " expected " ++ show want | got /= want]
+            _ -> []
+       in bad ++ go (i + 1) order' sess' rest
+
 -- | Named trace checks. Swb.Live and the test driver wrap them.
 properties :: Constants -> [(String, Trace -> [String])]
 properties c =
@@ -237,4 +303,6 @@ properties c =
   , ("atLeastOnceUntilAck", atLeastOnceUntilAck c)
   , ("exclusiveRefusal", exclusiveRefusal c)
   , ("noOrphanAfterExpiry", noOrphanAfterExpiry c)
+  , ("endNeedsToken", endNeedsToken)
+  , ("peersView", peersView c)
   ]

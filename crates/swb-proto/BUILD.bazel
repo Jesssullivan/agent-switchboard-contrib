@@ -19,6 +19,10 @@ rust_test(
         normal_dev = True,
         proc_macro_dev = True,
     ),
+    compile_data = [
+        "//:Cargo.toml",
+        "//:MODULE.bazel",
+    ],
     crate = ":swb_proto",
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),

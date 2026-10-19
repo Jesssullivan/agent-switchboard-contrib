@@ -22,12 +22,13 @@
 //! to approve a tool call in someone else's session (SWB-R14).
 //!
 //! SWB-R10 holds here as it does for hooks. Every broker request runs on the
-//! bounded client (1.5 s), the inbox is read with `wait_seconds=0`, and a
+//! bounded client (1.5 s), the inbox is read (`POST /v1/inbox`) with
+//! `wait_seconds=0`, and a
 //! broker that is down, slow or wrong only makes the poller retry quietly
 //! with backoff. Nothing here blocks or ends the harness.
 use super::{
     Check, Identity, Lookup, MAX_BODY_BYTES, SendArgs, VERSION, call_with, need,
-    predicted_identity, send_payload, valid_agent_id, valid_ulid,
+    predicted_identity, send_payload, valid_agent_id, valid_part, valid_ulid,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -96,10 +97,13 @@ pub(crate) fn snapshot(lookup: Lookup) -> Env {
 /// registered for this `SWB_HOST`, `SWB_SESSION_PID` and `SWB_PROC_START`.
 /// The last form follows `/clear` and resume, which change the session id.
 /// Claude Code exports no session id to a stdio MCP server, so this lookup
-/// is how a launcher-started session finds its own row. It compares
-/// `proc_start` when the listing carries it, and otherwise matches host and
-/// pid only (PRODUCT.md open decision 2 proposes dropping `proc_start` from
-/// `peers`); the newest non-ended row wins.
+/// is how a launcher-started session finds its own row. Since v0.3.0
+/// `peers` never returns `proc_start` (R-C944), so the channel asks the
+/// broker to filter on its own `SWB_PROC_START` (`POST /v1/peers`), then
+/// matches host, pid and, when set, harness. A crashed earlier session that
+/// reused the pid has another `proc_start` and is never picked. It asks for
+/// every state, because an idle session is still this session, and the
+/// newest non-ended row wins.
 pub(crate) fn resolve_me(lookup: Lookup) -> Result<Option<String>, String> {
     if let Some(me) = lookup("SWB_AGENT_ID").filter(|v| !v.is_empty()) {
         return if valid_agent_id(&me) {
@@ -116,8 +120,14 @@ pub(crate) fn resolve_me(lookup: Lookup) -> Result<Option<String>, String> {
     }
 }
 
+/// Pages of this host's sessions `registered_row` reads at most.
+const PEERS_PAGES: usize = 5;
+
 fn registered_row(lookup: Lookup) -> Result<Option<String>, String> {
     let host = need(lookup, "SWB_HOST")?;
+    if !valid_part(&host) {
+        return Err("SWB_HOST has characters outside [A-Za-z0-9._-]".into());
+    }
     // The broker mints the id from the numeric pid, so compare that form:
     // "+0077" in the environment is the row ending in ":77:".
     let pid = need(lookup, "SWB_SESSION_PID")?
@@ -126,19 +136,36 @@ fn registered_row(lookup: Lookup) -> Result<Option<String>, String> {
         .to_string();
     let proc_start = need(lookup, "SWB_PROC_START")?;
     let harness = lookup("SWB_HARNESS").filter(|v| !v.is_empty());
-    let listing = call_with(lookup, "GET", "/v1/peers", None)?;
-    let peers = listing
-        .get("peers")
-        .and_then(Value::as_array)
-        .ok_or("broker answered without a peers list")?;
+    let mut peers = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..PEERS_PAGES {
+        let query = json!({
+            "all": true, "host": host, "proc_start": proc_start,
+            "limit": 200, "cursor": cursor,
+        });
+        let listing = call_with(lookup, "POST", "/v1/peers", Some(&query))?;
+        peers.extend(
+            listing
+                .get("peers")
+                .and_then(Value::as_array)
+                .ok_or("broker answered without a peers list")?
+                .iter()
+                .cloned(),
+        );
+        match listing
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .filter(|c| valid_agent_id(c))
+        {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
     let text = |row: &Value, key: &str| row.get(key).and_then(Value::as_str).map(str::to_owned);
     Ok(peers
         .iter()
         .filter(|row| {
             text(row, "host").as_deref() == Some(host.as_str())
-                && text(row, "proc_start")
-                    .as_deref()
-                    .is_none_or(|p| p == proc_start.as_str())
                 && text(row, "state").as_deref() != Some("ended")
                 && harness
                     .as_deref()
@@ -166,9 +193,11 @@ fn me_or_err(lookup: Lookup) -> Result<String, String> {
 }
 
 fn fetch(lookup: Lookup, me: &str) -> Result<Value, String> {
-    let path = |limit: u32| format!("/v1/inbox?me={me}&limit={limit}&wait_seconds=0");
-    match call_with(lookup, "GET", &path(PAGE), None) {
-        Err(e) if e == "broker response too large" => call_with(lookup, "GET", &path(1), None),
+    let body = |limit: u32| json!({"me": me, "limit": limit, "wait_seconds": 0});
+    match call_with(lookup, "POST", "/v1/inbox", Some(&body(PAGE))) {
+        Err(e) if e == "broker response too large" => {
+            call_with(lookup, "POST", "/v1/inbox", Some(&body(1)))
+        }
         other => other,
     }
 }
@@ -769,26 +798,28 @@ mod tests {
             assert_eq!(poll.pending, 1);
             let requests = server.join().unwrap();
             assert_eq!(requests.len(), 1);
-            assert!(
-                requests[0].starts_with(
-                    "GET /v1/inbox?me=claude:neo:77:s-1&limit=8&wait_seconds=0 HTTP/1.1"
-                )
+            assert!(requests[0].starts_with("POST /v1/inbox HTTP/1.1"));
+            assert_eq!(
+                request_json(&requests[0]),
+                json!({"me": ME, "limit": 8, "wait_seconds": 0})
             );
         }
     }
 
     #[test]
     fn identity_follows_the_registered_row_for_this_launcher_process() {
-        let peers = r#"{"peers":[
-            {"agent_id":"claude:neo:77:old","harness":"claude","host":"neo","proc_start":"p1","last_seen":50,"state":"ended"},
-            {"agent_id":"claude:neo:77:stale","harness":"claude","host":"neo","proc_start":"p1","last_seen":10,"state":"idle"},
-            {"agent_id":"claude:neo:77:new","harness":"claude","host":"neo","proc_start":"p1","last_seen":40,"state":"live"},
-            {"agent_id":"claude:neo:77:reused","harness":"claude","host":"neo","proc_start":"p0","last_seen":99,"state":"live"},
-            {"agent_id":"claude:neo:78:other","harness":"claude","host":"neo","proc_start":"p1","last_seen":99,"state":"live"},
-            {"agent_id":"claude:sting:77:far","harness":"claude","host":"sting","proc_start":"p1","last_seen":99,"state":"live"}
-        ]}"#;
+        let first = r#"{"peers":[
+            {"agent_id":"claude:neo:77:old","harness":"claude","host":"neo","last_seen":50,"state":"ended"},
+            {"agent_id":"claude:neo:77:stale","harness":"claude","host":"neo","last_seen":10,"state":"idle"}
+        ],"next_cursor":"claude:neo:77:stale"}"#;
+        let second = r#"{"peers":[
+            {"agent_id":"claude:neo:77:new","harness":"claude","host":"neo","last_seen":40,"state":"live"},
+            {"agent_id":"claude:neo:78:other","harness":"claude","host":"neo","last_seen":99,"state":"live"},
+            {"agent_id":"claude:sting:77:far","harness":"claude","host":"sting","last_seen":99,"state":"live"}
+        ],"next_cursor":null}"#;
         let (url, server) = mock(vec![
-            (200, "application/json", peers),
+            (200, "application/json", first),
+            (200, "application/json", second),
             (200, "application/json", r#"{"messages":[]}"#),
         ]);
         let lookup = lookup_of(&[
@@ -800,12 +831,21 @@ mod tests {
         let poll = poll_once(&lookup, &mut Seen::default()).unwrap();
         assert_eq!((poll.events.len(), poll.pending), (0, 0));
         let requests = server.join().unwrap();
-        assert!(requests[0].starts_with("GET /v1/peers HTTP/1.1"));
-        assert!(requests[1].starts_with("GET /v1/inbox?me=claude:neo:77:new&"));
+        // The listing is filtered on this process's proc_start by the
+        // broker, in a POST body, so neither it nor a cursor is in a URL.
+        assert!(requests[0].starts_with("POST /v1/peers HTTP/1.1"));
+        assert_eq!(
+            request_json(&requests[0]),
+            json!({"all": true, "host": "neo", "proc_start": "p1", "limit": 200, "cursor": null})
+        );
+        assert!(requests[1].starts_with("POST /v1/peers HTTP/1.1"));
+        assert_eq!(request_json(&requests[1])["cursor"], "claude:neo:77:stale");
+        assert!(requests[2].starts_with("POST /v1/inbox HTTP/1.1"));
+        assert_eq!(request_json(&requests[2])["me"], "claude:neo:77:new");
     }
 
     #[test]
-    fn identity_matches_host_and_pid_when_peers_omits_proc_start() {
+    fn identity_matches_host_pid_and_harness() {
         let peers = r#"{"peers":[
             {"agent_id":"claude:neo:77:old","harness":"claude","host":"neo","last_seen":50,"state":"ended"},
             {"agent_id":"claude:neo:77:new","harness":"claude","host":"neo","last_seen":40,"state":"live"},

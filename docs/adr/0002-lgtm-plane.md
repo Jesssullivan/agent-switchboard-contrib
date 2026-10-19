@@ -722,11 +722,12 @@ Corrected against `lab@3d755193` (critique fixes adopted under R0 ruling 3):
   (`docs/agent-notes/2026-09-04-sess-587af118-computer-use-bridge-b-design.md:128-129`).
   Declaring it would displace the computer-use hook, the same way owning
   `features` would overwrite operator toggles. So: no new table, Codex
-  registers through `swb whoami`, heartbeats ride tool calls, and the
+  registers through `swb whoami --register` (plain `swb whoami` registered
+  before v0.3.0, R-C944), heartbeats ride tool calls, and the
   registry projects through `export-registries.py` and the Codex inventory
   cassettes. A fan-out `notify` wrapper is a separate ruling if ever wanted.
   **The binding mechanism is unproven.** No research lane produced evidence
-  of how `swb whoami`, run as a Codex MCP tool process, picks the calling
+  of how `swb whoami --register`, run as a Codex MCP tool process, picks the calling
   session when several Codex sessions run on one host; the earlier phrase
   "reads Codex's own session records read-only" named a place, not a
   binding. The binding must be something Codex hands the process — an
@@ -738,7 +739,7 @@ Corrected against `lab@3d755193` (critique fixes adopted under R0 ruling 3):
   own observable exit in ADR-0001 → P1b, and the P1b round trip does not
   silently depend on it.
 - **OpenCode.** The same registry entry through `opencodeRegistryServers`;
-  identity via `swb whoami`.
+  identity via `swb whoami --register`.
 - **Junie.** One server per launch: the default group `mux`, or a profile
   group as "an OPT-IN override per launch … each budgeted alone"
   (`mcp-mux-manifest.nix:31-32`). `ag` goes in `tracker` only (SWB-R12;
@@ -1324,7 +1325,7 @@ critique; each is settled by the exit that names it):
 - the membership of `group:dollhouse-admins` and `group:dollhouse-users`;
 - the tfvars value of the mail stack's `alertmanager_ntfy_topic` (read by a
   lane as `blahaj-mail-alerts`; only the variable was re-read here);
-- how `swb whoami` binds to the calling Codex session (no lane evidence;
+- how `swb whoami --register` binds to the calling Codex session (no lane evidence;
   P1b exit);
 - `settingsJson.telemetry.enabled` is inert (medium confidence);
 - how many tools mcp-grafana 1.6.0 enables by default (so the `ops` count
