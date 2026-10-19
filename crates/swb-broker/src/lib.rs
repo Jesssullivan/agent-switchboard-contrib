@@ -311,7 +311,11 @@ post_operation!(peers_post, "peers");
 post_operation!(inbox_post, "inbox");
 
 fn method_not_allowed(allow: &'static str, message: &str) -> Response {
-    let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", message);
+    let mut response = error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        message,
+    );
     response
         .headers_mut()
         .insert(header::ALLOW, HeaderValue::from_static(allow));
@@ -337,12 +341,22 @@ async fn peers_get(
             "all" => match value.as_str() {
                 "1" | "true" => json!(true),
                 "0" | "false" => json!(false),
-                _ => return error_response(StatusCode::BAD_REQUEST, "invalid_argument", "invalid all"),
+                _ => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_argument",
+                        "invalid all",
+                    );
+                }
             },
             "limit" => match value.parse::<u64>() {
                 Ok(n) => json!(n),
                 Err(_) => {
-                    return error_response(StatusCode::BAD_REQUEST, "invalid_argument", "invalid limit");
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_argument",
+                        "invalid limit",
+                    );
                 }
             },
             "host" | "cursor" => json!(value),
@@ -350,7 +364,13 @@ async fn peers_get(
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "invalid_argument",
-                    &format!("unknown query parameter {}", key.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect::<String>()),
+                    &format!(
+                        "unknown query parameter {}",
+                        key.chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .take(32)
+                            .collect::<String>()
+                    ),
                 );
             }
         };
@@ -382,7 +402,11 @@ async fn wrong_method() -> Response {
 /// otherwise. No identity, no body, no write.
 async fn healthz(State(store): State<Arc<Store>>) -> Response {
     match tokio::task::spawn_blocking(move || store.health()).await {
-        Ok(Ok(())) => (StatusCode::OK, Json(json!({"status":"ok","version":VERSION}))).into_response(),
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(json!({"status":"ok","version":VERSION})),
+        )
+            .into_response(),
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status":"unavailable","version":VERSION})),
@@ -1349,14 +1373,19 @@ mod tests {
     fn lists_six_typed_and_described_tools() {
         assert_eq!(tools().len(), 6);
         assert_eq!(
-            tools().iter().map(|t| t.name.to_string()).collect::<Vec<_>>(),
+            tools()
+                .iter()
+                .map(|t| t.name.to_string())
+                .collect::<Vec<_>>(),
             TOOL_NAMES
         );
         for tool in tools() {
             let props = tool.input_schema["properties"].as_object().unwrap();
             for (key, schema) in props {
                 assert!(
-                    schema["description"].as_str().is_some_and(|d| !d.is_empty()),
+                    schema["description"]
+                        .as_str()
+                        .is_some_and(|d| !d.is_empty()),
                     "{}.{key} has no description",
                     tool.name
                 );
@@ -1446,7 +1475,14 @@ mod tests {
         assert_eq!(acked["state"], "acked");
         let empty = mcp_call(&app, &session, 9, "inbox", json!({"me":to})).await;
         assert!(empty["messages"].as_array().unwrap().is_empty());
-        let ended = mcp_call(&app, &session, 10, "end", json!({"me":from,"end_token":token})).await;
+        let ended = mcp_call(
+            &app,
+            &session,
+            10,
+            "end",
+            json!({"me":from,"end_token":token}),
+        )
+        .await;
         assert_eq!(ended["state"], "ended");
         let live = mcp_call(&app, &session, 11, "peers", json!({})).await;
         assert_eq!(live["peers"].as_array().unwrap().len(), 1);
@@ -1740,7 +1776,12 @@ mod tests {
         }
         let not_found = app
             .clone()
-            .oneshot(guarded_request("GET", "/nope", "", &[("host", "localhost")]))
+            .oneshot(guarded_request(
+                "GET",
+                "/nope",
+                "",
+                &[("host", "localhost")],
+            ))
             .await
             .unwrap();
         assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
@@ -1749,7 +1790,12 @@ mod tests {
             json!({"error":"no such route","code":"not_found"})
         );
         let health = app
-            .oneshot(guarded_request("GET", "/healthz", "", &[("host", "localhost")]))
+            .oneshot(guarded_request(
+                "GET",
+                "/healthz",
+                "",
+                &[("host", "localhost")],
+            ))
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
@@ -1895,7 +1941,9 @@ mod tests {
         let store = seeded_store();
         let app = router(Arc::clone(&store), vec!["localhost".into()]);
         store
-            .send(&json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"x"}))
+            .send(
+                &json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"x"}),
+            )
             .unwrap();
         let before = state_snapshot(&store);
         for uri in [
@@ -1908,7 +1956,10 @@ mod tests {
             assert_eq!(response.headers()[header::ALLOW], "POST", "{uri}");
             let body = json_of(response).await;
             assert_eq!(body["code"], "method_not_allowed", "{uri}");
-            assert!(body["error"].as_str().unwrap().contains("POST /v1/"), "{uri}");
+            assert!(
+                body["error"].as_str().unwrap().contains("POST /v1/"),
+                "{uri}"
+            );
         }
         assert_eq!(state_snapshot(&store), before);
         let inbox = store.inbox("pi:sting:2:b", 10).unwrap();
@@ -1922,7 +1973,13 @@ mod tests {
     async fn post_peers_and_inbox_take_a_json_body() {
         let store = seeded_store();
         let app = router(Arc::clone(&store), vec!["localhost".into()]);
-        let refreshed = call(&app, "POST", "/v1/peers", r#"{"me":"pi:sting:2:b","all":true}"#).await;
+        let refreshed = call(
+            &app,
+            "POST",
+            "/v1/peers",
+            r#"{"me":"pi:sting:2:b","all":true}"#,
+        )
+        .await;
         assert_eq!(refreshed.status(), StatusCode::OK);
         let body = json_of(refreshed).await;
         assert_eq!(body["peers"][0]["agent_id"], "pi:sting:2:b");
@@ -1940,22 +1997,63 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
             assert_eq!(json_of(response).await["code"], code, "{uri}");
         }
-        let inbox = call(&app, "POST", "/v1/inbox", r#"{"me":"pi:sting:2:b","limit":1}"#).await;
+        let inbox = call(
+            &app,
+            "POST",
+            "/v1/inbox",
+            r#"{"me":"pi:sting:2:b","limit":1}"#,
+        )
+        .await;
         assert_eq!(inbox.status(), StatusCode::OK);
-        assert!(json_of(inbox).await["messages"].as_array().unwrap().is_empty());
+        assert!(
+            json_of(inbox).await["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn errors_are_typed_json() {
         let app = router(seeded_store(), vec!["localhost".into()]);
         let cases: [(&str, &str, StatusCode, &str); 7] = [
-            ("/v1/peers", r#"{"me":"codex:honey:3:nobody"}"#, StatusCode::NOT_FOUND, "unregistered"),
-            ("/v1/ack", r#"{"me":"pi:sting:2:b","msg_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#, StatusCode::NOT_FOUND, "message_unavailable"),
-            ("/v1/send", r#"{"from":"x","to":"y","ticket":"none","body":"b"}"#, StatusCode::BAD_REQUEST, "invalid_argument"),
-            ("/v1/peers", r#"{"all":"yes"}"#, StatusCode::BAD_REQUEST, "invalid_argument"),
-            ("/v1/send", "{not json", StatusCode::BAD_REQUEST, "invalid_json"),
+            (
+                "/v1/peers",
+                r#"{"me":"codex:honey:3:nobody"}"#,
+                StatusCode::NOT_FOUND,
+                "unregistered",
+            ),
+            (
+                "/v1/ack",
+                r#"{"me":"pi:sting:2:b","msg_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
+                StatusCode::NOT_FOUND,
+                "message_unavailable",
+            ),
+            (
+                "/v1/send",
+                r#"{"from":"x","to":"y","ticket":"none","body":"b"}"#,
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+            ),
+            (
+                "/v1/peers",
+                r#"{"all":"yes"}"#,
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+            ),
+            (
+                "/v1/send",
+                "{not json",
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+            ),
             ("/v1/send", "[]", StatusCode::BAD_REQUEST, "invalid_json"),
-            ("/v1/inbox", r#"{"me":"pi:sting:2:b","wait_seconds":"5"}"#, StatusCode::BAD_REQUEST, "invalid_argument"),
+            (
+                "/v1/inbox",
+                r#"{"me":"pi:sting:2:b","wait_seconds":"5"}"#,
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+            ),
         ];
         for (uri, body, status, code) in cases {
             let response = call(&app, "POST", uri, body).await;
@@ -1985,12 +2083,16 @@ mod tests {
     async fn end_over_rest_needs_the_registered_token() {
         let store = Arc::new(Store::memory().unwrap());
         let app = router(Arc::clone(&store), vec!["localhost".into()]);
-        let registered = json_of(
-            call(&app, "POST", "/v1/register", GUARDED_ROUTES[0].2).await,
+        let registered =
+            json_of(call(&app, "POST", "/v1/register", GUARDED_ROUTES[0].2).await).await;
+        let token = registered["end_token"].as_str().unwrap();
+        let legacy = call(
+            &app,
+            "POST",
+            "/v1/end",
+            r#"{"me":"claude:honey:1:a","proc_start":"1"}"#,
         )
         .await;
-        let token = registered["end_token"].as_str().unwrap();
-        let legacy = call(&app, "POST", "/v1/end", r#"{"me":"claude:honey:1:a","proc_start":"1"}"#).await;
         assert_eq!(legacy.status(), StatusCode::BAD_REQUEST);
         assert!(error_of(legacy).await.contains("end_token"));
         let forged = call(&app, "POST", "/v1/end", GUARDED_ROUTES[1].2).await;
@@ -2013,6 +2115,9 @@ mod tests {
         let token = result["end_token"].as_str().unwrap();
         let line = audit_record("register", &args, &result, None).to_string();
         assert!(!line.contains(token), "{line}");
-        assert_eq!(audit_record("register", &args, &result, None)["agent_id"], "claude:honey:1:a");
+        assert_eq!(
+            audit_record("register", &args, &result, None)["agent_id"],
+            "claude:honey:1:a"
+        );
     }
 }

@@ -265,12 +265,16 @@ fn token_path(lookup: Lookup, agent_id: &str) -> Result<PathBuf, String> {
     if !valid_agent_id(agent_id) || agent_id.len() > 240 {
         return Err("agent id cannot name a token file".into());
     }
-    let dir = token_dir(lookup).ok_or("no SWB_STATE_DIR, XDG_STATE_HOME or HOME for the end token")?;
+    let dir =
+        token_dir(lookup).ok_or("no SWB_STATE_DIR, XDG_STATE_HOME or HOME for the end token")?;
     Ok(dir.join(format!("{agent_id}.token")))
 }
 
 fn valid_token(token: &str) -> bool {
-    token.len() == 64 && token.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    token.len() == 64
+        && token
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Saves the end token from a register response, if it carries one. Returns
@@ -1187,7 +1191,11 @@ fn main() -> ExitCode {
             ExitCode::from(3)
         }
         Some(other) => usage_error(
-            &other.chars().filter(|c| c.is_ascii_graphic()).take(32).collect::<String>(),
+            &other
+                .chars()
+                .filter(|c| c.is_ascii_graphic())
+                .take(32)
+                .collect::<String>(),
             "unknown command",
         ),
         None => usage_error("", "missing command"),
@@ -1683,7 +1691,10 @@ mod tests {
         let saved = save_token(&lookup, &json!({"agent_id":ME,"end_token":TOKEN}))
             .unwrap()
             .unwrap();
-        assert_eq!(saved, PathBuf::from(&state).join("sessions/claude:neo:41:s-1.token"));
+        assert_eq!(
+            saved,
+            PathBuf::from(&state).join("sessions/claude:neo:41:s-1.token")
+        );
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&saved), 0o600);
         assert_eq!(mode(saved.parent().unwrap()), 0o700);
@@ -1695,7 +1706,10 @@ mod tests {
         assert_eq!(ended["state"], "ended");
         let requests = server.join().unwrap();
         assert!(requests[0].starts_with("POST /v1/end HTTP/1.1"));
-        assert_eq!(request_json(&requests[0]), json!({"me":ME,"end_token":TOKEN}));
+        assert_eq!(
+            request_json(&requests[0]),
+            json!({"me":ME,"end_token":TOKEN})
+        );
         assert!(!saved.exists(), "a spent token stays on disk");
         // Without a saved token, SessionEnd makes no broker call.
         assert!(end_session(&lookup, "claude", "s-1").is_err());
@@ -1752,12 +1766,16 @@ mod tests {
         let out = whoami_cmd(&lookup_of(&borrowed), true).unwrap();
         assert_eq!(out["registered"], true);
         assert!(!out.to_string().contains(TOKEN), "{out}");
-        assert!(out["end_token_file"].as_str().unwrap().ends_with("claude:neo:41:s-1.token"));
+        assert!(
+            out["end_token_file"]
+                .as_str()
+                .unwrap()
+                .ends_with("claude:neo:41:s-1.token")
+        );
         assert!(server.join().unwrap()[0].starts_with("POST /v1/register "));
         assert_eq!(load_token(&lookup_of(&borrowed), ME).unwrap(), TOKEN);
         let _ = std::fs::remove_dir_all(&state);
     }
-
 
     #[test]
     fn doctor_with_nothing_set_fails_with_fixes() {

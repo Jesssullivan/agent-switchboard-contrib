@@ -378,12 +378,18 @@ impl Store {
             })
             .map_err(sql_err)?;
         for (column, ddl) in [
-            ("session_id", "ALTER TABLE sessions ADD COLUMN session_id TEXT"),
+            (
+                "session_id",
+                "ALTER TABLE sessions ADD COLUMN session_id TEXT",
+            ),
             (
                 "registered_seq",
                 "ALTER TABLE sessions ADD COLUMN registered_seq INTEGER NOT NULL DEFAULT 0",
             ),
-            ("token_nonce", "ALTER TABLE sessions ADD COLUMN token_nonce BLOB"),
+            (
+                "token_nonce",
+                "ALTER TABLE sessions ADD COLUMN token_nonce BLOB",
+            ),
         ] {
             if !columns.iter().any(|c| c == column) {
                 db.execute(ddl, []).map_err(sql_err)?;
@@ -419,9 +425,11 @@ impl Store {
     }
     fn keyed_mac(db: &Connection, key_name: &str) -> StoreResult<Hmac<Sha256>> {
         let key: Vec<u8> = db
-            .query_row("SELECT value FROM settings WHERE name=?1", [key_name], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT value FROM settings WHERE name=?1",
+                [key_name],
+                |r| r.get(0),
+            )
             .map_err(sql_err)?;
         Hmac::<Sha256>::new_from_slice(&key)
             .map_err(|e| StoreError::new(ErrorKind::Internal, e.to_string()))
@@ -599,9 +607,11 @@ impl Store {
                 |r| {
                     let seen: i64 = r.get(3)?;
                     let ended: i64 = r.get(4)?;
-                    Ok(json!({"agent_id":r.get::<_,String>(0)?,"harness":r.get::<_,String>(1)?,
+                    Ok(
+                        json!({"agent_id":r.get::<_,String>(0)?,"harness":r.get::<_,String>(1)?,
                         "host":r.get::<_,String>(2)?,"last_seen":seen,
-                        "state":lease_state(seen, ended != 0, now)}))
+                        "state":lease_state(seen, ended != 0, now)}),
+                    )
                 },
             )
             .map_err(sql_err)?;
@@ -985,7 +995,14 @@ mod tests {
         }
     }
 
-    fn reg(s: &Store, harness: &str, host: &str, pid: u32, session: &str, proc_start: &str) -> Value {
+    fn reg(
+        s: &Store,
+        harness: &str,
+        host: &str,
+        pid: u32,
+        session: &str,
+        proc_start: &str,
+    ) -> Value {
         s.register(&json!({"harness":harness,"host":host,"pid":pid,"session_id":session,"proc_start":proc_start}))
             .unwrap()
     }
@@ -1122,14 +1139,23 @@ mod tests {
         assert_eq!(token.len(), END_TOKEN_HEX_LEN);
         // The listing never carries proc_start or a token.
         let listed = s.peers(&all()).unwrap().to_string();
-        assert!(!listed.contains("start-1") && !listed.contains(&token), "{listed}");
+        assert!(
+            !listed.contains("start-1") && !listed.contains(&token),
+            "{listed}"
+        );
         assert!(!listed.contains("proc_start"), "{listed}");
         // A forged or malformed token ends nothing, and says nothing.
         let forged = "0".repeat(END_TOKEN_HEX_LEN);
         assert_eq!(s.end(me, &forged).unwrap()["state"], "unknown");
         assert_eq!(s.end(me, "start-1").unwrap_err(), "invalid end_token");
-        assert_eq!(s.end(me, &token.to_uppercase()).unwrap_err(), "invalid end_token");
-        assert_eq!(s.end("codex:honey:9:none", &token).unwrap()["state"], "unknown");
+        assert_eq!(
+            s.end(me, &token.to_uppercase()).unwrap_err(),
+            "invalid end_token"
+        );
+        assert_eq!(
+            s.end("codex:honey:9:none", &token).unwrap()["state"],
+            "unknown"
+        );
         assert_eq!(s.peers(&all()).unwrap()["peers"][0]["state"], "live");
         // Every register rotates the token, even with the same proc_start,
         // so knowing proc_start never retrieves the live token.
@@ -1138,7 +1164,10 @@ mod tests {
         assert_eq!(s.end(me, &token).unwrap()["state"], "unknown");
         let rotated = reg(&s, "claude", "honey", 10, "same", "start-2");
         assert_ne!(rotated["end_token"], again["end_token"]);
-        assert_eq!(s.end(me, again["end_token"].as_str().unwrap()).unwrap()["state"], "unknown");
+        assert_eq!(
+            s.end(me, again["end_token"].as_str().unwrap()).unwrap()["state"],
+            "unknown"
+        );
         let current = rotated["end_token"].as_str().unwrap().to_owned();
         assert_eq!(s.end(me, &current).unwrap()["state"], "ended");
         assert_eq!(s.peers(&all()).unwrap()["peers"][0]["state"], "ended");
@@ -1242,7 +1271,10 @@ mod tests {
                 .unwrap();
             let rows = page["peers"].as_array().unwrap();
             assert!(rows.len() <= 2);
-            seen.extend(rows.iter().map(|p| p["agent_id"].as_str().unwrap().to_owned()));
+            seen.extend(
+                rows.iter()
+                    .map(|p| p["agent_id"].as_str().unwrap().to_owned()),
+            );
             match page["next_cursor"].as_str() {
                 Some(next) => cursor = Some(next.to_owned()),
                 None => break,
