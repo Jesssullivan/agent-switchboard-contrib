@@ -16,7 +16,7 @@ secrets. It covers every mode `main` has, in order:
 | 9 | MCP over Streamable HTTP, with curl as the client: `tools/list`, `register`, `peers`, `send`, `inbox`, `ack`. The agent registers with harness id `pi`, but Pi has no built-in MCP client and its integration is unproven (R-C949) |
 | 10 | Cross-host: a second host (a second process with its own `SWB_HOST` and state dir) on the same broker, and a second broker that does not federate |
 | 11 | v0.3.0 end tokens: a forged end is refused, SessionEnd spends the token |
-| 12 | Claims and handoff as ADR-0001 SWB-R16 defines them (advisory claims with `overlaps[]`, exclusive-vs-exclusive refusal, `offered` handoff receipt accepted by the receiver's claim): **pending P2** stubs only; `swb agentd` exits 3 |
+| 12 | Claims and handoff as ADR-0001 SWB-R16 and SWB-R60 (R-C950) define them (advisory claims with `overlaps[]`, an exclusive request refused while any other session holds an active claim on the subject, `offered` handoff receipt accepted by the receiver's claim): **pending P2** stubs only; `swb agentd` exits 3 |
 
 ```sh
 SWB_BIN=/path/to/swb examples/demo/run.sh            # print the transcript
@@ -28,7 +28,8 @@ It needs bash, curl, jq, `mkfifo` and an `swb` 0.3.x binary. Brokers listen
 on `127.0.0.1:18181` and `:18182` (metrics `:19191`, `:19192`); move them
 with `SWB_DEMO_PORT_BASE`. The script refuses to start if any of those ports
 already answers, and treats a broker as up only while its own process is
-alive, so it never runs against another broker's state. All run state lives in one `mktemp -d` directory
+alive. That is a best-effort guard, not a guarantee: a listener that accepts
+but never answers HTTP still reads as a free port. All run state lives in one `mktemp -d` directory
 that the script deletes on exit.
 
 The transcript is reproducible: the script uses fixed message ids and fixed

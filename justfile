@@ -40,7 +40,8 @@ remote-check host="sting" dir="~/scratch/agent-switchboard-check":
 # run the one-host selftest (R-C953, TIN-6694). Build host only, never neo.
 demo-check:
     {{clean_bazel_env}} bazelisk build --lockfile_mode=error //crates/swb:swb
-    SWB_BIN="$(bazelisk cquery --output=files //crates/swb:swb 2>/dev/null)"; \
+    SWB_BIN="$({{clean_bazel_env}} bazelisk cquery --lockfile_mode=error --output=files //crates/swb:swb)" && \
+      test -n "$SWB_BIN" && \
       SWB_BIN="$PWD/$SWB_BIN" examples/demo/run.sh --check && \
       SWB_BIN="$PWD/$SWB_BIN" examples/one-host/run.sh selftest
 

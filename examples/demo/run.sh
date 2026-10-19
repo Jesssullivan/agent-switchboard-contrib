@@ -329,25 +329,28 @@ forged_end() { curl -sS "$broker_a/v1/end" -H 'Content-Type: application/json' \
 say "Any caller (here a bare curl, with no identity at all) tries to end alice's session"
 say "with a well-formed token that is not hers:"
 show "curl -X POST \$BROKER_A/v1/end -d '{\"me\":\"$ALICE\",\"end_token\":\"000...000\"}'" forged_end
-say "The broker answers unknown and ends nothing, without saying why. A malformed token is a 400."
+say "The broker answers unknown and ends nothing, without saying why."
 show "swb peers --host host-a   # alice is still live" host_a_peers
 show "echo '{\"session_id\":\"sess-alice\"}' | swb-hook.sh SessionEnd" plugin_hook sess-alice SessionEnd
 show "ls \$SWB_STATE_DIR/sessions/   # alice: the hook spent and deleted the token" ls "$demo/state-alice/sessions"
 all_peers() { as_bob swb peers --all | peers_view; }
 show "swb peers --all" all_peers
 
-step "12. Claims and handoff: pending P2 (ADR-0001, SWB-R16)"
-say "[pending P2] claim:   carol claims TIN-4655 (changelog). Claims are advisory: the claim"
-say "                      always succeeds and returns overlaps[] naming other holders."
-say "[pending P2] exclusive: only a second exclusive claim on the same subject is refused,"
-say "                      with held_by; non-exclusive claims always succeed."
+step "12. Claims and handoff: pending P2 (ADR-0001, SWB-R16, SWB-R60)"
+say "[pending P2] claim:   carol claims TIN-4655 (changelog). Claims are advisory: a"
+say "                      non-exclusive claim is always recorded and returns overlaps[]"
+say "                      naming other holders, an exclusive holder included."
+say "[pending P2] exclusive: an exclusive request is refused, with held_by listing the"
+say "                      holders, while another session holds any active claim on the"
+say "                      subject; nothing is recorded. The holder's repeat request renews."
 say "[pending P2] handoff: carol hands her live claim to dave; the broker records an"
 say "                      \"offered\" receipt."
 say "[pending P2] accept:  dave's claim accepts the receipt and carol's claim becomes"
 say "                      handed_off."
-say "[pending P2] release: a holder may instead release a claim; a released claim has"
-say "                      nothing left to hand off."
-say "None of these tools exists on main; tools/list above has six tools and no claim."
+say "[pending P2] release: a holder may instead release a claim; ending a session"
+say "                      releases its claims at once."
+say "None of these tools is on main yet; tools/list above has six tools and no claim."
+say "TIN-6690 adds them and replaces these stubs with real claim steps."
 say "The per-host push adapter is P2 as well:"
 show "swb agentd" swb agentd
 
