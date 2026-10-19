@@ -1,5 +1,6 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -38,6 +39,22 @@ rust_test(
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True),
+)
+
+# SWB-R10 / R-C949 (TIN-6688): the compiled hook, directly and through the
+# Claude Code wrapper, against a blackholed broker returns exit 0 within 2 s.
+sh_test(
+    name = "hook_blackhole_test",
+    size = "small",
+    srcs = ["tests/hook_blackhole_test.sh"],
+    args = [
+        "$(rootpath :swb)",
+        "$(rootpath //integrations:claude-code/scripts/swb-hook.sh)",
+    ],
+    data = [
+        ":swb",
+        "//integrations:claude-code/scripts/swb-hook.sh",
+    ],
 )
 
 # R-C262: `swb` with the `test-clock` feature. Only `SWB_TEST_CLOCK=1` on

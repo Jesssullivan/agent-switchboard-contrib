@@ -1,0 +1,4 @@
+package(default_visibility = ["//visibility:public"])
+
+# The Claude Code hook wrapper, for //crates/swb:hook_blackhole_test.
+exports_files(["claude-code/scripts/swb-hook.sh"])

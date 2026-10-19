@@ -1085,6 +1085,7 @@ pub mod test_clock {
 
 #[cfg(test)]
 mod tests {
+    include!("service_roundtrip_tests.rs");
     use super::*;
     use axum::{
         body::{Body, to_bytes},

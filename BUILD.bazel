@@ -77,7 +77,10 @@ test_suite(
 
 test_suite(
     name = "integration_tests",
-    tests = ["//crates/swb-broker:broker_integration_test"],
+    tests = [
+        "//crates/swb:hook_blackhole_test",
+        "//crates/swb-broker:broker_integration_test",
+    ],
 )
 
 test_suite(
