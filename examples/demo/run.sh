@@ -95,7 +95,9 @@ start_broker() { # name port metrics
   done
   env SWB_DB_PATH="$demo/$name.sqlite3" SWB_LISTEN="127.0.0.1:$port" \
     SWB_METRICS_LISTEN="127.0.0.1:$metrics" "$swb_bin" serve \
-    >"$demo/$name.log" 2>&1 &
+    >"$demo/$name.log" 2>&1 7>&- &
+  # 7>&-: a broker started after the channel's stdin (fd 7) is open must not
+  # hold its write end, or closing fd 7 never reaches the channel as EOF.
   pid="$!"
   pids+=("$pid")
   # Healthy only while our own process is alive: a broker that failed to

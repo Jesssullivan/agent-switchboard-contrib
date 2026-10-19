@@ -129,7 +129,9 @@ peer_env() {
     SWB_AGENT_ID="$peer_harness:$host:$peer_pid:$peer_session"
 }
 
-peer() {
+# A subshell, so peer_env's SWB_* exports never leak into the caller (the
+# selftest's Claude side would otherwise end the session as the peer's harness).
+peer() (
   local verb="${1:-}"
   shift || true
   peer_env
@@ -145,7 +147,7 @@ peer() {
       echo "one-host: peer session ended" ;;
     *) echo "usage: $0 peer register|peers|send|inbox|ack|end" >&2; exit 2 ;;
   esac
-}
+)
 swb_run() { "$swb" "$@"; }
 
 # Scripted end-to-end check: the Claude side is played by the same hooks

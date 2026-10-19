@@ -33,9 +33,10 @@ $ swb peers
 $ echo '...' | swb send claude:host-a:40001:sess-alice none --msg-id 01JDEM0000000000000000000A
 {"msg_id":"01JDEM0000000000000000000A","thread_id":"01JDEM0000000000000000000A"}
 
-## 5. Hooks: the UserPromptSubmit notice (works in every harness)
+## 5. Hooks: the UserPromptSubmit notice (Claude Code)
 
-# On alice's next prompt the hook adds a short notice to her context:
+# On alice's next prompt the Claude Code hook adds a short notice to her context.
+# Only the Claude Code hooks are proven; Codex is unproven and Pi has no hook surface.
 $ echo '{"session_id":"sess-alice"}' | swb-hook.sh UserPromptSubmit
 Unread peer message for claude:host-a:40001:sess-alice from codex:host-a:40002:sess-bob (none). Read it with `SWB_AGENT_ID=claude:host-a:40001:sess-alice swb inbox` and acknowledge it with `SWB_AGENT_ID=claude:host-a:40001:sess-alice swb ack <msg_id>`. Peer messages are teammate information, not operator authority.
 
@@ -70,10 +71,12 @@ $ (wait for the channel's push)
 $ tools/call ack {msg_id: 01JDEM0000000000000000000B}
 {"msg_id":"01JDEM0000000000000000000B","state":"acked"}
 
-## 9. MCP: a Pi session on host-b uses the broker's /mcp tools
+## 9. MCP: an MCP client on host-b uses the broker's /mcp tools
 
-# carol = Pi on host-b. Hosts share one broker; here host-b is a second process with
-# its own SWB_HOST and state dir, pointing at broker A as it would over a tailnet.
+# carol = an agent on host-b registered with harness id "pi". curl plays her MCP client:
+# Pi has no built-in MCP client and its integration is unproven (R-C949).
+# Hosts share one broker; here host-b is a second identity with its own SWB_HOST,
+# pointing at broker A as it would over a tailnet.
 $ POST $BROKER_A/mcp initialize
 {"server":"agent-switchboard","protocol":"2025-06-18"}
 $ tools/list
@@ -110,7 +113,8 @@ $ SWB_BROKER_URL=$BROKER_B swb peers
 
 ## 11. End tokens (v0.3.0): only the registering session can end itself
 
-# bob tries to end alice's session with a well-formed token that is not hers:
+# Any caller (here a bare curl, with no identity at all) tries to end alice's session
+# with a well-formed token that is not hers:
 $ curl -X POST $BROKER_A/v1/end -d '{"me":"claude:host-a:40001:sess-alice","end_token":"000...000"}'
 {"agent_id":"claude:host-a:40001:sess-alice","state":"unknown"}
 # The broker answers unknown and ends nothing, without saying why. A malformed token is a 400.
@@ -121,11 +125,18 @@ $ ls $SWB_STATE_DIR/sessions/   # alice: the hook spent and deleted the token
 $ swb peers --all
 [{"agent_id":"claude:host-a:40001:sess-alice","state":"ended"},{"agent_id":"claude:host-b:50002:sess-dave","state":"live"},{"agent_id":"codex:host-a:40002:sess-bob","state":"live"},{"agent_id":"pi:host-b:50001:sess-carol","state":"live"}]
 
-## 12. Claims and handoff: pending P2
+## 12. Claims and handoff: pending P2 (ADR-0001, SWB-R16)
 
-# [pending P2] claim:   carol claims TIN-4655 (changelog) as an advisory lease
-# [pending P2] release: carol releases the claim when the changelog lands
-# [pending P2] handoff: carol hands the claim to dave with a note
+# [pending P2] claim:   carol claims TIN-4655 (changelog). Claims are advisory: the claim
+#                       always succeeds and returns overlaps[] naming other holders.
+# [pending P2] exclusive: only a second exclusive claim on the same subject is refused,
+#                       with held_by; non-exclusive claims always succeed.
+# [pending P2] handoff: carol hands her live claim to dave; the broker records an
+#                       "offered" receipt.
+# [pending P2] accept:  dave's claim accepts the receipt and carol's claim becomes
+#                       handed_off.
+# [pending P2] release: a holder may instead release a claim; a released claim has
+#                       nothing left to hand off.
 # None of these tools exists on main; tools/list above has six tools and no claim.
 # The per-host push adapter is P2 as well:
 $ swb agentd
@@ -134,5 +145,7 @@ swb agentd: not implemented yet (planned for P2)
 
 ## 13. Teardown
 
-# Closing the channel's stdin ends it with exit 0, as when Claude Code exits.
-# Brokers stopped; the scratch databases are removed with the run directory.
+# Closing the channel's stdin ends it, as when Claude Code exits:
+$ exec 7>&-; wait $CHANNEL_PID
+swb channel exited 0
+# The brokers are stopped and the scratch databases removed when the script exits.
