@@ -67,3 +67,14 @@ is in the dated TIN-4655 receipt and the Neo evidence files at
 0600 Skopeo authfile was unlinked after readback. No image was rebuilt or
 deployed, no mutable tag or GF runner was used, and no process was signaled.
 Deployment and live acceptance remain open.
+
+## Correction 2026-10-19: worktrees removed
+
+R-C948 / R-N13: the local worktrees named above, and the original
+`local-integration/current` worktree at `6330f2e`, were removed on
+2026-10-19 during the swb hygiene pass. Each head was first proven
+reachable from a fork ref: `6330f2e` from
+`preserve/local-integration/current`, and this receipt's head `ae83bb1`
+from `preserve/docs/tin-4655-second-integration-receipt-20260927`. No
+remote branch was deleted. The candidate commits above stay reachable
+through those refs.
