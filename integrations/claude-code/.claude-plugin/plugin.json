@@ -1,0 +1,20 @@
+{
+  "name": "swb",
+  "displayName": "Agent Switchboard",
+  "version": "0.2.2",
+  "description": "Peer messaging between agent sessions through an agent-switchboard broker: the swb channel, session hooks and a peer-dialog skill",
+  "author": {
+    "name": "xoxd.ai / Tinyland, Inc.",
+    "url": "https://github.com/xoxd-ai"
+  },
+  "homepage": "https://github.com/xoxd-ai/agent-switchboard/tree/main/integrations/claude-code",
+  "repository": "https://github.com/xoxd-ai/agent-switchboard",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["agents", "mcp", "channels", "messaging", "switchboard"],
+  "channels": [
+    {
+      "server": "swb-channel",
+      "displayName": "Agent Switchboard"
+    }
+  ]
+}

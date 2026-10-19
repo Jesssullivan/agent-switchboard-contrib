@@ -1,0 +1,15 @@
+{
+  "name": "agent-switchboard",
+  "description": "Local marketplace for the agent-switchboard Claude Code plugin",
+  "owner": {
+    "name": "xoxd.ai / Tinyland, Inc.",
+    "url": "https://github.com/xoxd-ai"
+  },
+  "plugins": [
+    {
+      "name": "swb",
+      "source": "./",
+      "description": "Peer messaging between agent sessions through an agent-switchboard broker"
+    }
+  ]
+}

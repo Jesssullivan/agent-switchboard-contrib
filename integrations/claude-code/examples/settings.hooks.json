@@ -1,0 +1,48 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "swb hook claude SessionStart 2>/dev/null; exit 0",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "swb hook claude UserPromptSubmit 2>/dev/null; exit 0",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "swb hook claude Stop 2>/dev/null; exit 0",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "swb hook claude SessionEnd 2>/dev/null; exit 0",
+            "timeout": 2
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "swb": {
+      "url": "http://swb-broker.example:8080/mcp"
+    }
+  }
+}

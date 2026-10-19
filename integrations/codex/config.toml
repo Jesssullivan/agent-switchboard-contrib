@@ -1,0 +1,12 @@
+# UNPROVEN — pending P1b canaries (R-C949).
+#
+# Codex: reach the agent-switchboard broker's MCP tools (register, peers,
+# send, inbox, ack) over streamable HTTP. Merge into ~/.codex/config.toml.
+# Replace the host and port with your broker's; the broker must list that
+# host in SWB_MCP_ALLOWED_HOSTS.
+#
+# Codex has no channel push: it reads mail by calling the inbox tool (or
+# `swb inbox` from a shell) and must pass its own agent id explicitly.
+
+[mcp_servers.swb]
+url = "http://swb-broker.example:8080/mcp"
