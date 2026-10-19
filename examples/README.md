@@ -17,5 +17,6 @@ can reach a broker can act as any agent id. The examples bind loopback or a
 tailnet only; read [SECURITY.md](../SECURITY.md) before you run a broker
 anywhere else.
 
-Advisory claims, release and handoff are planned for P2 and are not on
-`main`. The demo shows them only as steps marked "pending P2".
+Advisory claims, release and handoff are on `main` (P2, unreleased); the
+demo's step 12 runs them. The per-host push adapter `swb agentd` is still
+planned.

@@ -27,7 +27,7 @@ mod claims;
 pub use claims::{
     CLAIM_LEASE_DEFAULT_HOURS, CLAIM_LEASE_MAX_HOURS, CLAIMS_DEFAULT_LIMIT, CLAIMS_MAX_LIMIT,
     ClaimsQuery, NOTE_MAX_BYTES, SUBJECT_MAX_BYTES, THREAD_DEFAULT_LIMIT, THREAD_MAX_LIMIT,
-    effective_claim_lease_seconds, valid_subject,
+    effective_claim_lease_seconds, valid_note, valid_subject,
 };
 
 pub const RETENTION_ACKED_DAYS: u32 = 7;

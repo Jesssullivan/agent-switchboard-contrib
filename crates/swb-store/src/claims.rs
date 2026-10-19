@@ -70,7 +70,8 @@ pub fn valid_subject(subject: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._:/#@+-".contains(c))
 }
 
-fn valid_note(note: &str) -> bool {
+/// A claim or handoff note: at most `NOTE_MAX_BYTES`, no control characters.
+pub fn valid_note(note: &str) -> bool {
     note.len() <= NOTE_MAX_BYTES && !note.chars().any(char::is_control)
 }
 
@@ -247,25 +248,27 @@ pub(crate) fn release_all_held(db: &Connection, me: &str, now: i64) -> StoreResu
     let released: Vec<(String, String)> = {
         let mut stmt = db
             .prepare(
-                "SELECT claim_id, subject FROM claims WHERE holder=?1 AND state='active'
+                "SELECT claim_id, subject FROM claims
+                 WHERE holder=?1 AND state='active' AND expires_at>?2
                  ORDER BY created_at, claim_id",
             )
             .map_err(sql_err)?;
         let rows = stmt
-            .query_map([me], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map(params![me, now], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(sql_err)?;
         rows.collect::<Result<_, _>>().map_err(sql_err)?
     };
     db.execute(
         "UPDATE handoffs SET state='cancelled', decided_at=?2
          WHERE state='offered' AND claim_id IN
-           (SELECT claim_id FROM claims WHERE holder=?1 AND state='active')",
+           (SELECT claim_id FROM claims
+            WHERE holder=?1 AND state='active' AND expires_at>?2)",
         params![me, now],
     )
     .map_err(sql_err)?;
     db.execute(
         "UPDATE claims SET state='released', ended_at=?2, end_reason='session_ended'
-         WHERE holder=?1 AND state='active'",
+         WHERE holder=?1 AND state='active' AND expires_at>?2",
         params![me, now],
     )
     .map_err(sql_err)?;
@@ -480,11 +483,11 @@ impl Store {
         };
         // An accepted handoff keeps the source's exclusivity unless the
         // receiver asks otherwise; a plain claim is non-exclusive by default.
+        // An accepted exclusive handoff is an exclusive request like any
+        // other: R-C950 (1) makes no exception for it, so it is refused while
+        // another session holds an active claim on the subject, and the offer
+        // stays open (the receiver may accept it with `exclusive: false`).
         let exclusive = requested_exclusive.unwrap_or(source_exclusive);
-        // Accepting an exclusive claim moves an existing guard rather than
-        // asking for a new one, so it is not refused over the non-exclusive
-        // claims that were already recorded beside it.
-        let transfers_guard = handoff_from.is_some() && source_exclusive && exclusive;
 
         // A session holds at most one active claim per subject: a repeat
         // request updates that claim in place.
@@ -497,7 +500,7 @@ impl Store {
         let overlaps = holder_rows(&tx, &others, now)?;
         let own_exclusive = own.is_some_and(|c| c.exclusive);
 
-        if exclusive && !own_exclusive && !transfers_guard && !others.is_empty() {
+        if exclusive && !own_exclusive && !others.is_empty() {
             // R-C950 (1) and SWB-R16: refused, nothing recorded. The lease
             // refresh still counts, like every other call by a registered
             // session; a handoff acceptance is undone with the rest.
@@ -1042,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn an_accepted_exclusive_handoff_keeps_the_guard() {
+    fn an_exclusive_handoff_is_refused_while_another_session_holds_a_claim() {
         let (s, _) = clocked();
         let held = claim(&s, A, "TIN-1", true);
         // An advisory claim beside the exclusive holder is recorded (R-C950 (2)).
@@ -1052,13 +1055,71 @@ mod tests {
             .handoff(&json!({"me":A,"claim_id":source,"to":B}))
             .unwrap()["handoff_id"]
             .clone();
-        // Accepting without --exclusive keeps the source's exclusivity, and
-        // moving that guard is not refused over C's advisory claim.
+        // Accepting keeps the source's exclusivity, so it is an exclusive
+        // request, and R-C950 (1) refuses it while C holds a claim: nothing
+        // moves and the offer stays open.
+        let refused = s.claim(&json!({"me":B,"handoff_id":hid})).unwrap();
+        assert_eq!(refused["outcome"], "refused");
+        assert_eq!(holders(&refused["held_by"]), [C]);
+        assert_eq!(holders(&json!(listed(&s, "TIN-1"))), [A, C]);
+        // The receiver may accept it as advisory instead.
+        let accepted = s
+            .claim(&json!({"me":B,"handoff_id":hid,"exclusive":false}))
+            .unwrap();
+        assert_eq!(accepted["outcome"], "recorded");
+        assert_eq!(accepted["exclusive"], false);
+        assert_eq!(holders(&accepted["overlaps"]), [C]);
+        assert_eq!(holders(&json!(listed(&s, "TIN-1"))), [B, C]);
+    }
+
+    #[test]
+    fn an_unopposed_exclusive_handoff_keeps_the_guard() {
+        let (s, _) = clocked();
+        let held = claim(&s, A, "TIN-1", true);
+        let hid = s
+            .handoff(&json!({"me":A,"claim_id":held["claim_id"],"to":B}))
+            .unwrap()["handoff_id"]
+            .clone();
         let accepted = s.claim(&json!({"me":B,"handoff_id":hid})).unwrap();
         assert_eq!(accepted["outcome"], "recorded");
         assert_eq!(accepted["exclusive"], true);
-        assert_eq!(holders(&accepted["overlaps"]), [C]);
         assert_eq!(claim(&s, A, "TIN-1", true)["outcome"], "refused");
+    }
+
+    #[test]
+    fn end_does_not_release_claims_that_already_expired() {
+        let (s, clock) = clocked();
+        let token = reg(&s, A);
+        let old = s
+            .claim(&json!({"me":A,"subject":"TIN-1","lease_hours":1}))
+            .unwrap();
+        clock.advance(3601);
+        let live = claim(&s, A, "TIN-2", false);
+        let ended = s.end(A, &token).unwrap();
+        let released: Vec<&str> = ended["released_claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["claim_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(released, [live["claim_id"].as_str().unwrap()]);
+        // The expired claim keeps its own end: not released, no ended_at.
+        let history = s
+            .claims(&ClaimsQuery {
+                holder: Some(A),
+                all: true,
+                ..ClaimsQuery::default()
+            })
+            .unwrap();
+        let row = history["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["claim_id"] == old["claim_id"])
+            .unwrap()
+            .clone();
+        assert_eq!(row["state"], "expired");
+        assert!(row.get("ended_at").is_none());
     }
 
     #[test]

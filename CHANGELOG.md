@@ -66,14 +66,16 @@ fallback. Details and the upgrade order:
     on the subject;
   - repeating your own exclusive claim renews it (same `claim_id`, later
     expiry); a session holds at most one active claim per subject, so any
-    other repeat updates that claim and a holder is listed once;
-  - `end` releases the session's claims at once, returns them in
+    other repeat updates that claim and a holder is listed once (SWB-R61);
+  - `end` releases the session's unexpired claims at once, returns them in
     `released_claims`, and the broker logs one `release` audit line each.
   - Leases default to 4 h, clamped to 1..24 h; a claim whose holder is
     `gone` shows `orphaned` and is never revoked.
   - `handoff` creates an `offered` receipt; the receiver accepts it with
     `claim --handoff`, which moves the claim and keeps its exclusivity
-    unless the receiver says otherwise. `release` and `handoff` act
+    unless the receiver says otherwise (`--exclusive` or `--advisory`). An
+    acceptance that would be exclusive is refused while another session
+    holds a claim on the subject, and the offer stays open (R-C950 (1)). `release` and `handoff` act
     only on the caller's own claims (`claim_unavailable`, 404, otherwise).
   - The store gains `claims` and `handoffs` tables in place on open; claims
     and handoffs are pruned 7 days after they stop being active.
@@ -84,7 +86,7 @@ fallback. Details and the upgrade order:
     reports `truncated`.
   - The Linear handoff-receipt comment (SWB-R15) is not posted yet.
 - Formal spec: `Broker.dhall` replaces the `Unruled` cases with the R-C950
-  `claim.rules`; the QuickCheck model, `exclusiveRefusal` and
+  `claim.rules` and the SWB-R61 `holder_has_one_claim_per_subject`; the QuickCheck model, `exclusiveRefusal` and
   `noOrphanAfterExpiry` assert them, and the live adapter runs claims.
 - `GET /healthz` on the main listener (Host-guarded) and the metrics
   listener (unguarded, for probes).

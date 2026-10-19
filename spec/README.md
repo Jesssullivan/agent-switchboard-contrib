@@ -87,6 +87,11 @@ adapter, the real broker.
   expiry moves to the later of the old one and now plus the new lease.
 - `end_releases_holder_claims`: `End` with the session's token releases its
   claims at once (the broker logs each release).
+- `holder_has_one_claim_per_subject` (SWB-R61, R-C655): a repeat request by a
+  holder updates its one active claim on the subject (the same claim id, the
+  later expiry); an exclusive request over its own advisory claim, with no
+  other holder, makes it exclusive and is recorded; an advisory request never
+  drops exclusivity.
 
 Release, handoff and `claims` filters are in the Rust tests
 (`crates/swb-store/src/claims.rs`), not the model. A claim lease ends at its

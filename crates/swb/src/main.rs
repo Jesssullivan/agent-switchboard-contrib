@@ -8,6 +8,9 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use swb_proto::VERSION;
+// Claim subjects and notes use the broker's own validators, so the CLI and
+// the store cannot drift (SWB-R16).
+use swb_store::{valid_note, valid_subject};
 
 mod channel;
 
@@ -30,7 +33,7 @@ commands:
   thread <thread_id> [--after SEQ] [--limit N]
                             read one thread's messages that SWB_AGENT_ID sent or received
   claim <subject> [--exclusive] [--lease-hours N] [--note TEXT]
-  claim --handoff <ULID> [--exclusive]
+  claim --handoff <ULID> [--exclusive|--advisory]
                             claim a subject (advisory), or accept a handoff offered to you;
                             a refused exclusive claim prints its answer and exits 4
   release <claim_id>        release one of SWB_AGENT_ID's claims
@@ -658,24 +661,12 @@ fn peers_cmd(lookup: Lookup, args: &PeersArgs) -> Result<Value, String> {
     call_with(lookup, "GET", &path, None)
 }
 
-/// A claim subject: a ticket, a path or another short token (SWB-R16).
-fn valid_subject(subject: &str) -> bool {
-    !subject.is_empty()
-        && subject.len() <= 256
-        && subject
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._:/#@+-".contains(c))
-}
-
-fn valid_note(note: &str) -> bool {
-    note.len() <= 512 && !note.chars().any(char::is_control)
-}
-
 /// Options for `swb claim`. Either a subject or `--handoff ULID`.
 #[derive(Debug, Default, PartialEq)]
 struct ClaimArgs {
     subject: Option<String>,
-    exclusive: bool,
+    /// `--exclusive` sends true, `--advisory` false; neither sends nothing.
+    exclusive: Option<bool>,
     lease_hours: Option<u32>,
     note: Option<String>,
     handoff_id: Option<String>,
@@ -692,7 +683,13 @@ fn parse_claim_args(args: &[String]) -> Result<ClaimArgs, String> {
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
         match arg.as_str() {
-            "--exclusive" => out.exclusive = true,
+            "--exclusive" | "--advisory" => {
+                let want = arg == "--exclusive";
+                if out.exclusive.is_some_and(|e| e != want) {
+                    return Err("--exclusive and --advisory exclude each other".into());
+                }
+                out.exclusive = Some(want);
+            }
             "--lease-hours" => {
                 out.lease_hours = Some(
                     value("--lease-hours")?
@@ -738,8 +735,8 @@ fn claim_cmd(lookup: Lookup, args: &ClaimArgs) -> Result<Value, String> {
     if let Some(subject) = &args.subject {
         payload["subject"] = json!(subject);
     }
-    if args.exclusive {
-        payload["exclusive"] = json!(true);
+    if let Some(exclusive) = args.exclusive {
+        payload["exclusive"] = json!(exclusive);
     }
     if let Some(hours) = args.lease_hours {
         payload["lease_hours"] = json!(hours);
@@ -1960,6 +1957,21 @@ mod tests {
         ] {
             assert!(parse_peers_args(&strings(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn claim_exclusivity_flags() {
+        let parse = |a: &[&str]| parse_claim_args(&strings(a));
+        assert_eq!(parse(&["TIN-1"]).unwrap().exclusive, None);
+        assert_eq!(
+            parse(&["TIN-1", "--exclusive"]).unwrap().exclusive,
+            Some(true)
+        );
+        assert_eq!(
+            parse(&["--handoff", ULID, "--advisory"]).unwrap().exclusive,
+            Some(false)
+        );
+        assert!(parse(&["TIN-1", "--exclusive", "--advisory"]).is_err());
     }
 
     #[test]

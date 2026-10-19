@@ -6,7 +6,8 @@
       "exclusive_refused_while_any_other_claim_is_held",
       "nonexclusive_recorded_with_exclusive_holder_in_overlaps",
       "exclusive_repeat_by_holder_renews",
-      "end_releases_holder_claims"
+      "end_releases_holder_claims",
+      "holder_has_one_claim_per_subject"
     ]
   },
   "message": {
@@ -38,8 +39,10 @@
     "SWB-R16",
     "SWB-R46",
     "R-C229",
+    "R-C655",
     "R-C944",
-    "R-C950"
+    "R-C950",
+    "SWB-R61"
   ],
   "session": {
     "end_token_hex_length": 64,

@@ -4,8 +4,7 @@
 # R-C953 (TIN-5770 comment fff218eb): recorded demos now, a sandbox later.
 # Everything here is local and deterministic: two loopback brokers, scripted
 # fake agents, fixed message ids, no model calls, no network beyond
-# 127.0.0.1 and no secrets. Advisory claims and handoff are P2 and appear only
-# as clearly marked "pending P2" stubs. One machine plays both hosts.
+# 127.0.0.1 and no secrets. One machine plays both hosts.
 #
 # Usage:
 #   examples/demo/run.sh            run the demo, print the transcript
@@ -336,21 +335,50 @@ show "ls \$SWB_STATE_DIR/sessions/   # alice: the hook spent and deleted the tok
 all_peers() { as_bob swb peers --all | peers_view; }
 show "swb peers --all" all_peers
 
-step "12. Claims and handoff: pending P2 (ADR-0001, SWB-R16, SWB-R60)"
-say "[pending P2] claim:   carol claims TIN-4655 (changelog). Claims are advisory: a"
-say "                      non-exclusive claim is always recorded and returns overlaps[]"
-say "                      naming other holders, an exclusive holder included."
-say "[pending P2] exclusive: an exclusive request is refused, with held_by listing the"
-say "                      holders, while another session holds any active claim on the"
-say "                      subject; nothing is recorded. The holder's repeat request renews."
-say "[pending P2] handoff: carol hands her live claim to dave; the broker records an"
-say "                      \"offered\" receipt."
-say "[pending P2] accept:  dave's claim accepts the receipt and carol's claim becomes"
-say "                      handed_off."
-say "[pending P2] release: a holder may instead release a claim; ending a session"
-say "                      releases its claims at once."
-say "None of these tools is on main yet; tools/list above has six tools and no claim."
-say "TIN-6690 adds them and replaces these stubs with real claim steps."
+step "12. Claims and handoff (ADR-0001, SWB-R16, SWB-R60, SWB-R61)"
+say "Claims are advisory. Every agent below uses the CLI with its own SWB_AGENT_ID."
+DAVE=claude:host-b:50002:sess-dave
+as_dave() {
+  env SWB_BROKER_URL="$broker_a" SWB_HOST=host-b SWB_SESSION_PID=50002 \
+    SWB_PROC_START=2026-10-19T09:00:03Z SWB_STATE_DIR="$demo/state-dave" SWB_AGENT_ID="$DAVE" "$@"
+}
+claim_view() {
+  jq -c '{outcome, subject, holder, exclusive, claim_id}
+    + (if .overlaps then {overlaps: [.overlaps[].holder]} else {} end)
+    + (if .held_by then {held_by: [.held_by[].holder]} else {} end)
+    + (if .handoff_from then {handoff_from} else {} end)'
+}
+carol_claim() { as_carol env SWB_AGENT_ID="$CAROL" swb claim TIN-4655 --note changelog |
+  tee "$demo/carol.claim" | claim_view; }
+show "swb claim TIN-4655 --note changelog   # carol" carol_claim
+bob_claim() { as_bob swb claim TIN-4655 | tee "$demo/bob.claim" | claim_view; }
+say "A non-exclusive claim is always recorded; overlaps[] names the other holders:"
+show "swb claim TIN-4655   # bob" bob_claim
+say "An exclusive request is refused while another session holds any active claim on"
+say "the subject: held_by lists the holders, nothing is recorded, and the CLI exits 4."
+dave_exclusive() { as_dave swb claim TIN-4655 --exclusive | claim_view; }
+show "swb claim TIN-4655 --exclusive   # dave" dave_exclusive
+bob_release() { as_bob swb release "$(jq -r .claim_id "$demo/bob.claim")" | jq -c '{subject, holder, state, released}'; }
+show "swb release \$BOB_CLAIM   # bob" bob_release
+say "carol offers her claim to dave; the broker records an \"offered\" receipt:"
+carol_handoff() { as_carol env SWB_AGENT_ID="$CAROL" swb handoff "$(jq -r .claim_id "$demo/carol.claim")" "$DAVE" \
+  --note "changelog is yours" | tee "$demo/handoff" | jq -c '{handoff_id, subject, from, to, state}'; }
+show "swb handoff \$CAROL_CLAIM $DAVE --note 'changelog is yours'   # carol" carol_handoff
+dave_accept() { as_dave swb claim --handoff "$(jq -r .handoff_id "$demo/handoff")" | tee "$demo/dave.claim" | claim_view; }
+say "dave's claim accepts it; carol's claim becomes handed_off:"
+show "swb claim --handoff \$HANDOFF_ID   # dave" dave_accept
+say "With no other holder left, dave's exclusive request makes his own claim exclusive"
+say "(one claim per holder and subject, SWB-R61); bob's exclusive request is refused:"
+show "swb claim TIN-4655 --exclusive   # dave" dave_exclusive
+bob_exclusive() { as_bob swb claim TIN-4655 --exclusive | claim_view; }
+show "swb claim TIN-4655 --exclusive   # bob" bob_exclusive
+claims_view() { jq -c '.claims | sort_by(.created_at, .holder)[] | {holder, exclusive, state} + (if .end_reason then {end_reason} else {} end)'; }
+all_claims() { as_bob swb claims --subject TIN-4655 --all | claims_view; }
+show "swb claims --subject TIN-4655 --all" all_claims
+say "Ending a session releases its claims at once (dave's SessionEnd hook):"
+dave_end() { hook_json sess-dave | as_dave env -u SWB_AGENT_ID swb hook claude SessionEnd; }
+show "echo '{\"session_id\":\"sess-dave\"}' | SWB_HOST=host-b swb hook claude SessionEnd" dave_end
+show "swb claims --subject TIN-4655 --all" all_claims
 say "The per-host push adapter is P2 as well:"
 show "swb agentd" swb agentd
 

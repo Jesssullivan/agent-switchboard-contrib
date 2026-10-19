@@ -21,17 +21,25 @@ let ClaimRule =
       --     expiry extended, never shortened).
       --   end_releases_holder_claims: ending a holder session releases its
       --     claims at once, and the broker logs each release.
+      -- SWB-R61 (R-C655, TIN-4655 comment 18c7bd1c) rules the cases R-C950
+      -- leaves open; the same two properties assert it:
+      --   holder_has_one_claim_per_subject: a repeat request by a holder
+      --     updates its one active claim on the subject (same claim id, the
+      --     later expiry); an exclusive request over its own advisory claim,
+      --     with no other holder, makes it exclusive and is recorded; an
+      --     advisory request never drops exclusivity.
       < exclusive_refused_while_any_other_claim_is_held
       | nonexclusive_recorded_with_exclusive_holder_in_overlaps
       | exclusive_repeat_by_holder_renews
       | end_releases_holder_claims
+      | holder_has_one_claim_per_subject
       >
 
 let LeaseState =
       -- peers() classification in swb-store: ended wins, then age bands.
       < live | idle | gone | ended >
 
-in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C944", "R-C950" ]
+in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655", "R-C944", "R-C950", "SWB-R61" ]
     , session =
       { lease_seconds = 900
       , live_max_age_seconds = 900
@@ -69,6 +77,7 @@ in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C944"
         , ClaimRule.nonexclusive_recorded_with_exclusive_holder_in_overlaps
         , ClaimRule.exclusive_repeat_by_holder_renews
         , ClaimRule.end_releases_holder_claims
+        , ClaimRule.holder_has_one_claim_per_subject
         ]
       }
     }

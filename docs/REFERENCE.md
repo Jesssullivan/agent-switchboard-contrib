@@ -104,8 +104,9 @@ it is never written to the audit log. Never put a secret in either.
   exclusive; an advisory request never drops exclusivity.
 - Leases default to 4 h and are clamped to 1..24 h. Every claim call renews
   the caller's session lease.
-- `end` releases every claim the session holds at once and returns them in
-  `released_claims`; the broker logs a `release` audit line for each, with
+- `end` releases every active, unexpired claim the session holds at once
+  and returns them in `released_claims` (a claim that already expired keeps
+  its expiry as its end); the broker logs a `release` audit line for each, with
   `reason: session_ended`.
 - A claim whose holder is `gone` shows `state: orphaned` and is never
   revoked; it still counts against an exclusive request.
@@ -114,10 +115,12 @@ it is never written to the audit log. Never put a secret in either.
   `claim {me, handoff_id}` (`swb claim --handoff <id>`): in one transaction
   the source becomes `handed_off` and the receiver's claim is recorded under
   the same rules. The accepted claim keeps the source's exclusivity unless
-  the receiver passes `exclusive`. Accepting an exclusive source moves its
-  guard and is never refused; asking for `exclusive` on a non-exclusive
-  source is a new exclusive request, which can be refused and then leaves
-  the offer open. A receiver that already holds a claim on the subject
+  the receiver passes `exclusive`. An acceptance that would be exclusive is
+  an exclusive request under R-C950 (1), whether the exclusivity comes from
+  the source or from `exclusive: true`: while another session holds an
+  active claim on the subject it is refused with `held_by`, nothing moves,
+  and the offer stays open. The receiver can then accept it as advisory
+  with `exclusive: false` (`swb claim --handoff <id> --advisory`). A receiver that already holds a claim on the subject
   keeps that claim, now with `handoff_from` set. Releasing a claim, or
   ending its session, cancels its open offers.
 - `claims` returns `truncated: true` when more claims matched than the

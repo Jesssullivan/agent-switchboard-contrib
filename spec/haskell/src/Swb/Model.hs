@@ -5,8 +5,8 @@
 -- while another session holds any active claim on the subject; a
 -- non-exclusive request is always recorded and lists every other holder; a
 -- repeat exclusive request by the current exclusive holder renews its claim;
--- any other repeat request by a holder updates its one claim on the subject;
--- and ending a session releases its claims.
+-- any other repeat request by a holder updates its one claim on the subject
+-- (SWB-R61, R-C655); and ending a session releases its claims.
 -- Time is an abstract clock in seconds that only 'Tick' advances.
 --
 -- v0.3.0 (R-C944): register returns an end token and only that token ends
