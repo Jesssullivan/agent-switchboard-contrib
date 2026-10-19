@@ -5,7 +5,7 @@
 # Everything here is local and deterministic: two loopback brokers, scripted
 # fake agents, fixed message ids, no model calls, no network beyond
 # 127.0.0.1 and no secrets. Advisory claims and handoff are P2 and appear only
-# as clearly marked "pending P2" stubs.
+# as clearly marked "pending P2" stubs. One machine plays both hosts.
 #
 # Usage:
 #   examples/demo/run.sh            run the demo, print the transcript
@@ -47,7 +47,7 @@ broker_a="http://127.0.0.1:$port_a" broker_b="http://127.0.0.1:$port_b"
 demo="$(mktemp -d "${TMPDIR:-/tmp}/swb-demo.XXXXXX")"
 pids=()
 cleanup() {
-  exec 7>&- 2>/dev/null || true
+  { exec 7>&-; } 2>/dev/null || true
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
   for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
   rm -rf "$demo"
@@ -82,22 +82,35 @@ M2=01JDEM0000000000000000000B
 M3=01JDEM0000000000000000000C
 M4=01JDEM0000000000000000000D
 
-wait_metrics() {
-  local url="$1"
-  for _ in $(seq 1 100); do
-    curl -sf "$url/healthz" >/dev/null 2>&1 && return 0
-    sleep 0.1
-  done
-  echo "demo: broker at $url did not come up" >&2
-  return 1
+port_free() { # port: nothing may answer there before our broker starts
+  ! curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$1/" 2>/dev/null
 }
 start_broker() { # name port metrics
-  local name="$1" port="$2" metrics="$3"
+  local name="$1" port="$2" metrics="$3" pid
+  for p in "$port" "$metrics"; do
+    port_free "$p" || {
+      echo "demo: 127.0.0.1:$p is already in use; set SWB_DEMO_PORT_BASE" >&2
+      exit 3
+    }
+  done
   env SWB_DB_PATH="$demo/$name.sqlite3" SWB_LISTEN="127.0.0.1:$port" \
     SWB_METRICS_LISTEN="127.0.0.1:$metrics" "$swb_bin" serve \
     >"$demo/$name.log" 2>&1 &
-  pids+=("$!")
-  wait_metrics "http://127.0.0.1:$metrics"
+  pid="$!"
+  pids+=("$pid")
+  # Healthy only while our own process is alive: a broker that failed to
+  # bind exits, and a foreign listener must never pass for it.
+  for _ in $(seq 1 100); do
+    kill -0 "$pid" 2>/dev/null || break
+    if curl -sf "http://127.0.0.1:$metrics/healthz" >/dev/null 2>&1 &&
+      curl -sf "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
+      kill -0 "$pid" 2>/dev/null && return 0
+    fi
+    sleep 0.1
+  done
+  echo "demo: broker $name did not come up; its log:" >&2
+  cat "$demo/$name.log" >&2
+  exit 1
 }
 
 # Session environments. Each fake agent is a process with its own SWB_*
@@ -111,7 +124,7 @@ as_bob() { # a shell-driven peer (CLI only) on host-a
     SWB_PROC_START=2026-10-19T09:00:01Z SWB_STATE_DIR="$demo/state-bob" \
     SWB_HARNESS=codex SWB_SESSION_ID=sess-bob SWB_AGENT_ID="$BOB" "$@"
 }
-as_carol() { # Pi on host-b, same broker over the (simulated) tailnet
+as_carol() { # harness id "pi" on host-b, same broker over the (simulated) tailnet
   env SWB_BROKER_URL="$broker_a" SWB_HOST=host-b SWB_SESSION_PID=50001 \
     SWB_PROC_START=2026-10-19T09:00:02Z SWB_STATE_DIR="$demo/state-carol" "$@"
 }
@@ -203,8 +216,9 @@ send_m1() { echo "Can you review the parser change on my branch? Tests pass loca
   as_bob swb send "$ALICE" none --msg-id "$M1" | jq -c '{msg_id, thread_id}'; }
 show "echo '...' | swb send $ALICE none --msg-id $M1" send_m1
 
-step "5. Hooks: the UserPromptSubmit notice (works in every harness)"
-say "On alice's next prompt the hook adds a short notice to her context:"
+step "5. Hooks: the UserPromptSubmit notice (Claude Code)"
+say "On alice's next prompt the Claude Code hook adds a short notice to her context."
+say "Only the Claude Code hooks are proven; Codex is unproven and Pi has no hook surface."
 notice_alice() { hook_json sess-alice | as_alice "$repo/integrations/claude-code/scripts/swb-hook.sh" UserPromptSubmit |
   jq -r '.hookSpecificOutput.additionalContext'; }
 show "echo '{\"session_id\":\"sess-alice\"}' | swb-hook.sh UserPromptSubmit" notice_alice
@@ -216,7 +230,8 @@ mkfifo "$demo/ch.in"
 : >"$demo/ch.out"
 as_alice env SWB_HARNESS=claude SWB_CHANNEL_POLL_SECONDS=2 swb channel \
   <"$demo/ch.in" >"$demo/ch.out" 2>"$demo/ch.err" &
-pids+=("$!")
+channel_pid="$!"
+pids+=("$channel_pid")
 exec 7>"$demo/ch.in"
 ch_line() { grep "$1" "$demo/ch.out" | sed -n "${2:-1}p"; }
 channel_init() {
@@ -259,9 +274,11 @@ show "(wait for the channel's push)" channel_event 2
 say "authority stays \"peer\": the claim is the sender's, to confirm with your own operator."
 show "tools/call ack {msg_id: $M2}" channel_call 2 ack "{\"msg_id\":\"$M2\"}"
 
-step "9. MCP: a Pi session on host-b uses the broker's /mcp tools"
-say "carol = Pi on host-b. Hosts share one broker; here host-b is a second process with"
-say "its own SWB_HOST and state dir, pointing at broker A as it would over a tailnet."
+step "9. MCP: an MCP client on host-b uses the broker's /mcp tools"
+say "carol = an agent on host-b registered with harness id \"pi\". curl plays her MCP client:"
+say "Pi has no built-in MCP client and its integration is unproven (R-C949)."
+say "Hosts share one broker; here host-b is a second identity with its own SWB_HOST,"
+say "pointing at broker A as it would over a tailnet."
 show "POST \$BROKER_A/mcp initialize" mcp_open "$broker_a"
 tool_names() { mcp_rpc "$broker_a" 1 tools/list '{}' | jq -c '[.tools[].name]'; }
 show "tools/list" tool_names
@@ -307,7 +324,8 @@ step "11. End tokens (v0.3.0): only the registering session can end itself"
 forged="$(printf '0%.0s' $(seq 1 64))"
 forged_end() { curl -sS "$broker_a/v1/end" -H 'Content-Type: application/json' \
   -d "{\"me\":\"$ALICE\",\"end_token\":\"$forged\"}" | jq -c .; }
-say "bob tries to end alice's session with a well-formed token that is not hers:"
+say "Any caller (here a bare curl, with no identity at all) tries to end alice's session"
+say "with a well-formed token that is not hers:"
 show "curl -X POST \$BROKER_A/v1/end -d '{\"me\":\"$ALICE\",\"end_token\":\"000...000\"}'" forged_end
 say "The broker answers unknown and ends nothing, without saying why. A malformed token is a 400."
 show "swb peers --host host-a   # alice is still live" host_a_peers
@@ -316,18 +334,31 @@ show "ls \$SWB_STATE_DIR/sessions/   # alice: the hook spent and deleted the tok
 all_peers() { as_bob swb peers --all | peers_view; }
 show "swb peers --all" all_peers
 
-step "12. Claims and handoff: pending P2"
-say "[pending P2] claim:   carol claims TIN-4655 (changelog) as an advisory lease"
-say "[pending P2] release: carol releases the claim when the changelog lands"
-say "[pending P2] handoff: carol hands the claim to dave with a note"
+step "12. Claims and handoff: pending P2 (ADR-0001, SWB-R16)"
+say "[pending P2] claim:   carol claims TIN-4655 (changelog). Claims are advisory: the claim"
+say "                      always succeeds and returns overlaps[] naming other holders."
+say "[pending P2] exclusive: only a second exclusive claim on the same subject is refused,"
+say "                      with held_by; non-exclusive claims always succeed."
+say "[pending P2] handoff: carol hands her live claim to dave; the broker records an"
+say "                      \"offered\" receipt."
+say "[pending P2] accept:  dave's claim accepts the receipt and carol's claim becomes"
+say "                      handed_off."
+say "[pending P2] release: a holder may instead release a claim; a released claim has"
+say "                      nothing left to hand off."
 say "None of these tools exists on main; tools/list above has six tools and no claim."
 say "The per-host push adapter is P2 as well:"
 show "swb agentd" swb agentd
 
 step "13. Teardown"
-exec 7>&-
-say "Closing the channel's stdin ends it with exit 0, as when Claude Code exits."
-say "Brokers stopped; the scratch databases are removed with the run directory."
+say "Closing the channel's stdin ends it, as when Claude Code exits:"
+channel_close() {
+  exec 7>&-
+  local rc=0
+  wait "$channel_pid" || rc=$?
+  echo "swb channel exited $rc"
+}
+show "exec 7>&-; wait \$CHANNEL_PID" channel_close
+say "The brokers are stopped and the scratch databases removed when the script exits."
 
 # ---------------------------------------------------------------- output
 # Normalize what varies between runs: the run directory, ports, broker-minted
@@ -352,7 +383,7 @@ normalize <"$raw" >"$transcript"
 cast_of() { # asciicast v2 from the transcript, with fixed synthetic timing
   jq -R -s -c --arg title "agent-switchboard: every mode on main (scripted)" '
     split("\n") | .[:-1] as $lines
-    | {version: 2, width: 110, height: 34, timestamp: 1760864400, title: $title,
+    | {version: 2, width: 110, height: 34, timestamp: 1792400400, title: $title,
        env: {TERM: "xterm-256color", SHELL: "/bin/bash"}},
       (foreach $lines[] as $l ({t: 0};
          .t += (if ($l | startswith("## ")) then 1.2

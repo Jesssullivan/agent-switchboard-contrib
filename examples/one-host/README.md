@@ -15,7 +15,9 @@ SWB_BIN=/path/to/swb examples/one-host/run.sh selftest
 `selftest` starts a scratch broker, plays the Claude side with the same hook
 wrapper Claude Code runs (`integrations/claude-code/scripts/swb-hook.sh`),
 and checks register, peers, send, the UserPromptSubmit notice, inbox, reply,
-ack and SessionEnd. It prints one `ok` line and removes its scratch state.
+ack and the end of both sessions: each end token file is spent and the broker
+lists both sessions as ended. Hooks exit 0 silently even on failure, so the
+selftest checks the broker rather than the hook's exit code. It prints one `ok` line and removes its scratch state.
 
 ## Try it with Claude Code
 

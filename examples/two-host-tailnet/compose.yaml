@@ -1,6 +1,9 @@
 # TAILNET ONLY. swb has no authentication: anyone who can reach :8080 can act
-# as any agent id. This file publishes no host port; the broker is reachable
-# only through the Tailscale sidecar's tailnet address (R-C953, TIN-6694).
+# as any agent id. This file publishes no host port, and the broker binds
+# loopback inside the sidecar's network namespace, so neither the Docker host
+# nor other containers on the bridge network can reach it. The sidecar's
+# `tailscale serve` forwards tailnet :8080 to that loopback port
+# (serve.json), which makes the tailnet the only way in (R-C953, TIN-6694).
 #
 # Needs a v0.3.0 image. None is published yet (v0.3.0 is unreleased on main):
 # build one with `just image` on a linux/amd64 build host and put the digest it
@@ -20,8 +23,11 @@ services:
       TS_HOSTNAME: swb
       TS_STATE_DIR: /var/lib/tailscale
       TS_USERSPACE: "false"
+      # tailnet :8080 -> 127.0.0.1:8080 in this namespace, where swb listens.
+      TS_SERVE_CONFIG: /config/serve.json
     volumes:
       - tailscale-state:/var/lib/tailscale
+      - ./serve.json:/config/serve.json:ro
     devices:
       - /dev/net/tun:/dev/net/tun
     cap_add:
@@ -39,8 +45,10 @@ services:
   swb:
     image: ghcr.io/xoxd-ai/agent-switchboard@sha256:REPLACE_WITH_YOUR_V030_DIGEST
     command: ["serve"]
-    # Share the sidecar's network namespace: the broker listens on the tailnet
-    # interface and nowhere else. No `ports:` on purpose.
+    # Share the sidecar's network namespace and bind loopback only. The
+    # namespace also has the bridge interface (eth0), so 0.0.0.0 would expose
+    # the broker to the Docker host and every container on that network.
+    # No `ports:` on purpose.
     network_mode: service:tailscale
     depends_on:
       tailscale:
@@ -51,7 +59,7 @@ services:
     read_only: true
     environment:
       SWB_DB_PATH: /var/lib/swb/swb.sqlite3
-      SWB_LISTEN: 0.0.0.0:8080
+      SWB_LISTEN: 127.0.0.1:8080
       # Metrics are not Host-guarded: keep them on loopback in this namespace.
       SWB_METRICS_LISTEN: 127.0.0.1:9090
       # The exact names clients put in SWB_BROKER_URL. Replace the tailnet name.

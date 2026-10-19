@@ -36,6 +36,14 @@ remote-check host="sting" dir="~/scratch/agent-switchboard-check":
     rsync -a --delete --exclude '/bazel-*' --exclude '/target/' --exclude '/.git/' ./ {{host}}:{{dir}}/
     ssh {{host}} 'cd {{dir}} && just check'
 
+# Build swb, then diff the scripted demo against docs/demo/transcript.txt and
+# run the one-host selftest (R-C953, TIN-6694). Build host only, never neo.
+demo-check:
+    {{clean_bazel_env}} bazelisk build --lockfile_mode=error //crates/swb:swb
+    SWB_BIN="$(bazelisk cquery --output=files //crates/swb:swb 2>/dev/null)"; \
+      SWB_BIN="$PWD/$SWB_BIN" examples/demo/run.sh --check && \
+      SWB_BIN="$PWD/$SWB_BIN" examples/one-host/run.sh selftest
+
 # SWB-R49 local integration while GF is in development (TIN-4655).
 # Pin each PR to its reviewed full SHA. This creates a separate,
 # signed local merge tree; it never pushes or changes GitHub PR/main state.

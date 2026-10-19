@@ -3,6 +3,11 @@
 # the Tailscale Kubernetes operator; never give it a LoadBalancer, NodePort or
 # Ingress (R-C953, TIN-6694).
 #
+# A ClusterIP Service is still reachable from every pod in the cluster, so the
+# NetworkPolicy at the end admits the API port only from the Tailscale
+# operator's proxy pods (namespace `tailscale`; change it if yours differs).
+# It needs a CNI that enforces NetworkPolicy.
+#
 # Needs a v0.3.0 image digest you built (`just image`); none is published yet.
 # One replica only: the store is one SQLite file.
 apiVersion: v1
@@ -59,9 +64,13 @@ spec:
             capabilities: {drop: ["ALL"]}
           volumeMounts:
             - {name: data, mountPath: /var/lib/swb}
+            # The root filesystem is read-only; SQLite may need a temp dir.
+            - {name: tmp, mountPath: /tmp}
       volumes:
         - name: data
           persistentVolumeClaim: {claimName: swb-data}
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
 ---
 # Only the API port. Scrape metrics from inside the cluster, never from the
 # tailnet Service.
@@ -77,3 +86,21 @@ spec:
   selector: {app: swb}
   ports:
     - {name: http, port: 8080, targetPort: http}
+---
+# Only the Tailscale operator's proxy may reach the API port. Metrics (9090)
+# get no ingress rule here: add one for your in-cluster scraper. Kubelet probes
+# are not affected on CNIs that exempt node traffic.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: swb
+spec:
+  podSelector:
+    matchLabels: {app: swb}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: tailscale}
+      ports:
+        - {protocol: TCP, port: 8080}

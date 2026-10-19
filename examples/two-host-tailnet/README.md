@@ -26,13 +26,19 @@ prints. The approved v0.2.2 digest in
 v0.2.2 clients only; broker and clients must run the same minor version.
 
 - **Docker Compose**, [compose.yaml](compose.yaml): the broker shares a
-  Tailscale sidecar's network namespace and publishes no host port. Pass
+  Tailscale sidecar's network namespace, binds `127.0.0.1:8080` there and
+  publishes no host port. The sidecar's `tailscale serve`
+  ([serve.json](serve.json)) forwards tailnet port 8080 to it, so the Docker
+  host and other containers on the bridge network cannot reach the broker. Pass
   `TS_AUTHKEY` from your shell or an untracked `.env`; never commit it.
 - **Kubernetes**, [k8s.yaml](k8s.yaml): one replica, a PVC, a non-root pod
   (UID 65532) and a ClusterIP Service that the
   [Tailscale Kubernetes operator](https://tailscale.com/kb/1236/kubernetes-operator)
   exposes on the tailnet (`tailscale.com/expose`). The Service carries only
-  the API port.
+  the API port. A ClusterIP Service is reachable from every pod in the
+  cluster, so the manifest's NetworkPolicy admits that port only from the
+  operator's proxy namespace (`tailscale`); it needs a CNI that enforces
+  NetworkPolicy.
 
 In both, set `SWB_MCP_ALLOWED_HOSTS` to exactly the names clients use (the
 short MagicDNS name and the full `*.ts.net` name). A request for any other

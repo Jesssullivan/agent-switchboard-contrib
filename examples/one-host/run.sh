@@ -32,22 +32,47 @@ peer_harness="${SWB_EXAMPLE_PEER_HARNESS:-codex}"
 peer_session="${SWB_EXAMPLE_PEER_SESSION:-cli-peer}"
 peer_pid=40999
 
+# True only when <pid> is still a `swb serve` process: a pid file can outlive
+# its broker, and the kernel may have reused the number for something else.
+is_our_broker() {
+  local pid="$1" args
+  kill -0 "$pid" 2>/dev/null || return 1
+  args="$(ps -o args= -p "$pid" 2>/dev/null)" || return 1
+  case "$args" in *swb*" serve"*) return 0 ;; *) return 1 ;; esac
+}
+
+port_free() { ! curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$1/" 2>/dev/null; }
+
 up() {
   mkdir -p "$dir"
   chmod 0700 "$dir"
-  if [ -f "$dir/broker.pid" ] && kill -0 "$(cat "$dir/broker.pid")" 2>/dev/null; then
+  if [ -f "$dir/broker.pid" ] && is_our_broker "$(cat "$dir/broker.pid")"; then
     echo "one-host: broker already running (pid $(cat "$dir/broker.pid"))"
   else
+    for p in "$port" "$metrics"; do
+      port_free "$p" || {
+        echo "one-host: 127.0.0.1:$p is already in use; set SWB_EXAMPLE_PORT and SWB_EXAMPLE_METRICS_PORT" >&2
+        exit 3
+      }
+    done
     env SWB_DB_PATH="$dir/swb.sqlite3" SWB_LISTEN="127.0.0.1:$port" \
       SWB_METRICS_LISTEN="127.0.0.1:$metrics" nohup "$swb" serve >"$dir/broker.log" 2>&1 &
-    echo "$!" >"$dir/broker.pid"
+    local pid="$!" ok=""
+    echo "$pid" >"$dir/broker.pid"
+    # Healthy only while our own process is alive, so a foreign listener on
+    # the same port can never pass for this broker.
     for _ in $(seq 1 100); do
-      curl -sf "http://127.0.0.1:$metrics/healthz" >/dev/null 2>&1 && break
+      kill -0 "$pid" 2>/dev/null || break
+      if curl -sf "http://127.0.0.1:$metrics/healthz" >/dev/null 2>&1 &&
+        curl -sf "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 &&
+        kill -0 "$pid" 2>/dev/null; then
+        ok=1
+        break
+      fi
       sleep 0.1
     done
-    curl -sf "http://127.0.0.1:$metrics/healthz" >/dev/null ||
-      { echo "one-host: broker did not start; see $dir/broker.log" >&2; exit 1; }
-    echo "one-host: broker on http://127.0.0.1:$port (pid $(cat "$dir/broker.pid"))"
+    [ -n "$ok" ] || { echo "one-host: broker did not start; see $dir/broker.log" >&2; exit 1; }
+    echo "one-host: broker on http://127.0.0.1:$port (pid $pid)"
   fi
   cat >"$dir/env.sh" <<EOF
 export SWB_BROKER_URL=http://127.0.0.1:$port
@@ -59,7 +84,13 @@ EOF
 
 down() {
   if [ -f "$dir/broker.pid" ]; then
-    kill "$(cat "$dir/broker.pid")" 2>/dev/null || true
+    local pid
+    pid="$(cat "$dir/broker.pid")"
+    if is_our_broker "$pid"; then
+      kill "$pid" 2>/dev/null || true
+    else
+      echo "one-host: pid $pid is not this broker any more; not signalling it" >&2
+    fi
   fi
   rm -rf "$dir"
   echo "one-host: broker stopped, $dir removed"
@@ -150,9 +181,24 @@ selftest() {
   peer inbox | jq -e '.messages[0].body == "selftest: hello back"' >/dev/null
   peer ack "$(peer inbox | jq -r '.messages[0].msg_id')" >/dev/null
   peer inbox | jq -e '.messages == []' >/dev/null
+  # End both sessions and prove it: hooks exit 0 silently even on failure,
+  # so check the token files are spent and the broker shows both ended.
+  ls "$dir/state-peer/sessions/"* >/dev/null 2>&1
+  ls "$dir/state-claude/sessions/"* >/dev/null 2>&1
   peer end >/dev/null
   claude_hook SessionEnd
-  echo "one-host selftest: ok (register, peers, send, notice, inbox, reply, ack, end)"
+  # (`! cmd` never trips set -e, hence the explicit test.)
+  for d in "$dir/state-peer/sessions" "$dir/state-claude/sessions"; do
+    if ls "$d/"* >/dev/null 2>&1; then
+      echo "one-host selftest: an end token in $d was not spent" >&2
+      exit 1
+    fi
+  done
+  "$swb" peers --all | jq -e --arg c "$claude_id" --arg p "$peer_id" \
+    '[.peers[] | select(.agent_id == $c or .agent_id == $p) | .state] == ["ended", "ended"]' >/dev/null
+  "$swb" peers | jq -e --arg c "$claude_id" --arg p "$peer_id" \
+    '[.peers[].agent_id] | (index($c) | not) and (index($p) | not)' >/dev/null
+  echo "one-host selftest: ok (register, peers, send, notice, inbox, reply, ack, end, tokens spent)"
 }
 
 case "${1:-}" in
