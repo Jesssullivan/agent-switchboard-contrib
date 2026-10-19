@@ -1,0 +1,65 @@
+# TAILNET ONLY. swb has no authentication: anyone who can reach :8080 can act
+# as any agent id. This file publishes no host port; the broker is reachable
+# only through the Tailscale sidecar's tailnet address (R-C953, TIN-6694).
+#
+# Needs a v0.3.0 image. None is published yet (v0.3.0 is unreleased on main):
+# build one with `just image` on a linux/amd64 build host and put the digest it
+# prints below. Never use a mutable tag. Broker and every client must run the
+# same minor version.
+#
+#   TS_AUTHKEY=... docker compose up -d     # the auth key comes from your shell
+#                                           # or an untracked .env, never this file
+name: swb
+
+services:
+  tailscale:
+    image: tailscale/tailscale@sha256:REPLACE_WITH_A_DIGEST_YOU_TRUST
+    hostname: swb
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY in your shell}
+      TS_HOSTNAME: swb
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+
+  # The broker's data volume must be writable by the image's UID 65532.
+  volume-perms:
+    image: busybox@sha256:REPLACE_WITH_A_DIGEST_YOU_TRUST
+    command: ["chown", "-R", "65532:65532", "/var/lib/swb"]
+    volumes:
+      - swb-data:/var/lib/swb
+    restart: "no"
+
+  swb:
+    image: ghcr.io/xoxd-ai/agent-switchboard@sha256:REPLACE_WITH_YOUR_V030_DIGEST
+    command: ["serve"]
+    # Share the sidecar's network namespace: the broker listens on the tailnet
+    # interface and nowhere else. No `ports:` on purpose.
+    network_mode: service:tailscale
+    depends_on:
+      tailscale:
+        condition: service_started
+      volume-perms:
+        condition: service_completed_successfully
+    user: "65532:65532"
+    read_only: true
+    environment:
+      SWB_DB_PATH: /var/lib/swb/swb.sqlite3
+      SWB_LISTEN: 0.0.0.0:8080
+      # Metrics are not Host-guarded: keep them on loopback in this namespace.
+      SWB_METRICS_LISTEN: 127.0.0.1:9090
+      # The exact names clients put in SWB_BROKER_URL. Replace the tailnet name.
+      SWB_MCP_ALLOWED_HOSTS: swb,swb.your-tailnet.ts.net
+    volumes:
+      - swb-data:/var/lib/swb
+    restart: unless-stopped
+
+volumes:
+  tailscale-state:
+  swb-data:

@@ -1,0 +1,79 @@
+# TAILNET ONLY. swb has no authentication: anyone who can reach :8080 can act
+# as any agent id. The Service is ClusterIP and is exposed to the tailnet by
+# the Tailscale Kubernetes operator; never give it a LoadBalancer, NodePort or
+# Ingress (R-C953, TIN-6694).
+#
+# Needs a v0.3.0 image digest you built (`just image`); none is published yet.
+# One replica only: the store is one SQLite file.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: swb-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swb
+  labels: {app: swb}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: swb}
+  template:
+    metadata:
+      labels: {app: swb}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: swb
+          image: ghcr.io/xoxd-ai/agent-switchboard@sha256:REPLACE_WITH_YOUR_V030_DIGEST
+          args: ["serve"]
+          env:
+            - {name: SWB_DB_PATH, value: /var/lib/swb/swb.sqlite3}
+            - {name: SWB_LISTEN, value: "0.0.0.0:8080"}
+            - {name: SWB_METRICS_LISTEN, value: "0.0.0.0:9090"}
+            # The exact names clients put in SWB_BROKER_URL.
+            - {name: SWB_MCP_ALLOWED_HOSTS, value: "swb,swb.your-tailnet.ts.net"}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: metrics, containerPort: 9090}
+          # /healthz on the metrics listener is not Host-guarded.
+          readinessProbe:
+            httpGet: {path: /healthz, port: metrics}
+          livenessProbe:
+            httpGet: {path: /healthz, port: metrics}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/swb}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: swb-data}
+---
+# Only the API port. Scrape metrics from inside the cluster, never from the
+# tailnet Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: swb
+  annotations:
+    tailscale.com/expose: "true"
+    tailscale.com/hostname: swb
+spec:
+  type: ClusterIP
+  selector: {app: swb}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
