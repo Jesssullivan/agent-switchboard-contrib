@@ -71,6 +71,36 @@ def own_cgroup():
     paths = [line.split(":", 2)[2] for line in lines if line.startswith("0::")]
     return paths[0] if paths else None
 
+def cgroup_memory_bound(path, root=Path("/sys/fs/cgroup")):
+    """The tightest memory.max and memory.high on the path from `path` to the root.
+
+    A limit set on any ancestor binds every descendant, so the run is bounded
+    only if some cgroup on the way up has a finite value. Unreadable or "max"
+    entries count as no limit. Returns a receipt dict; kind is "none" when no
+    ancestor carries a finite limit, so a run outside a bounded slice does not
+    claim one.
+    """
+    bound = {"kind": "none", "cgroup": path}
+    if not path:
+        return bound
+    rel = Path(path.lstrip("/"))
+    chain = [rel, *rel.parents]
+    for key in ("memory.max", "memory.high"):
+        best = None
+        for node in chain:
+            try:
+                value = (root / node / key).read_text().strip()
+            except OSError:
+                continue
+            if value.isdigit() and (best is None or int(value) < best[0]):
+                best = (int(value), "/" + str(node) if str(node) != "." else "/")
+        if best is not None:
+            field = key.replace(".", "_")
+            bound[field + "_bytes"] = best[0]
+            bound[field + "_set_by"] = best[1]
+            bound["kind"] = "cgroup"
+    return bound
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path)
@@ -83,7 +113,7 @@ def main():
     sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
     output_base = str(a.output.resolve() / "bazel-output-base") if a.output else "<run-output>/bazel-output-base"
     startup = ["bazelisk", "--batch", "--ignore_all_rc_files", "--host_jvm_args=-Xmx512m", f"--host_jvm_args=-XX:ActiveProcessorCount={a.cpus}", "--host_jvm_args=-Xss512k", "--output_base=" + output_base]
-    command = [*startup, "test", "--lockfile_mode=error", f"--jobs={a.cpus}", f"--local_resources=cpu={a.cpus}", "--legacy_globbing_threads=1", "--loading_phase_threads=1", "--local_test_jobs=1", "--test_output=all", "--test_arg=--test-threads=1", "--action_env=MALLOC_ARENA_MAX=2", "--action_env=GLIBC_TUNABLES=", "--host_action_env=MALLOC_ARENA_MAX=2", "--host_action_env=GLIBC_TUNABLES=", "--test_env=MALLOC_ARENA_MAX=2", "--test_env=GLIBC_TUNABLES=", *TARGETS]
+    command = [*startup, "test", "--lockfile_mode=error", f"--jobs={a.cpus}", f"--local_resources=cpu={a.cpus}", "--legacy_globbing_threads=1", "--loading_phase_threads=1", "--local_test_jobs=1", "--test_output=all", "--test_arg=--test-threads=1", "--action_env=MALLOC_ARENA_MAX=2", "--action_env=GLIBC_TUNABLES=", "--host_action_env=MALLOC_ARENA_MAX=2", "--host_action_env=GLIBC_TUNABLES=", "--test_env=MALLOC_ARENA_MAX=2", "--test_env=GLIBC_TUNABLES=", "--test_env=SWB_HOOK_REQUIRE_BLACKHOLE=1", *TARGETS]
     plan = {"schema": "swb.owned-fixture-receipt.v1", "source_sha": sha, "command": command, "expected_cases": EXPECTED, "qualification": "owned-fixtures-only", "live_acceptance": False, "process_actions": False, "rulings": RULINGS}
     if a.plan:
         print(json.dumps(plan, indent=2, sort_keys=True))
@@ -114,7 +144,12 @@ def main():
     # slice), not by RLIMIT_AS: an address-space limit counts reservations,
     # and the Nix evaluator behind rules_nixpkgs fails a 6 GiB one with
     # "allocating arena using mmap: Cannot allocate memory" (sting, 2026-10-19).
-    plan["memory_bound"] = {"kind": "cgroup", "cgroup": own_cgroup()}
+    # The receipt records the limit actually in force (memory.max and
+    # memory.high read up the cgroup tree), not just the cgroup's name.
+    plan["memory_bound"] = cgroup_memory_bound(own_cgroup())
+    # --ignore_all_rc_files: this lane does not read .bazelrc, so its Bazel
+    # configuration differs from CI's (ci.yml uses the repo .bazelrc).
+    plan["bazel_rc_files"] = "ignored (--ignore_all_rc_files); differs from CI, which reads .bazelrc"
     plan["jvm_heap_limit_mib"] = 512
     plan["glibc_malloc_arena_max"] = 2
     env = dict(os.environ)

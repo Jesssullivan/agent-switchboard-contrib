@@ -217,9 +217,10 @@ remote-spec-check host="sting" dir="~/scratch/agent-switchboard-spec":
     rsync -a --delete --exclude '/bazel-*' --exclude '/target/' --exclude '/.git' --exclude '/spec/haskell/dist-newstyle/' ./ {{host}}:{{dir}}/
     ssh {{host}} 'cd {{dir}} && just spec-check'
 
-# Stub (P1b): end-to-end round trip against a live broker.
+# Not implemented: the round trip on the deployed broker across a pod
+# restart (P1b item d, TIN-6688). The owned-fixture lane is `e2e-fixtures`.
 e2e:
-    @echo "e2e: lands with the P1b broker MVP (ADR-0001, phase P1b exit)" >&2
+    @echo "e2e: the deployed-broker round trip (P1b item d, TIN-6688) is not implemented; run 'just e2e-fixtures <output>' for the owned-fixture lane" >&2
     @exit 1
 
 # R-C949 / TIN-6688 (carried from PR #32): the owned-fixture lane. Runs the

@@ -49,7 +49,7 @@ class ReceiptTests(unittest.TestCase):
                     return str(bindir) + "\n"
                 raise AssertionError(command)
             output = base / "receipt"
-            with patch.dict(e2e.os.environ, {"MALLOC_ARENA_MAX": "256", "GLIBC_TUNABLES": "glibc.malloc.arena_max=256"}), patch.object(sys, "argv", ["e2e", "--output", str(output)]), patch.object(e2e.platform, "system", return_value="Linux"), patch.object(e2e, "own_cgroup", return_value="/user.slice/user-1000.slice/tinyland-heavy.slice/heavy-test.scope"), patch.object(e2e.os, "sched_getaffinity", side_effect=[{12, 13, 14, 15, 16}, {12, 13, 14, 15}], create=True), patch.object(e2e.os, "sched_setaffinity", side_effect=OSError("fixture affinity denial") if affinity_error else None, create=True) as affinity, patch.object(e2e.subprocess, "check_output", side_effect=check_output), patch.object(e2e.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+            with patch.dict(e2e.os.environ, {"MALLOC_ARENA_MAX": "256", "GLIBC_TUNABLES": "glibc.malloc.arena_max=256"}), patch.object(sys, "argv", ["e2e", "--output", str(output)]), patch.object(e2e.platform, "system", return_value="Linux"), patch.object(e2e, "own_cgroup", return_value="/user.slice/user-1000.slice/tinyland-heavy.slice/heavy-test.scope"), patch.object(e2e, "cgroup_memory_bound", side_effect=lambda path: {"kind": "cgroup", "cgroup": path, "memory_max_bytes": 1 << 34, "memory_max_set_by": "/user.slice/user-1000.slice/tinyland-heavy.slice"}), patch.object(e2e.os, "sched_getaffinity", side_effect=[{12, 13, 14, 15, 16}, {12, 13, 14, 15}], create=True), patch.object(e2e.os, "sched_setaffinity", side_effect=OSError("fixture affinity denial") if affinity_error else None, create=True) as affinity, patch.object(e2e.subprocess, "check_output", side_effect=check_output), patch.object(e2e.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
                 if affinity_error:
                     with self.assertRaises(SystemExit) as refused:
                         e2e.main()
@@ -66,7 +66,9 @@ class ReceiptTests(unittest.TestCase):
         code, receipt, env = self.exercise()
         self.assertEqual(code, 0)
         self.assertTrue(receipt["source_clean"])
-        self.assertEqual(receipt["memory_bound"], {"kind": "cgroup", "cgroup": "/user.slice/user-1000.slice/tinyland-heavy.slice/heavy-test.scope"})
+        self.assertEqual(receipt["memory_bound"]["kind"], "cgroup")
+        self.assertEqual(receipt["memory_bound"]["memory_max_bytes"], 1 << 34)
+        self.assertIn("ignored", receipt["bazel_rc_files"])
         self.assertNotIn("memory_limit_bytes_per_process", receipt)
         self.assertFalse(receipt["live_acceptance"])
         self.assertEqual(receipt["cpu_affinity"], [12, 13, 14, 15])
@@ -79,6 +81,7 @@ class ReceiptTests(unittest.TestCase):
         self.assertIn("--loading_phase_threads=1", receipt["command"])
         self.assertIn("--action_env=MALLOC_ARENA_MAX=2", receipt["command"])
         self.assertIn("--test_env=MALLOC_ARENA_MAX=2", receipt["command"])
+        self.assertIn("--test_env=SWB_HOOK_REQUIRE_BLACKHOLE=1", receipt["command"])
         self.assertIn("--host_action_env=MALLOC_ARENA_MAX=2", receipt["command"])
         self.assertIn("//crates/swb-broker:swb_broker_test", receipt["command"])
         self.assertIn("//crates/swb:swb", receipt["command"])
@@ -90,6 +93,30 @@ class ReceiptTests(unittest.TestCase):
         self.assertTrue(receipt["cases"]["crates/swb:hook_blackhole_test"]["hook_blackholed_broker_exit_0_within_2s"])
         self.assertTrue(receipt["cases"]["crates/swb-broker:swb_broker_test"]["owned_http_round_trip_survives_graceful_service_reopen"])
         self.assertIn("R-C949", receipt["rulings"])
+
+    def test_cgroup_memory_bound_reads_tightest_ancestor_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            leaf = root / "user.slice" / "heavy.slice" / "job.scope"
+            leaf.mkdir(parents=True)
+            (root / "user.slice" / "memory.max").write_text("max\n")
+            (root / "user.slice" / "heavy.slice" / "memory.max").write_text("8589934592\n")
+            (root / "user.slice" / "heavy.slice" / "memory.high").write_text("max\n")
+            (leaf / "memory.max").write_text("max\n")
+            bound = e2e.cgroup_memory_bound("/user.slice/heavy.slice/job.scope", root=root)
+            self.assertEqual(bound["kind"], "cgroup")
+            self.assertEqual(bound["memory_max_bytes"], 8589934592)
+            self.assertEqual(bound["memory_max_set_by"], "/user.slice/heavy.slice")
+            self.assertNotIn("memory_high_bytes", bound)
+
+    def test_cgroup_memory_bound_without_a_limit_claims_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            leaf = root / "user.slice" / "session.scope"
+            leaf.mkdir(parents=True)
+            (leaf / "memory.max").write_text("max\n")
+            self.assertEqual(e2e.cgroup_memory_bound("/user.slice/session.scope", root=root)["kind"], "none")
+            self.assertEqual(e2e.cgroup_memory_bound(None, root=root)["kind"], "none")
 
     def test_affinity_denial_refuses_before_bazel_or_output(self):
         self.exercise(affinity_error=True)

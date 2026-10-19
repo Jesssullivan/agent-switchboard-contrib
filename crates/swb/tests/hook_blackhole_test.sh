@@ -14,10 +14,19 @@
 #
 # Timing margin: the SWB-R10 ceiling is 2 s and the hook's own bound is
 # HOOK_LIMIT = 1800 ms (crates/swb/src/main.rs), leaving about 200 ms for
-# fork/exec of env, sh and swb. On a CPU-capped slice that headroom can be
-# lost to scheduling, so a case that is correct apart from overshooting the
-# 2 s ceiling is run once more; a second overshoot fails. A hook that hangs
-# or prints still fails on its first run.
+# fork/exec of env, sh and swb (1866 ms worst case measured on sting, so the
+# margin is thin on a CPU-capped runner). A case that exits 0 with no output
+# but overshoots 2 s is run once more, and a second overshoot fails. That
+# retry also covers a hook that hangs for a bounded time and then exits 0
+# (say at 2.5 s): it fails only if it overshoots twice. A case that exits
+# non-zero or prints fails on its first run. There is no per-case timeout: a
+# hook that never returns is caught by Bazel's timeout for the whole target
+# (size "small", 60 s) as a TIMEOUT, not as a FAIL line for that case.
+#
+# NO-ROUTE: with SWB_HOOK_REQUIRE_BLACKHOLE=1 (set by the fixture driver) a
+# run where no case reached the blackhole fails. Without it (CI) the run
+# still checks exit, output and budget, and prints NO-ROUTE, so a green CI
+# run is not by itself evidence that the blackhole path ran.
 #
 # Cases: the compiled `swb hook claude <event>` directly, and the Claude Code
 # wrapper `integrations/claude-code/scripts/swb-hook.sh`, for every event.
@@ -132,6 +141,10 @@ if [ "$blackholed" -eq 0 ]; then
   # Every closed-stdin case returned in under 1 s: connect failed at once, so
   # the blackhole path did not run. Not a contract break, and not evidence.
   echo "NO-ROUTE: all hook cases returned exit 0 within 2 s, but no closed-stdin case waited on connect; the blackhole path did not run"
+  if [ "${SWB_HOOK_REQUIRE_BLACKHOLE:-0}" = "1" ]; then
+    echo "SWB_HOOK_REQUIRE_BLACKHOLE=1: a NO-ROUTE run is not accepted" >&2
+    exit 1
+  fi
   exit 0
 fi
 echo "all hook cases returned exit 0 within 2 s against a blackholed broker ($blackholed closed-stdin cases waited on connect)"
