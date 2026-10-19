@@ -710,7 +710,7 @@ impl Store {
         }
         for key in ["msg_id", "thread_id", "reply_expires"] {
             if input.get(key).is_some_and(|value| !value.is_string()) {
-                return Err(format!("invalid {key}"));
+                return Err(format!("invalid {key}").into());
             }
         }
         if input.get("ttl_hours").is_some_and(|v| !v.is_u64()) {
@@ -730,7 +730,7 @@ impl Store {
                         && !s.chars().any(char::is_control)
                 })
             }) {
-                return Err(format!("invalid {key}"));
+                return Err(format!("invalid {key}").into());
             }
         }
         let msg_id = input

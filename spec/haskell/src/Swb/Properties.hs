@@ -249,7 +249,7 @@ endNeedsToken tr = go M.empty M.empty (clocked tr)
       let sess' = trackSessions t o r sess
           bad = case (o, r) of
             (Register a p, RRegistered tok) -> case M.lookup a regs of
-              Just (Reg toks _) -> ["register " ++ show (a, p) ++ " reissued an old token" | tok `elem` toks]
+              Just (Reg toks) -> ["register " ++ show (a, p) ++ " reissued an old token" | tok `elem` toks]
               _ -> []
             (End a ref, REnded ok) ->
               let toks = maybe [] regTokens (M.lookup a regs)

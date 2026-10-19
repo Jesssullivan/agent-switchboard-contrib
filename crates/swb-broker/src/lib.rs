@@ -269,24 +269,24 @@ async fn run_operation(store: Arc<Store>, name: &'static str, args: Value) -> Re
 /// A JSON request body, or the typed error for a missing, mistyped or
 /// malformed one. A JSON body needs `Content-Type: application/json`, which
 /// a browser can only send after a CORS preflight.
-fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Response> {
+fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Box<Response>> {
     match body {
         Ok(Json(value @ Value::Object(_))) => Ok(value),
-        Ok(Json(_)) => Err(error_response(
+        Ok(Json(_)) => Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
             "invalid_json",
             "request body must be a JSON object",
-        )),
-        Err(JsonRejection::MissingJsonContentType(_)) => Err(error_response(
+        ))),
+        Err(JsonRejection::MissingJsonContentType(_)) => Err(Box::new(error_response(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported_media_type",
             "Content-Type must be application/json",
-        )),
-        Err(_) => Err(error_response(
+        ))),
+        Err(_) => Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
             "invalid_json",
             "request body is not valid JSON",
-        )),
+        ))),
     }
 }
 
@@ -298,7 +298,7 @@ macro_rules! post_operation {
         ) -> Response {
             match json_body(body) {
                 Ok(args) => run_operation(store, $name, args).await,
-                Err(response) => response,
+                Err(response) => *response,
             }
         }
     };
