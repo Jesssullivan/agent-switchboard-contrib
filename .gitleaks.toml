@@ -6,3 +6,17 @@
 
 [extend]
 useDefault = true
+
+# Reviewed false positive (TIN-4655, operator GO 2026-10-20, lab session).
+# Commit 5a8432e6 (v0.3.0 security bundle, R-C944) used the 64-hex counting
+# pattern 0011..eeff twice as a test end_token in crates/swb/src/main.rs
+# (lines 1270 and 1747 at that commit; the same tests still use it). It is a
+# fixture, not a credential. gitleaks generic-api-key flags it in history,
+# so rewriting the file cannot clear the full-history scan. All conditions
+# must match: that one path, that one rule and exactly that literal.
+[[allowlists]]
+description = "test end_token fixture (64-hex counting pattern), first in 5a8432e6"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^crates/swb/src/main\.rs$''']
+regexes = ['''^(?:00112233445566778899aabbccddeeff){2}$''']
