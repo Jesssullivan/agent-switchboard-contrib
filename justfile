@@ -101,17 +101,17 @@ secrets-scan:
 
 # TIN-6749: prebuilt release binaries for a signed, pushed release tag.
 # Attended and maintainer-only: run on sting (x86_64-linux), with a Darwin
-# builder reachable over ssh (default: PZM). Builds the flake's swb-release
+# builder reachable over ssh (default: PZM by its tailnet name). Builds the flake's swb-release
 # output for x86_64-linux here and aarch64-darwin there, from the tagged
 # commit on GitHub, then writes dist/<tag>/ with SHA256SUMS and install.sh
 # and signs SHA256SUMS with the release key. See
 # docs/operations/PRODUCTIONIZATION.md -> "Prebuilt release binaries".
 # Build and sign the prebuilt release binaries for a pushed, signed tag (attended).
-release-binaries tag darwin_host="jsullivan2@petting-zoo-mini.local":
+release-binaries tag darwin_host="jsullivan2@petting-zoo-mini":
     bash ./scripts/release-binaries.sh build {{ quote(tag) }} {{ quote(darwin_host) }}
     bash ./scripts/release-binaries.sh sign {{ quote(tag) }}
 
-# Attach dist/<tag>/ to the existing GitHub release <tag>.
+# Attach dist/<tag>/ to the GitHub release <tag> (a draft is fine).
 release-binaries-upload tag:
     bash ./scripts/release-binaries.sh upload {{ quote(tag) }}
 

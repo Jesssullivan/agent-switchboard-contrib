@@ -42,7 +42,10 @@ check_tag_signer() {
 }
 
 build() {
-  local darwin_host="${1:-jsullivan2@petting-zoo-mini.local}" sha ref out linux darwin_path got
+  # The tailnet name, not petting-zoo-mini.local: sting resolves no mDNS.
+  # This is a nix build on PZM, not a system deploy, so the native-sshd
+  # deploy transport is not needed.
+  local darwin_host="${1:-jsullivan2@petting-zoo-mini}" sha ref out linux darwin_path got
   [[ "$(uname -s)/$(uname -m)" == "Linux/x86_64" ]] || die "build runs on x86_64-linux (sting or honey)"
   sha="$(tag_commit)"
   check_tag_signer
@@ -97,13 +100,24 @@ sign() {
 }
 
 upload() {
+  local id f name _
   [[ -f "$dist/SHA256SUMS.asc" ]] || die "run build and sign first"
-  gh release view "$tag" -R "$REPO" >/dev/null 2>&1 \
-    || die "no GitHub release $tag yet; create it with its notes first (gh release create)"
-  gh release upload "$tag" -R "$REPO" --clobber \
-    "$dist/swb-$tag-x86_64-linux" "$dist/swb-$tag-aarch64-darwin" \
-    "$dist/install.sh" "$dist/SHA256SUMS" "$dist/SHA256SUMS.asc"
-  say "uploaded to https://github.com/$REPO/releases/tag/$tag"
+  # A draft release is not bound to its tag until it is published, so
+  # `gh release view TAG` cannot see it; find it, draft or not, by tag_name.
+  id="$(gh api "repos/$REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$tag\") | .id" | head -n 1)"
+  [[ "$id" =~ ^[0-9]+$ ]] || die "no GitHub release $tag yet; create it as a draft with its notes first (gh release create $tag --draft)"
+  for f in "swb-$tag-x86_64-linux" "swb-$tag-aarch64-darwin" install.sh SHA256SUMS SHA256SUMS.asc; do
+    for _ in 1 2 3; do
+      name="$(gh api --method POST -H "Content-Type: application/octet-stream" \
+        "https://uploads.github.com/repos/$REPO/releases/$id/assets?name=$f" \
+        --input "$dist/$f" --jq .name 2>/dev/null)" && break
+      name=""
+      sleep 5
+    done
+    [[ "$name" == "$f" ]] || die "upload of $f failed (delete a partial asset in the release page before retrying)"
+    say "uploaded $f"
+  done
+  say "attached to release id $id; publish it when the assets are checked"
 }
 
 shift 2

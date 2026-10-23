@@ -265,18 +265,26 @@ v0.3.0, with an install script that verifies them.
 - **Attended, not CI.** No GloriousFlywheel runner builds Darwin, and the
   release key is not in CI, so a maintainer runs the step after the tag:
   1. Push the signed tag and let the release workflow publish the image.
-  2. Create the GitHub release with its notes, as for v0.2.2.
+  2. Create the GitHub release as a draft with its notes
+     (`gh release create vX.Y.Z --draft`), as for v0.2.2.
   3. On sting: `git fetch upstream --tags`, then
      `just release-binaries vX.Y.Z`. It builds Linux on sting and Darwin
-     on PZM over native ssh (`jsullivan2@petting-zoo-mini.local`). It checks
+     on PZM over ssh by its tailnet name (`jsullivan2@petting-zoo-mini`;
+     sting resolves no mDNS, and a nix build is not a system deploy). It checks
      that each binary reports the tag's version and that the Darwin one links
      nothing in `/nix/store`. It writes `dist/vX.Y.Z/`, signs `SHA256SUMS`
      with the release key and verifies the signature against
      `release-signers.asc`, the way `install.sh` does. The recipe refuses a
      tag not signed by the release key.
-  4. `just release-binaries-upload vX.Y.Z`.
+  4. `just release-binaries-upload vX.Y.Z` attaches the five files to the
+     draft (found by tag through the releases API), then publish it.
   5. Smoke-test `install.sh vX.Y.Z` with a scratch `SWB_INSTALL_DIR` on a
      Linux host and on a Mac.
+- **v0.3.0 (SWB-R62)** was the first release with binaries (2026-10-23;
+  receipt TIN-6749 comment `6c3f1670`). The release workflow run
+  [39888543363](https://github.com/xoxd-ai/agent-switchboard/actions/runs/39888543363)
+  pushed `sha256:2e42fc30…` and read it back; `install.sh v0.3.0` passed
+  with its signature check on sting (Linux) and on PZM (macOS).
 - The binaries are not part of the approved-broker record: that record and
   the release workflow pin only the OCI image. The binaries' hashes are in
   the signed `SHA256SUMS` and in the release receipt on TIN-6749.

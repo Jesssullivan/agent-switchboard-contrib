@@ -54,7 +54,7 @@
   "pr_heads": {
     "43": "572da8015920c816f9ba7c3440dfac0764a89c60"
   },
-  "publication_receipt": "PENDING: v0.3.0 release workflow registry readback; ratified SWB-R62 under TIN-6749 comment a7256598 item 1 (operator interview 2026-10-23) and R-C435 (TIN-5770 comment d3d90700); ruling carried on TIN-4655 comment 24157077",
+  "publication_receipt": "PUBLISHED 2026-10-23T02:25Z by the release workflow under the signed v0.3.0 tag (tag object 6b646390403a9475eb7890fdb5f95f0e1a649689 on ee1af0c4e2e2b260c57665f5feda24f2ec0dfe67): run https://github.com/xoxd-ai/agent-switchboard/actions/runs/39888543363 rebuilt the approved digest, pushed it by digest with no registry tag (02:25:15Z-02:25:28Z) and read it back; release-check --registry-manifest passed (supplied_registry_manifest_matches true); registry readback digest sha256:2e42fc30cabdee4b076bd80d7d1e4b80080fc81436153210368daaa0caea7172, 4579 bytes, byte-identical to the approved manifest; evidence artifact release-evidence-v0.3.0 (id 12474585352, zip sha256:4d045b921712cb514e443c6c52b6f6b6eafa50bc828c7f5d2549d51727899eeb, kept 90 days); anonymous readback from neo at 2026-10-23T02:29Z is byte-identical to that manifest; receipt TIN-6749 comment 6c3f1670-6fc6-4406-86ea-b8fd8abe0a67; ratified SWB-R62 under TIN-6749 comment a7256598 item 1 and R-C435 (TIN-5770 comment d3d90700)",
   "qualification": "published-candidate-only",
   "rulings": [
     "SWB-R62",
