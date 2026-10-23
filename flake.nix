@@ -207,7 +207,6 @@
         };
       });
 
-
       apps = forAllSystems (pkgs: {
         # Run the same properties against a disposable broker on loopback:
         #   SWB_SPEC_BROKER_URL=http://127.0.0.1:18080 nix run .#spec-live
@@ -221,10 +220,12 @@
       });
 
       checks = forAllSystems (pkgs: {
-        spec-dhall = pkgs.runCommand "swb-spec-dhall" { nativeBuildInputs = dhallTools pkgs ++ [ pkgs.bash ]; } ''
-          bash ${specDhallSource}/spec/check-dhall.sh ${specDhallSource}
-          touch "$out"
-        '';
+        spec-dhall =
+          pkgs.runCommand "swb-spec-dhall" { nativeBuildInputs = dhallTools pkgs ++ [ pkgs.bash ]; }
+            ''
+              bash ${specDhallSource}/spec/check-dhall.sh ${specDhallSource}
+              touch "$out"
+            '';
         spec-quickcheck = swbSpec pkgs;
         # R-C261: refinement types on the model's core invariants. The plugin
         # fails the compile on any unproved refinement.
@@ -251,51 +252,117 @@
       # this derivation only compiles the binary. swb-spec (R-C229) is merged
       # in for every system; building it runs the model properties (cabal
       # test via doCheck).
-      packages = nixpkgs.lib.recursiveUpdate (forAllSystems (pkgs: {
-        swb-spec = swbSpec pkgs;
-      })) (nixpkgs.lib.genAttrs packageSystems (
-        system:
-        let
-          pkgs = pkgsFor system;
-          toolchain = pkgs.rust-bin.stable.${rustChannel}.minimal;
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = toolchain;
-            rustc = toolchain;
-          };
-          swb = rustPlatform.buildRustPackage {
-            pname = "swb";
-            version = workspaceVersion;
-            src = nixpkgs.lib.fileset.toSource {
-              root = ./.;
-              fileset = nixpkgs.lib.fileset.unions [
-                ./Cargo.toml
-                ./Cargo.lock
-                ./crates
-                ./schemas
-              ];
-            };
-            cargoLock.lockFile = ./Cargo.lock;
-            cargoBuildFlags = [
-              "-p"
-              "swb"
-            ];
-            doCheck = false;
-            meta = {
-              description = "agent-switchboard broker, agent daemon and hook client";
-              homepage = "https://github.com/xoxd-ai/agent-switchboard";
-              license = [
-                nixpkgs.lib.licenses.mit
-                nixpkgs.lib.licenses.asl20
-              ];
-              mainProgram = "swb";
-            };
-          };
-        in
-        {
-          inherit swb;
-          default = swb;
-        }
-      ));
+      packages =
+        nixpkgs.lib.recursiveUpdate
+          (forAllSystems (pkgs: {
+            swb-spec = swbSpec pkgs;
+          }))
+          (
+            nixpkgs.lib.genAttrs packageSystems (
+              system:
+              let
+                pkgs = pkgsFor system;
+                # The swb derivation for one package set: `pkgs` for the Nix
+                # package, `pkgs.pkgsStatic` for the static Linux release binary.
+                mkSwb =
+                  set:
+                  let
+                    toolchain = set.rust-bin.stable.${rustChannel}.minimal;
+                    rustPlatform = set.makeRustPlatform {
+                      cargo = toolchain;
+                      rustc = toolchain;
+                    };
+                  in
+                  rustPlatform.buildRustPackage {
+                    pname = "swb";
+                    version = workspaceVersion;
+                    src = nixpkgs.lib.fileset.toSource {
+                      root = ./.;
+                      fileset = nixpkgs.lib.fileset.unions [
+                        ./Cargo.toml
+                        ./Cargo.lock
+                        ./crates
+                        ./schemas
+                      ];
+                    };
+                    cargoLock.lockFile = ./Cargo.lock;
+                    cargoBuildFlags = [
+                      "-p"
+                      "swb"
+                    ];
+                    doCheck = false;
+                    meta = {
+                      description = "agent-switchboard broker, agent daemon and hook client";
+                      homepage = "https://github.com/xoxd-ai/agent-switchboard";
+                      license = [
+                        nixpkgs.lib.licenses.mit
+                        nixpkgs.lib.licenses.asl20
+                      ];
+                      mainProgram = "swb";
+                    };
+                  };
+                swb = mkSwb pkgs;
+                # Release binaries (TIN-6749): one self-contained `bin/swb` per
+                # system, for the GitHub release and scripts/install.sh. Each build
+                # refuses its own output if it still references /nix/store, so a
+                # binary that only runs on a Nix machine is never published.
+                # - x86_64-linux: statically linked against musl (pkgsStatic). The
+                #   bundled SQLite is compiled by the same static toolchain.
+                # - aarch64-darwin: macOS has no static libc, so the binary links
+                #   /usr/lib/libSystem. The one store dylib it needs, libiconv, is
+                #   rewritten to the system copy at /usr/lib/libiconv.2.dylib, and
+                #   the binary is re-signed ad hoc (arm64 macOS runs nothing
+                #   unsigned). It is not Developer ID signed or notarized.
+                swb-release =
+                  if pkgs.stdenv.hostPlatform.isLinux then
+                    (mkSwb pkgs.pkgsStatic).overrideAttrs (old: {
+                      pname = "swb-release";
+                      postFixup = (old.postFixup or "") + ''
+                        bin="$out/bin/swb"
+                        if ${pkgs.file}/bin/file -L "$bin" | grep -q 'dynamically linked'; then
+                          echo "swb-release: $bin is dynamically linked" >&2
+                          exit 1
+                        fi
+                        if grep -q /nix/store "$bin"; then
+                          echo "swb-release: $bin references /nix/store" >&2
+                          exit 1
+                        fi
+                      '';
+                    })
+                  else
+                    pkgs.runCommand "swb-release-${workspaceVersion}"
+                      {
+                        nativeBuildInputs = [
+                          pkgs.cctools
+                          pkgs.darwin.sigtool
+                        ];
+                        meta.mainProgram = "swb";
+                      }
+                      ''
+                        install -d "$out/bin"
+                        bin="$out/bin/swb"
+                        cp ${swb}/bin/swb "$bin"
+                        chmod u+w "$bin"
+                        for lib in $(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep '^/nix/store/' || true); do
+                          case "$(basename "$lib")" in
+                            libiconv.2.dylib) install_name_tool -change "$lib" /usr/lib/libiconv.2.dylib "$bin" ;;
+                            *) echo "swb-release: no system replacement for $lib" >&2; exit 1 ;;
+                          esac
+                        done
+                        codesign -f -s - "$bin"
+                        if otool -L "$bin" | tail -n +2 | grep -q /nix/store; then
+                          echo "swb-release: $bin still links /nix/store" >&2
+                          exit 1
+                        fi
+                        chmod 0555 "$bin"
+                      '';
+              in
+              {
+                inherit swb swb-release;
+                default = swb;
+              }
+            )
+          );
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
     };

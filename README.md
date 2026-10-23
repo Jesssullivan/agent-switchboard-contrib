@@ -39,13 +39,41 @@ change between minor versions; the CHANGELOG says when they do.
 
 ## Install
 
-You need either Nix (with flakes) or Rust 1.97.1. The repository's
-`rust-toolchain.toml` pins that release, so `rustup` installs it on first use.
+From v0.3.0 each release ships prebuilt binaries for x86_64-linux (static)
+and aarch64-darwin, so neither Nix nor Rust is needed. Otherwise you need
+Nix (with flakes) or Rust 1.97.1; the repository's `rust-toolchain.toml`
+pins that release, so `rustup` installs it on first use.
 
 **Broker and clients must run the same minor version.** `main` is v0.3.0,
 which a v0.2.2 broker or client cannot talk to (the routes changed). To
 join a v0.2.2 broker, install the tagged release; to try `swb` on its own,
 either works, as long as broker and clients come from the same source.
+
+**Prebuilt binary (v0.3.0 and later):**
+
+```sh
+curl -fsSLO https://github.com/xoxd-ai/agent-switchboard/releases/download/v0.3.0/install.sh
+less install.sh          # read it first
+sh install.sh v0.3.0     # installs ~/.local/bin/swb
+```
+
+`install.sh` downloads `swb-<version>-<system>` and `SHA256SUMS` from the
+release and always checks the binary's SHA-256. When `gpg` is installed it
+also checks `SHA256SUMS.asc` against the release key pinned in the script
+(primary fingerprint `161895136D2E5C292D2A663D0B01977B8DD5DA60`, the key in
+[docs/releases/release-signers.asc](docs/releases/release-signers.asc)).
+Set `SWB_REQUIRE_SIGNATURE=1` to fail when `gpg` is missing, and
+`SWB_INSTALL_DIR` to install elsewhere. To verify by hand:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS        # shasum -a 256 -c on macOS
+gpg --import release-signers.asc && gpg --verify SHA256SUMS.asc SHA256SUMS
+```
+
+The Linux binary is statically linked (musl). The macOS binary links only
+system libraries and is signed ad hoc; it is not Developer ID signed or
+notarized. Downloaded with `curl` it carries no quarantine flag; downloaded
+with a browser, clear it with `xattr -d com.apple.quarantine swb`.
 
 **Nix:**
 

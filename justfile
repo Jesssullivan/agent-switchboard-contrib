@@ -99,6 +99,22 @@ secrets-scan:
     trufflehog ${no_update[@]+"${no_update[@]}"} git "file://$PWD" --only-verified --fail
     gitleaks git --config .gitleaks.toml --redact --exit-code 1 .
 
+# TIN-6749: prebuilt release binaries for a signed, pushed release tag.
+# Attended and maintainer-only: run on sting (x86_64-linux), with a Darwin
+# builder reachable over ssh (default: PZM). Builds the flake's swb-release
+# output for x86_64-linux here and aarch64-darwin there, from the tagged
+# commit on GitHub, then writes dist/<tag>/ with SHA256SUMS and install.sh
+# and signs SHA256SUMS with the release key. See
+# docs/operations/PRODUCTIONIZATION.md -> "Prebuilt release binaries".
+# Build and sign the prebuilt release binaries for a pushed, signed tag (attended).
+release-binaries tag darwin_host="jsullivan2@petting-zoo-mini.local":
+    bash ./scripts/release-binaries.sh build {{ quote(tag) }} {{ quote(darwin_host) }}
+    bash ./scripts/release-binaries.sh sign {{ quote(tag) }}
+
+# Attach dist/<tag>/ to the existing GitHub release <tag>.
+release-binaries-upload tag:
+    bash ./scripts/release-binaries.sh upload {{ quote(tag) }}
+
 # PRs go from the fork to upstream main through the merge queue (ADR-0001).
 # The fork is Jesssullivan/agent-switchboard-contrib: a real GitHub fork of
 # upstream with the contrib name (R-C655, TIN-5770 comment fed25e8b). The
