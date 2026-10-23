@@ -931,6 +931,29 @@ impl Store {
         tx.commit().map_err(sql_err)?;
         Ok(json!({"messages":values}))
     }
+    /// The thread id, seq, in_reply_to and ticket of a stored message, for
+    /// the broker's audit line (ADR-0002 L1-lite). Metadata only, never the
+    /// body; `None` when no such message is stored.
+    pub fn message_meta(&self, msg_id: &str) -> StoreResult<Option<Value>> {
+        let db = self.db()?;
+        let row: Option<(String, String)> = db
+            .query_row(
+                "SELECT thread_id, envelope FROM messages WHERE msg_id=?1",
+                [msg_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        Ok(row.map(|(thread_id, envelope)| {
+            let envelope = serde_json::from_str::<Value>(&envelope).unwrap_or(Value::Null);
+            json!({
+                "thread_id": thread_id,
+                "seq": envelope.get("seq"),
+                "in_reply_to": envelope.get("in_reply_to"),
+                "ticket": envelope.get("ticket"),
+            })
+        }))
+    }
     pub fn ack(&self, me: &str, msg_id: &str) -> StoreResult<Value> {
         if !valid_agent_id(me) || !valid_ulid(msg_id) {
             return Err("invalid identity or msg_id".into());

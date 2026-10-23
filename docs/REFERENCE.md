@@ -80,6 +80,17 @@ guard's refusals are 403. The full table is in the migration notes.
 `swb_claim_overlaps` (active claims sharing a subject with another holder)
 and `swb_handoffs_total`.
 
+The broker writes one JSON audit line to stdout for each successful
+`register`, new `send` and `ack`, for each message an `inbox` read returns
+(op `fetch`, with `delivery_count`), and for each recorded, renewed or
+refused claim, release and handoff. Fields are named explicitly: `ts`, `op`,
+`me`, `to`, `ticket`, `ruling`, `msg_id`, `thread_id`, `seq`,
+`in_reply_to`, `size`, `body_hmac` and the claim fields. A line never
+carries a body, a note or an end token. The message lines share `msg_id`,
+`thread_id` and `ticket`, so a log reader can follow one thread from send
+through delivery to ack (ADR-0002 L1-lite). The broker has no log client;
+the lines go to stdout only.
+
 ## Claims
 
 Claims are advisory (SWB-R16, R-C950). A subject is a ticket (`TIN-4655`), a

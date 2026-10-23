@@ -55,6 +55,12 @@ fallback. Details and the upgrade order:
 
 ### Added
 
+- **Audit lines follow a thread (ADR-0002 L1-lite, TIN-6749).** The `send`
+  and `ack` audit lines carry `thread_id`, `seq`, `in_reply_to` and
+  `ticket` beside `msg_id` (`ack` reads them from the stored message), and
+  every message an `inbox` read returns writes a `fetch` line with its
+  `delivery_count`. Still no body, note or end token. The broker writes
+  stdout only; it ships no Loki or OTLP client.
 - **Claims, release and handoff (P2, SWB-R16, R-C950, TIN-6690).** New MCP
   tools, REST routes and CLI verbs `claim`, `release`, `handoff` and
   `claims`, plus `heartbeat` and `thread`, completing the ADR-0001 tool set

@@ -18,8 +18,8 @@ contractual remedy attaches to any indicator.
 
 - The SLIs apply to the commissioned broker: the one-replica StatefulSet
   behind the Tailscale Service `mcp-agents`, at the MagicDNS name Tailscale
-  actually issues (SWB-R52). No broker is live yet (R-C264 puts commissioning
-  next). Fixture runs, local integration trees and loopback `spec-live` runs
+  actually issues (SWB-R52). The v0.2.2 broker is live, but nothing scrapes
+  its `/metrics` yet, so no SLI data exists. Fixture runs, local integration trees and loopback `spec-live` runs
   are development evidence, not SLI data.
 - Measurement starts at the first scrape after the P1b functional exits pass.
   R-C263 sets no minimum amount of data. The targets interview decides
@@ -45,24 +45,33 @@ contractual remedy attaches to any indicator.
 ## What the broker exposes today
 
 The broker serves `/metrics` on its separate metrics listener (`:9090`,
-in-cluster only). As of `08de158` it emits exactly three series
-(`Store::metrics` in `crates/swb-store/src/lib.rs`):
+in-cluster only). As of v0.3.0 it emits six series (`Store::metrics` in
+`crates/swb-store/src/lib.rs`). The three claim series arrived with P2
+claims (R-C950):
 
 | Series | Type | Meaning today |
 | --- | --- | --- |
 | `swb_messages_total` | counter, no labels | Accepted new sends. Persisted in the SQLite `counters` table, so it survives a restart; an idempotent retry does not increment it. |
 | `swb_mailbox_unacked` | gauge, no labels | Messages not `acked` or `expired` whose TTL has not passed. |
 | `swb_sessions{state="live"}` | gauge | Sessions not ended with `last_seen` within the last 900 s. |
+| `swb_claims_active` | gauge, no labels | Active claims that have not expired. |
+| `swb_claim_overlaps` | gauge, no labels | Active claims that share a subject with another holder's active claim. |
+| `swb_handoffs_total` | counter, no labels | Handoff offers created. Persisted in the `counters` table; repeating an open offer does not increment it. |
 
-Each successful `register`, new `send` and `ack` also writes one JSON audit
-line to stdout with a second-resolution `ts` and the `msg_id`, never the
-body (SWB-R19, SWB-R26).
+Each successful `register`, new `send` and `ack`, each message an `inbox`
+read returns (a `fetch` line with its `delivery_count`), and each recorded
+claim, release or handoff also writes one JSON audit line to stdout. A line
+has a second-resolution `ts` and never the body (SWB-R19, SWB-R26). Since
+v0.3.0 the message lines carry `msg_id`, `thread_id`, `seq`, `in_reply_to`
+and `ticket` (ADR-0002 L1-lite), so a log reader can follow one thread from
+send through each delivery to ack.
 
 The labelled forms in ADR-0002 (`{from_harness,to_harness,transport}`,
 `{harness,host,state}`, `{to_harness}`) and
 `swb_session_last_seen_timestamp_seconds` are designed but **not emitted**.
-There is no health or readiness endpoint, no latency histogram, and no
-counter for acks or expiries.
+`GET /healthz` (v0.3.0) answers on both listeners and is a liveness check
+only. There is no readiness endpoint, no latency histogram, and no counter
+for acks or expiries.
 
 ## SLI 1: delivery latency (p50, p99)
 
@@ -80,8 +89,9 @@ counter for acks or expiries.
   latency sample. Count it separately (SLI 2 accounting), never as a
   latency of TTL.
 - **Measured today:** not measurable. The `messages` table stores
-  `created_at` in whole seconds and records no fetch time. The stdout audit
-  has no `inbox` line.
+  `created_at` in whole seconds and records no fetch time. Since v0.3.0 the
+  stdout audit has a `fetch` line per delivery, but its `ts` is whole
+  seconds too, so it cannot resolve a 250 ms poll loop.
 - **Needed:** a `first_fetched_at` column set in the `inbox` transaction when
   `delivery_count` goes 0 → 1; millisecond timestamps for `created_at` and
   `first_fetched_at` (second resolution cannot resolve a 250 ms poll loop);
