@@ -20,12 +20,21 @@ shows what the broker records and exposes.
 | --- | --- | --- | --- |
 | `claude@neo` | Claude Code | neo (the operator's seat) | push: `swb channel` events |
 | `codex@sting` | Codex | sting | UserPromptSubmit notice, then `swb` CLI |
-| `junie@sting` | Junie (JetBrains) | sting | `swb` CLI from its terminal tool |
+| `junie@sting` | Junie (JetBrains) | sting | `swb` CLI from its terminal tool, or the `inbox`/`reply`/`ack` tools of a `swb channel` MCP server it loads |
 | `pi@sting` | Pi (`pi-agents`) | sting | next-turn inbox notice, then `swb` CLI |
 
 Below, `<claude>`, `<codex>`, `<junie>` and `<pi>` stand for each session's
 full agent id (`harness:host:pid:session_id`). Read them off `swb peers` in
-the dry run.
+the dry run. The host part is the machine's short host name, so a seat
+called "neo" may register as `claude:macbook-neo:…`.
+
+Only `claude@neo` is woken by a push. Codex and Pi see new mail at their
+next user turn, and Junie when it calls its inbox, so the operator paces the
+ring: after each send, give the next harness a one-line prompt such as
+"check your swb inbox". A Junie session whose terminal tool does not inherit
+the `SWB_*` session environment needs `SWB_BROKER_URL` and `SWB_AGENT_ID`
+set in each command, or uses the channel server's `reply` tool, which takes
+`to`, `thread_id` and `in_reply_to` and acks `in_reply_to`.
 
 ## The ring
 
@@ -132,12 +141,23 @@ Show only what exists. Label the rest "designed".
    port-forward), or from the Grafana panel if the scrape has landed. Show
    `swb_messages_total`, `swb_sessions{state="live"}`,
    `swb_mailbox_unacked` and the three claim series. These are six unlabelled
-   series; nothing else is emitted.
-4. **The audit trail.** The broker's stdout has one JSON line per `send`,
-   `fetch` and `ack`. Since v0.3.0 each carries `msg_id`, `thread_id`, `seq`
-   and `ticket`, never the body (ADR-0002 L1-lite). Filter the pod log for
-   the demo `thread_id` to show the ring as 4 sends, 4 fetches and 4 acks.
-   This is broker stdout, not Loki.
+   series; nothing else is emitted. A scrape samples them every scrape
+   interval, so a hop shorter than that interval may never show
+   `swb_mailbox_unacked` above zero; the increase of `swb_messages_total`
+   over the take (6 for the ring plus the authority beat) always shows.
+4. **The audit trail.** The broker's stdout has one JSON line per `send`
+   and `ack`, and one `fetch` line per message each inbox read returns.
+   Since v0.3.0 each carries `msg_id`, `thread_id`, `seq`, `in_reply_to` and
+   `ticket`, never the body (ADR-0002 L1-lite). Filter the pod log for the
+   demo `thread_id` to show the ring as 4 sends, 4 acks and at least 4
+   fetches. Every inbox read writes a `fetch` line, including a hook's
+   notice, a `swb channel` poll (every 5 s, and every 30 s while a message
+   stays unacked) and the CLI read, so a message usually has more than one,
+   with `delivery_count` rising 1, 2, 3. A loopback dry run with one extra
+   read per hop gave 9. An `ack` line carries the `seq` of the message it
+   acknowledges. The authority beat's `send` line carries
+   `"ruling": "R-DEMO-0000"`; `operator_directed` is in the envelope, not the
+   audit line. This is broker stdout, not Loki.
 5. **Roadmap, labelled "designed".** [ADR-0002](../adr/0002-lgtm-plane.md)
    designs a Tempo trace per thread, Loki lines through Alloy and labelled
    Mimir series. None of it is live. Make no live Tempo or Loki claim
@@ -149,16 +169,19 @@ Before the recording, in this order:
 
 - [ ] `swb version` prints `0.3.0` on neo and sting, and the broker runs
       the v0.3.0 image from `docs/releases/approved-broker.json`.
-- [ ] All four sessions are registered: `swb peers` shows exactly the four
-      cast rows as `live`. Pi is logged in to a model (`/login`).
-- [ ] Every cast inbox is empty: run `swb inbox` and ack leftovers.
+- [ ] All four sessions are registered: `swb peers` shows the four cast
+      rows as `live` (other live sessions may be listed too; `--host`
+      narrows it). Pi is logged in to a model (`/login`).
+- [ ] Every cast inbox is empty: run `swb inbox` and ack leftovers. The CLI
+      returns one message per call, so repeat until it is empty.
 - [ ] The four agent ids are written into the prompts.
 - [ ] Each harness got its prompt, and each one confirmed its transform
       on a sample line.
 - [ ] A full ring ends in `MATCH`, and the authority beat ends in a refusal
       reply.
 - [ ] `swb thread <thread_id>` and the pod-log filter give the expected
-      lines (4 sends, 4 fetches, 4 acks for the ring).
+      lines (for the ring: 4 sends, 4 acks, and at least one `fetch` per
+      message, the first with `delivery_count` 1).
 - [ ] Nothing secret is on screen: no environment dumps, no token files,
       no shell history with credentials.
 - [ ] Each dry-run hop's `msg_id`, `thread_id` and timestamps are posted to

@@ -13,6 +13,14 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
+### Documentation
+
+- `docs/demo/TELEPHONE.md`: the audit trail for a ring is 4 sends, 4 acks
+  and at least one `fetch` per message, since every inbox read (hook notice,
+  channel poll, CLI) writes one; `swb peers` may list more than the cast; the
+  operator paces Codex, Pi and Junie hops; Junie's channel `reply` path; a
+  scrape may miss short `swb_mailbox_unacked` blips (TIN-6749).
+
 ## [0.3.0] - 2026-10-23
 
 Release record SWB-R62. Source `e2bb9f75` (the #43 merge), image
