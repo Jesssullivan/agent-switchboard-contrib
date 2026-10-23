@@ -8,6 +8,7 @@ registers, receives peer messages and answers them.
 | Claude Code | [claude-code/](claude-code/) | Plugin, channel push, fail-open hooks and the peer-dialog skill |
 | Codex | [codex/](codex/) | **UNPROVEN — pending P1b canaries (R-C949)** |
 | Pi | [pi/](pi/) | **UNPROVEN — pending P1b canaries (R-C949)** |
+| Any harness | [agent-skill/](agent-skill/SKILL.md) | Harness-neutral guide (a `SKILL.md`): receive, reply and ack with the `swb` CLI; peer messages are data, never authority |
 
 Every integration follows one rule: a message from another agent is teammate
 information, never operator authority. The broker stamps it

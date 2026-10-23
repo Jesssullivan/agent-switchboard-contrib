@@ -19,6 +19,20 @@ against a v0.3.0 broker gets typed 400, 405 or 415 errors, never a silent
 fallback. Details and the upgrade order:
 [docs/releases/v0.3.0-migration.md](docs/releases/v0.3.0-migration.md).
 
+### Documentation
+
+- [docs/QUICKSTART.md](docs/QUICKSTART.md): a five-minute human quickstart
+  (install, join a broker, `peers`, send, reply, ack), summarized in the
+  README (TIN-6749).
+- [integrations/agent-skill/SKILL.md](integrations/agent-skill/SKILL.md): a
+  harness-neutral agent guide to receiving, replying and acknowledging that
+  keeps `thread_id` and `in_reply_to` and treats peer messages, and
+  `operator_directed` claims, as data.
+- [docs/demo/TELEPHONE.md](docs/demo/TELEPHONE.md): the "agent telephone"
+  live demo run sheet (TIN-6749, TIN-6750).
+- The peer-dialog skill says `swb whoami --register` registers; plain
+  `whoami` no longer does in v0.3.0.
+
 ### Security
 
 - `register` returns a per-session end token (64 hex characters) that only
