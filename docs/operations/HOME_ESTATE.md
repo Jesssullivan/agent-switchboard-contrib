@@ -25,9 +25,19 @@ in [PRODUCTIONIZATION.md](PRODUCTIONIZATION.md); SLIs in [SLO.md](SLO.md).
 - **Push:** the UserPromptSubmit notice everywhere; for Claude Code,
   `swb channel` (SWB-R56). `swb agentd` (P2) is no longer the Claude push
   path.
-- **LGTM plane:** the broker writes through to Tempo, Loki and Mimir; LGTM is
-  the read/query/context plane, never the commit path
-  ([ADR-0002](../adr/0002-lgtm-plane.md)).
+- **LGTM plane:** designed, not built ([ADR-0002](../adr/0002-lgtm-plane.md)).
+  The broker has no OTLP exporter and no Loki client, and writes nothing to
+  Tempo, Loki or Mimir. What it emits today:
+  - `/metrics` on `:9090`: six series (see
+    [SLO.md](SLO.md#what-the-broker-exposes-today)). Nothing scrapes them
+    yet.
+  - One JSON audit line per accepted operation on stdout. Since v0.3.0 the
+    message lines (`send`, `fetch`, `ack`) carry `msg_id`, `thread_id`,
+    `seq` and `ticket` (ADR-0002 L1-lite), so a log collector could follow a
+    thread. No collector picks them up yet.
+
+  SWB-R02's write-through stays the design: LGTM would be the
+  read/query/context plane, never the commit path.
 
 ## Release state
 

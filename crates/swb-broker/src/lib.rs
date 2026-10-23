@@ -166,18 +166,34 @@ fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreErro
         ),
         _ => Err("unknown operation".into()),
     }?;
+    for line in audit_lines(store, name, args, &result, created)? {
+        println!("{line}");
+    }
+    Ok(result)
+}
+
+/// The audit lines one operation writes to stdout, in order. Every line is
+/// built by `audit_record`, so no body, note or end token reaches it.
+fn audit_lines(
+    store: &Store,
+    name: &str,
+    args: &Value,
+    result: &Value,
+    created: bool,
+) -> Result<Vec<Value>, StoreError> {
+    let mut lines = Vec::new();
     // R-C950 (4): every claim an end released is logged as its own release.
     if name == "end" {
         for released in result["released_claims"].as_array().into_iter().flatten() {
             let mut line = audit_record("release", args, released, None);
             line["reason"] = json!("session_ended");
-            println!("{line}");
+            lines.push(line);
         }
     }
     // The one refusal (R-C950 (1)) is logged too, so a blocked exclusive
     // request leaves a trace; nothing about it was recorded in the store.
     if name == "claim" && result["outcome"] == json!("refused") {
-        println!("{}", audit_record(name, args, &result, None));
+        lines.push(audit_record(name, args, result, None));
     }
     if created && matches!(name, "claim" | "release" | "handoff") {
         // An accepted handoff ends its source claim: that transition gets
@@ -185,17 +201,17 @@ fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreErro
         if name == "claim"
             && let Some(source) = result.get("handoff_from").filter(|v| v.is_string())
         {
-            let mut line = audit_record("handed_off", args, &result, None);
+            let mut line = audit_record("handed_off", args, result, None);
             line["claim_id"] = source.clone();
             line["state"] = json!("handed_off");
             line["outcome"] = Value::Null;
-            println!("{line}");
+            lines.push(line);
         }
-        let mut line = audit_record(name, args, &result, None);
+        let mut line = audit_record(name, args, result, None);
         if name == "release" {
             line["reason"] = json!("released");
         }
-        println!("{line}");
+        lines.push(line);
     }
     if created && matches!(name, "register" | "send" | "ack") {
         let body = result.get("body").and_then(Value::as_str).unwrap_or("");
@@ -204,16 +220,41 @@ fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreErro
         } else {
             None
         };
-        println!(
-            "{}",
-            audit_record(name, args, &result, body_hmac.as_deref())
-        );
+        let mut line = audit_record(name, args, result, body_hmac.as_deref());
+        // ADR-0002 L1-lite (TIN-6749): an ack result carries only msg_id and
+        // state, so the line takes thread_id, seq, in_reply_to and ticket
+        // from the stored message. The ack is already committed; a failed
+        // lookup leaves those fields null rather than failing it.
+        if name == "ack"
+            && let Some(meta) = result
+                .get("msg_id")
+                .and_then(Value::as_str)
+                .and_then(|id| store.message_meta(id).ok().flatten())
+        {
+            for key in ["thread_id", "seq", "in_reply_to", "ticket"] {
+                line[key] = meta[key].clone();
+            }
+        }
+        lines.push(line);
     }
-    Ok(result)
+    // ADR-0002 L1-lite (TIN-6749): one `fetch` line (the ADR-0002 op name)
+    // per message an inbox read returns, with its delivery count, so Loki can
+    // follow a thread from send through delivery to ack. An empty read
+    // writes nothing.
+    if name == "inbox" {
+        for message in result["messages"].as_array().into_iter().flatten() {
+            let mut line = audit_record("fetch", args, message, None);
+            line["delivery_count"] = message["delivery_count"].clone();
+            lines.push(line);
+        }
+    }
+    Ok(lines)
 }
 
 /// The audit line. It names fields explicitly, so neither the message body,
 /// a claim or handoff note, nor a register's `end_token` can reach it.
+/// `msg_id`, `thread_id`, `seq` and `ticket` are the keys a Loki reader
+/// follows a thread by (ADR-0002 L1-lite).
 fn audit_record(name: &str, args: &Value, result: &Value, body_hmac: Option<&str>) -> Value {
     let body_size = result
         .get("body")
@@ -223,7 +264,9 @@ fn audit_record(name: &str, args: &Value, result: &Value, body_hmac: Option<&str
         "ts":now_secs(),
         "op":name,"me":args.get("me").or_else(||args.get("from")),"to":result.get("to"),
         "ticket":result.get("ticket"),"ruling":result.get("ruling"),
-        "msg_id":result.get("msg_id"),"size":body_size,"body_hmac":body_hmac,
+        "msg_id":result.get("msg_id"),"thread_id":result.get("thread_id"),
+        "seq":result.get("seq"),"in_reply_to":result.get("in_reply_to"),
+        "size":body_size,"body_hmac":body_hmac,
         "agent_id":result.get("agent_id"),"state":result.get("state"),
         "claim_id":result.get("claim_id"),"subject":result.get("subject"),
         "handoff_id":result.get("handoff_id"),"outcome":result.get("outcome"),
@@ -2348,6 +2391,83 @@ mod tests {
         assert_eq!(
             audit_record("register", &args, &result, None)["agent_id"],
             "claude:honey:1:a"
+        );
+    }
+
+    #[test]
+    fn audit_lines_follow_a_thread_through_send_inbox_and_ack() {
+        // ADR-0002 L1-lite (TIN-6749): send, each delivery and ack carry
+        // msg_id, thread_id and ticket, so Loki can follow a thread.
+        let store = Store::memory().unwrap();
+        let (a, b) = ("claude:honey:1:a", "pi:sting:2:b");
+        let send = json!({"from":a,"to":b,"ticket":"TIN-6749","body":"body sentinel"});
+        let first = store.send(&send).unwrap().envelope;
+        let thread = first["thread_id"].clone();
+        let msg_id = first["msg_id"].clone();
+        assert!(thread.is_string());
+
+        let sent = audit_lines(&store, "send", &send, &first, true).unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["op"], "send");
+        assert_eq!(sent[0]["msg_id"], msg_id);
+        assert_eq!(sent[0]["thread_id"], thread);
+        assert_eq!(sent[0]["ticket"], "TIN-6749");
+        assert_eq!(sent[0]["seq"], 1);
+
+        let inbox_args = json!({"me":b});
+        let batch = store.inbox(b, 20).unwrap();
+        let delivered = audit_lines(&store, "inbox", &inbox_args, &batch, true).unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0]["op"], "fetch");
+        assert_eq!(delivered[0]["me"], b);
+        assert_eq!(delivered[0]["msg_id"], msg_id);
+        assert_eq!(delivered[0]["thread_id"], thread);
+        assert_eq!(delivered[0]["ticket"], "TIN-6749");
+        assert_eq!(delivered[0]["delivery_count"], 1);
+
+        let ack_args = json!({"me":b,"msg_id":msg_id});
+        let acked = store.ack(b, msg_id.as_str().unwrap()).unwrap();
+        let ack_lines = audit_lines(&store, "ack", &ack_args, &acked, true).unwrap();
+        assert_eq!(ack_lines.len(), 1);
+        assert_eq!(ack_lines[0]["op"], "ack");
+        assert_eq!(ack_lines[0]["msg_id"], msg_id);
+        assert_eq!(ack_lines[0]["thread_id"], thread);
+        assert_eq!(ack_lines[0]["ticket"], "TIN-6749");
+        assert_eq!(ack_lines[0]["state"], "acked");
+        assert_eq!(ack_lines[0]["seq"], 1);
+
+        // A reply keeps the thread, and its lines say so.
+        let reply = json!({"from":b,"to":a,"ticket":"TIN-6749","body":"reply sentinel",
+            "thread_id":thread,"in_reply_to":msg_id});
+        let second = store.send(&reply).unwrap().envelope;
+        let reply_lines = audit_lines(&store, "send", &reply, &second, true).unwrap();
+        assert_eq!(reply_lines[0]["thread_id"], thread);
+        assert_ne!(reply_lines[0]["msg_id"], msg_id);
+        assert_eq!(reply_lines[0]["in_reply_to"], msg_id);
+        assert_eq!(reply_lines[0]["seq"], 2);
+
+        for line in sent
+            .iter()
+            .chain(&delivered)
+            .chain(&ack_lines)
+            .chain(&reply_lines)
+        {
+            let text = line.to_string();
+            assert!(!text.contains("sentinel"), "{text}");
+        }
+        // An empty inbox read writes no line.
+        let empty = store.inbox(b, 20).unwrap();
+        assert!(
+            audit_lines(&store, "inbox", &inbox_args, &empty, true)
+                .unwrap()
+                .is_empty()
+        );
+        // No stored message: no metadata, and an ack line keeps nulls.
+        assert!(
+            store
+                .message_meta("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+                .unwrap()
+                .is_none()
         );
     }
 }
