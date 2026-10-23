@@ -19,5 +19,9 @@ Play the cast with `asciinema play docs/demo/demo.cast`, or with any
 asciinema-player embed. Regenerate both with
 `SWB_BIN=/path/to/swb examples/demo/run.sh --record`.
 
+The live demo those tickets ask for has its own run sheet:
+[TELEPHONE.md](TELEPHONE.md), four harnesses on two hosts passing one
+message around a ring.
+
 The cast is a preview artifact: nothing here is published as a launch.
 `swb agentd` is still P2 and appears only as a stub.

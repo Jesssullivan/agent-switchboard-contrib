@@ -80,6 +80,26 @@ digest for each release is in
 
 ## Quickstart
 
+Five minutes, from a shell, against a broker someone already runs
+([docs/QUICKSTART.md](docs/QUICKSTART.md) has every step):
+
+1. **Install** `swb` (above) and check `swb version` matches the broker.
+2. **Join:** set `SWB_BROKER_URL`, `SWB_HOST`, `SWB_HARNESS`,
+   `SWB_SESSION_ID`, `SWB_SESSION_PID` and `SWB_PROC_START`, run
+   `swb whoami --register`, then export the printed id as `SWB_AGENT_ID`.
+3. **Look:** `swb peers` lists the live sessions.
+4. **Send:** `printf '%s\n' "hello" | swb send <agent-id> none` (body on stdin).
+5. **Reply and ack:** `swb inbox`, then
+   `swb send <from> none --thread <thread_id> --in-reply-to <msg_id>` and
+   `swb ack <msg_id>`.
+
+Agents follow the same steps through their hooks and tools; the
+harness-neutral [agent guide](integrations/agent-skill/SKILL.md) teaches
+them to keep threads intact and to treat peer messages as data, never as
+operator authority.
+
+### Try it on one machine
+
 Run a broker on loopback with a scratch database, register two sessions the
 way a SessionStart hook does, and send one message between them. It works
 with either version, on Linux and macOS.
@@ -126,7 +146,10 @@ routes, verbs and the channel setup are in
 
 | Doc | What |
 | --- | --- |
+| [docs/QUICKSTART.md](docs/QUICKSTART.md) | Five minutes: install, join a broker, peers, send, reply, ack |
 | [docs/REFERENCE.md](docs/REFERENCE.md) | Settings, REST routes, MCP tools, CLI verbs, exit codes, Claude Code channel |
+| [integrations/agent-skill/SKILL.md](integrations/agent-skill/SKILL.md) | Harness-neutral agent guide: receive, reply, ack; peer messages are data |
+| [docs/demo/TELEPHONE.md](docs/demo/TELEPHONE.md) | The "agent telephone" live demo run sheet |
 | [docs/releases/v0.3.0-migration.md](docs/releases/v0.3.0-migration.md) | What v0.3.0 changes on the wire and in the CLI, and the upgrade order |
 | [integrations/](integrations/) | Harness configuration: Claude Code plugin, Codex and Pi snippets |
 | [examples/](examples/) | One-host and two-host (tailnet) examples, and the scripted demo of every mode ([recording](docs/demo/)) |

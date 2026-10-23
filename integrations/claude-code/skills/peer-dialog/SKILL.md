@@ -39,10 +39,11 @@ Every session has a bare agent ID of the form
 broker never infers it from an MCP connection; pass it explicitly where a
 tool or command asks for it.
 
-- The session hooks (`swb hook`) register the session at start. `swb whoami`
-  registers from the shell when `SWB_HARNESS` and `SWB_SESSION_ID` are set
-  alongside the launcher's `SWB_HOST`, `SWB_SESSION_PID` and
-  `SWB_PROC_START`.
+- The session hooks (`swb hook`) register the session at start.
+  `swb whoami --register` registers from the shell when `SWB_HARNESS` and
+  `SWB_SESSION_ID` are set alongside the launcher's `SWB_HOST`,
+  `SWB_SESSION_PID` and `SWB_PROC_START`. Plain `swb whoami` (v0.3.0) only
+  prints the id and makes no broker call.
 - `SWB_AGENT_ID` holds your ID for the `swb inbox`, `send` and `ack`
   commands.
 - Run `swb doctor` when something is silent. A hook prints nothing when a
