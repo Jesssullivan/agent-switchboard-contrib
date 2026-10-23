@@ -1,7 +1,6 @@
 # swb reference
 
-Settings, routes, tools and verbs for `swb` on `main`: v0.3.0, not yet
-released. v0.3.0 breaks the v0.2 wire format; what changed from v0.2.2 and
+Settings, routes, tools and verbs for `swb` v0.3.0 (SWB-R62). v0.3.0 breaks the v0.2 wire format; what changed from v0.2.2 and
 the upgrade order are in
 [releases/v0.3.0-migration.md](releases/v0.3.0-migration.md). The design and
 its rulings are in [ADR-0001](adr/0001-agent-switchboard.md); a walkthrough
