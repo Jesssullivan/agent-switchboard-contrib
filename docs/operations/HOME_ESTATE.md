@@ -41,15 +41,15 @@ in [PRODUCTIONIZATION.md](PRODUCTIONIZATION.md); SLIs in [SLO.md](SLO.md).
 
 ## Release state
 
-v0.2.2 (SWB-R59) is the current release and the one the estate runs. The
-approved digest, protected-input hashes and publication receipt are in
+v0.3.0 (SWB-R62) is the current release. It breaks the v0.2 wire format,
+and the estate still runs v0.2.2 (SWB-R59) until blahaj upgrades the broker
+and lab moves its pin, together, with the lab changes listed in
+[v0.3.0-migration.md](../releases/v0.3.0-migration.md). The approved
+digest, protected-input hashes and publication receipt are in
 [docs/releases/approved-broker.json](../releases/approved-broker.json);
 release history is in the [CHANGELOG](../../CHANGELOG.md). v0.1.0 (SWB-R55)
-was pushed by hand under R-C312; v0.2.1 and v0.2.2 were published by the
-release workflow. `main` carries v0.3.0 (R-C944), which is unreleased and
-breaks the v0.2 wire format; lab's pin stays on v0.2.2 until v0.3.0 is
-released and the lab changes listed in
-[v0.3.0-migration.md](../releases/v0.3.0-migration.md) land with it.
+was pushed by hand under R-C312; v0.2.1, v0.2.2 and v0.3.0 were published by
+the release workflow.
 
 Publication is the signed-tag release workflow
 (`.github/workflows/release.yml`). It pushes only the approved digest in

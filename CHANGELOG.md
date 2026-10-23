@@ -13,6 +13,12 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-23
+
+Release record SWB-R62. Source `e2bb9f75` (the #43 merge), image
+`sha256:2e42fc30cabdee4b076bd80d7d1e4b80080fc81436153210368daaa0caea7172`,
+published by the release workflow under the signed `v0.3.0` tag.
+
 The workspace version is 0.3.0 (R-C944, #37). **This release breaks the v0.2
 wire format:** upgrade the broker and every client together. A v0.2 client
 against a v0.3.0 broker gets typed 400, 405 or 415 errors, never a silent
@@ -225,7 +231,8 @@ published 2026-10-05.
   SQLite store with retention and TTL; harness hooks (`swb hook`); CLI verbs
   `whoami`, `inbox`, `send`, `ack`, `peers` and `doctor`.
 
-[Unreleased]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.1.0...v0.2.0

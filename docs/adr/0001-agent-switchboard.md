@@ -661,6 +661,22 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
   published through the release workflow under the signed `v0.2.2` tag.
   The source is a GitHub merge commit signed by `B5690EEEBB952194`.
   SWB-R58 v0.2.1 stays published; this record authorizes no other image.
+- **SWB-R62 security-bundle release, v0.3.0 (2026-10-23):** the R-C944
+  bundle (#37: per-session end tokens, POST-only state changes, typed
+  errors, `/healthz`), P2 claims and handoff (#40, SWB-R60, SWB-R61) and the
+  thread-following audit line (#43, ADR-0002 L1-lite). The operator ruled
+  the release on TIN-6749 (comment `a7256598` item 1: "cut the signed v0.3.0
+  release following the repo's release process"); R-C435 pre-authorizes a
+  digest that two clean builds of the merge reproduce. The two clean builds
+  ran on sting, linux x86_64 on the pinned Nix toolchain (R-C416). The
+  approved source is `e2bb9f75c4a1c3db78f92945769b8fc2fa9bdd80` (the #43
+  merge, the last change to a protected input) at
+  `sha256:2e42fc30cabdee4b076bd80d7d1e4b80080fc81436153210368daaa0caea7172`,
+  published through the release workflow under the signed `v0.3.0` tag.
+  The source is a GitHub merge commit signed by `B5690EEEBB952194`. v0.3.0
+  breaks the v0.2 wire format, so broker and clients upgrade together
+  ([migration notes](../releases/v0.3.0-migration.md)). SWB-R59 v0.2.2 stays
+  published; this record authorizes no other image.
 - **SWB-R54 state custody (2026-09-27):** TIN-5105 is blahaj-operator-owned
   dedicated OpenTofu state commissioning. Backend, separate identity/carrier,
   backup, lock contention/release and scratch restore receipts must precede
@@ -900,6 +916,7 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R59 | 2026-10-13 | R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)", applied under R-C655 (TIN-5770 comment `be5a4566`), the standing delegated choice; lab review of blahaj#2087 (TIN-5770 comment `e503f591`); R-C416 | Approve the v0.2.2 Host-guard release: signed source daa6d59f (the #28 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:4ebaf180…` (4579-byte manifest), from two matching clean honey builds of that merge (Sting reserved for ADI). Recorded in `approved-broker.json`; the signed v0.2.2 tag publishes only this digest, through `release.yml`. |
 | SWB-R60 | 2026-10-19 | R-C950 (operator interview, Linear TIN-5770 comment `23fdf965`); lane TIN-6690 | Claims semantics for the SWB-R16 cases that were not yet ruled: an exclusive request while another session holds any active claim on the subject is refused with `held_by` listing the holders and records nothing; a non-exclusive request while an exclusive claim is held is recorded with the exclusive holder in `overlaps[]`; a repeat exclusive request by the current holder is an idempotent renewal (same claim id, expiry extended); ending a holder session releases its claims immediately and logs each release. |
 | SWB-R61 | 2026-10-19 | R-C655 (standing delegated choice, Linear TIN-5770 comment `be5a4566`), recorded on TIN-4655 comment `18c7bd1c`; review of PR #40 (SHOULD 2); lane TIN-6690 | Claim cases SWB-R60 leaves open: a session holds at most one active claim per subject, and a repeat request by its holder updates that claim in place (same claim id, the later expiry); an exclusive request over the caller's own advisory claim, with no other session holding one, makes it exclusive and is `recorded`; an advisory request by the exclusive holder is recorded and never drops exclusivity. R-C950 (1) applies to handoffs as written: an acceptance that would be exclusive is refused while another session holds an active claim, and the offer stays open. |
+| SWB-R62 | 2026-10-23 | Operator ruling, Linear TIN-6749 comment `a7256598` item 1 ("cut the signed v0.3.0 release following the repo's release process"), carried on TIN-4655 comment `24157077`; R-C944 (TIN-5770 comment `23fdf965`); R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | Approve the v0.3.0 security-bundle release: signed source e2bb9f75 (the #43 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:2e42fc30…` (4579-byte manifest), from two matching clean sting builds of that merge. Recorded in `approved-broker.json`; the signed v0.3.0 tag publishes only this digest, through `release.yml`. |
 
 Estate rulings this design depends on:
 

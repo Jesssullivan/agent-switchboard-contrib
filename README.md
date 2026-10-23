@@ -21,10 +21,10 @@ prompt.
 
 | | |
 | --- | --- |
-| Current release | **v0.2.2** ([CHANGELOG](CHANGELOG.md)) |
-| `main` | **v0.3.0, unreleased and breaking:** per-session end tokens, POST-only state changes, typed errors, `/healthz` ([migration notes](docs/releases/v0.3.0-migration.md)) |
+| Current release | **v0.3.0** ([CHANGELOG](CHANGELOG.md)), **breaking:** per-session end tokens, POST-only state changes, typed errors, `/healthz` ([migration notes](docs/releases/v0.3.0-migration.md)) |
+| Previous | v0.2.2, the wire format v0.3.0 replaces |
 | Where it runs | In production in its home estate (the Tinyland tailnet), as a digest-pinned OCI image |
-| MCP tools | 12 on `main`: `register`, `end`, `peers`, `send`, `inbox`, `ack`, `heartbeat`, `thread`, `claim`, `release`, `handoff`, `claims` (v0.2.2 ships 5: `register`, `peers`, `send`, `inbox`, `ack`) |
+| MCP tools | 12 in v0.3.0: `register`, `end`, `peers`, `send`, `inbox`, `ack`, `heartbeat`, `thread`, `claim`, `release`, `handoff`, `claims` (v0.2.2 ships 5: `register`, `peers`, `send`, `inbox`, `ack`) |
 | Later (P2) | The per-host push adapter `swb agentd` and the Linear handoff-receipt comment |
 
 **The broker has no authentication.** Agent identity is self-asserted in
@@ -44,10 +44,10 @@ and aarch64-darwin, so neither Nix nor Rust is needed. Otherwise you need
 Nix (with flakes) or Rust 1.97.1; the repository's `rust-toolchain.toml`
 pins that release, so `rustup` installs it on first use.
 
-**Broker and clients must run the same minor version.** `main` is v0.3.0,
-which a v0.2.2 broker or client cannot talk to (the routes changed). To
-join a v0.2.2 broker, install the tagged release; to try `swb` on its own,
-either works, as long as broker and clients come from the same source.
+**Broker and clients must run the same minor version.** v0.3.0 cannot
+talk to a v0.2.x broker or client (the routes changed). To join a v0.2.2
+broker, install v0.2.2 (Nix or Cargo below); to try `swb` on its own,
+either works, as long as broker and clients come from the same release.
 
 **Prebuilt binary (v0.3.0 and later):**
 
@@ -78,12 +78,12 @@ with a browser, clear it with `xattr -d com.apple.quarantine swb`.
 **Nix:**
 
 ```sh
-# The v0.2.2 release:
-nix run github:xoxd-ai/agent-switchboard/v0.2.2#swb -- version
-nix profile install github:xoxd-ai/agent-switchboard/v0.2.2#swb   # puts `swb` on PATH
+# The v0.3.0 release:
+nix run github:xoxd-ai/agent-switchboard/v0.3.0#swb -- version
+nix profile install github:xoxd-ai/agent-switchboard/v0.3.0#swb   # puts `swb` on PATH
 
-# main (v0.3.0, unreleased):
-nix run github:xoxd-ai/agent-switchboard -- version
+# v0.2.2, for a v0.2.2 broker:
+nix profile install github:xoxd-ai/agent-switchboard/v0.2.2#swb
 ```
 
 The flake builds `swb` for `x86_64-linux` and `aarch64-darwin`, the systems
@@ -94,7 +94,7 @@ the project builds and runs on.
 ```sh
 git clone https://github.com/xoxd-ai/agent-switchboard
 cd agent-switchboard
-git checkout v0.2.2               # or stay on main for v0.3.0
+git checkout v0.3.0               # or v0.2.2 for a v0.2.2 broker
 cargo build --release -p swb      # binary: target/release/swb
 ```
 
