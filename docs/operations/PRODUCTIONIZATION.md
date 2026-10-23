@@ -242,6 +242,45 @@ recorded below.
   it leaves release-check unchanged. `qualification` stays
   `published-candidate-only` after publication, as it did for v0.1.0.
 
+## Prebuilt release binaries (TIN-6749)
+
+Operator ruling TIN-6749 comment `a7256598` item 2 ("Nix + prebuilt
+binaries"): keep `nix profile install`, and attach signed self-contained
+binaries for x86_64-linux and aarch64-darwin to each GitHub release from
+v0.3.0, with an install script that verifies them.
+
+- **What a release carries:** `swb-vX.Y.Z-x86_64-linux`,
+  `swb-vX.Y.Z-aarch64-darwin`, `install.sh` (from the tagged commit),
+  `SHA256SUMS` over those three, and `SHA256SUMS.asc`, a detached armored
+  signature by the operator release key (primary
+  `161895136D2E5C292D2A663D0B01977B8DD5DA60`, the same key that signs the
+  tag and is pinned in `docs/releases/release-signers.asc`).
+- **How they are built:** the flake's `packages.<system>.swb-release`, from
+  the tagged commit on GitHub (`github:xoxd-ai/agent-switchboard/<sha>`),
+  never a local worktree.
+  - Linux: `pkgsStatic`, statically linked against musl.
+  - Darwin: links only `/usr/lib` (libiconv is rewritten to the system copy)
+    and is re-signed ad hoc. It is not Developer ID signed or notarized.
+  - Each build refuses its own output if it still references `/nix/store`.
+- **Attended, not CI.** No GloriousFlywheel runner builds Darwin, and the
+  release key is not in CI, so a maintainer runs the step after the tag:
+  1. Push the signed tag and let the release workflow publish the image.
+  2. Create the GitHub release with its notes, as for v0.2.2.
+  3. On sting: `git fetch upstream --tags`, then
+     `just release-binaries vX.Y.Z`. It builds Linux on sting and Darwin
+     on PZM over native ssh (`jsullivan2@petting-zoo-mini.local`). It checks
+     that each binary reports the tag's version and that the Darwin one links
+     nothing in `/nix/store`. It writes `dist/vX.Y.Z/`, signs `SHA256SUMS`
+     with the release key and verifies the signature against
+     `release-signers.asc`, the way `install.sh` does. The recipe refuses a
+     tag not signed by the release key.
+  4. `just release-binaries-upload vX.Y.Z`.
+  5. Smoke-test `install.sh vX.Y.Z` with a scratch `SWB_INSTALL_DIR` on a
+     Linux host and on a Mac.
+- The binaries are not part of the approved-broker record: that record and
+  the release workflow pin only the OCI image. The binaries' hashes are in
+  the signed `SHA256SUMS` and in the release receipt on TIN-6749.
+
 ## Packaging, retention and shutdown boundaries
 
 The image is the Debian 13 distroless nonroot Linux/amd64 package declared in

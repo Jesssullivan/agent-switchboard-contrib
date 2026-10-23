@@ -19,6 +19,17 @@ against a v0.3.0 broker gets typed 400, 405 or 415 errors, never a silent
 fallback. Details and the upgrade order:
 [docs/releases/v0.3.0-migration.md](docs/releases/v0.3.0-migration.md).
 
+### Install
+
+- **Prebuilt binaries (TIN-6749).** Each release from v0.3.0 attaches
+  `swb-<version>-x86_64-linux` (static, musl), `swb-<version>-aarch64-darwin`
+  (system libraries only, ad hoc signed), `SHA256SUMS`, its detached
+  signature `SHA256SUMS.asc` by the release key, and `install.sh`. The
+  script checks the checksum, checks the signature when `gpg` is available,
+  and installs to `~/.local/bin`. The binaries are the flake's new
+  `swb-release` output; `just release-binaries <tag>` builds and signs them
+  (attended), and `just release-binaries-upload <tag>` attaches them.
+
 ### Documentation
 
 - [docs/QUICKSTART.md](docs/QUICKSTART.md): a five-minute human quickstart
