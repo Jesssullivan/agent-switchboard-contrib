@@ -54,7 +54,7 @@ build() {
   out="$(nix build --no-link --print-out-paths --max-jobs 2 "$ref#packages.x86_64-linux.swb-release")"
   linux="$dist/swb-$tag-x86_64-linux"
   install -m 0755 "$out/bin/swb" "$linux"
-  file -L "$linux" | grep -q 'statically linked' || die "$linux is not statically linked"
+  file -L "$linux" | grep -Eq 'statically linked|static-pie linked' || die "$linux is not statically linked"
   got="$("$linux" version)"
   [[ "$got" == "swb $version "* ]] || die "$linux reports '$got', not swb $version"
 
