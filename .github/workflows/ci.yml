@@ -5,7 +5,9 @@ name: CI
 #
 # - Same-repository pull requests, merge_group and push to main run the full
 #   xoxd-ai/ci-templates rust-bazel-application lane on GloriousFlywheel
-#   private runners, and `ci-ok` aggregates it.
+#   private runners, and `ci-ok` aggregates it. The repository is public, so
+#   the lane passes `allow_public_same_repo_caller: true` (ci-templates#189,
+#   v5.2.0); without it trust-gate refuses every public caller.
 # - Fork pull requests (for example Jesssullivan/agent-switchboard-contrib -> main)
 #   are GATED IN MERGE QUEUE. The template refuses fork pull requests on
 #   private runners (contract.py: "fork pull requests cannot receive private
@@ -53,9 +55,14 @@ jobs:
     if: >-
       github.event_name != 'pull_request'
       || github.event.pull_request.head.repo.full_name == github.repository
-    uses: xoxd-ai/ci-templates/.github/workflows/rust-bazel-application.yml@ae836d8400d5784d74af4fecc020f225d1c2d08e # v5.1.1
+    uses: xoxd-ai/ci-templates/.github/workflows/rust-bazel-application.yml@3ff7d007276a1a3b52052bea21192a151187fc69 # v5.2.0
     with:
       enabled: true
+      # ci-templates#189 (v5.2.0): this repository is public, so trust-gate
+      # admits it only through this explicit opt-in, and only for push,
+      # merge_group and same-repository pull requests. Fork pull requests stay
+      # refused by the template and are skipped by the job-level `if:` above.
+      allow_public_same_repo_caller: true
       runner_group: tinyland-infra
       required_bazel_major: "9"
       platform_matrix_json: >-
@@ -83,7 +90,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: TruffleHog and gitleaks
-        uses: xoxd-ai/ci-templates/.github/actions/secrets-scan@ae836d8400d5784d74af4fecc020f225d1c2d08e # v5.1.1
+        uses: xoxd-ai/ci-templates/.github/actions/secrets-scan@3ff7d007276a1a3b52052bea21192a151187fc69 # v5.2.0
 
   spec-dhall:
     name: spec-dhall
