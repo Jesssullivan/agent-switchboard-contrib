@@ -13,6 +13,28 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
+## [0.4.0] - unreleased
+
+Not yet released. The workspace version is 0.4.0 (SWB-R63, TIN-4655
+comment `30ca400e`). As for v0.2.1 and v0.2.2, the release record, its
+date and the approved image digest follow two clean builds of the merge
+that carries this version.
+
+### Upgrade notes
+
+- **Upgrade the broker and every client together.** A v0.3.0 broker
+  answers `invalid harness` to a `register` with kind `hermes` or
+  `kimicode` and refuses any agent id that names one. A v0.3.0 client
+  refuses those ids too.
+- The REST routes and the envelope fields are the v0.3.0 ones. A v0.3.0
+  client can talk to a v0.4.0 broker, but it refuses ids of peers with
+  the new kinds.
+- SWB-R63: redeploy the live broker and bump the lab pin to v0.4.0 together.
+- A validator pinned to the older copy of
+  `schemas/envelope-v3.schema.json` rejects the new kinds. Refresh the copy.
+- `swb channel` keeps its three-tool mode by default. `--tools full` needs
+  a v0.4.0 `swb`, and its peers with the new kinds need a v0.4.0 broker.
+
 ### Added
 
 - Harness kinds `hermes` (a Hermes agent) and `kimicode` (the Kimi Code
