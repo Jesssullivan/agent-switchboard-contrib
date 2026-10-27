@@ -22,7 +22,7 @@ Linear: TIN-4655.
 
 **Read first:** [ADR-0001](docs/adr/0001-agent-switchboard.md), the broker
 design. Its Rulings table holds `SWB-R01`..`SWB-R23`, the source/release
-rulings `SWB-R49`..`SWB-R55` the Claude channel ruling `SWB-R56` the v0.2.0 release `SWB-R57`, the v0.2.1 hermetic release `SWB-R58` and the v0.2.2 Host-guard release `SWB-R59`, the claims rulings `SWB-R60` and `SWB-R61`, the v0.3.0 release `SWB-R62`; `SWB-R24` is recorded under its History.
+rulings `SWB-R49`..`SWB-R55` the Claude channel ruling `SWB-R56` the v0.2.0 release `SWB-R57`, the v0.2.1 hermetic release `SWB-R58` and the v0.2.2 Host-guard release `SWB-R59`, the claims rulings `SWB-R60` and `SWB-R61`, the v0.3.0 release `SWB-R62`, the harness-kinds ruling `SWB-R63`, the v0.4.0 release `SWB-R64`; `SWB-R24` is recorded under its History.
 
 **Read second:** [ADR-0002](docs/adr/0002-lgtm-plane.md), the LGTM plane and
 the phase order. Its Rulings table holds `SWB-R25`..`SWB-R48`.
@@ -120,7 +120,7 @@ When sources disagree, prefer them in this order:
   secrets-scan` before queueing.
 - **Release:** `.github/workflows/release.yml` runs only on a signed annotated
   `v*` tag on main. It pushes only the approved immutable digest from
-  `docs/releases/approved-broker.json` (SWB-R62) and verifies the registry
+  `docs/releases/approved-broker.json` (SWB-R64) and verifies the registry
   readback; a different image needs its own ruling first.
 - **SWB-R49 local integration while GF is in development:** use
   `just local-integrate` with exact reviewed `PR@FULL_SHA` inputs to assemble

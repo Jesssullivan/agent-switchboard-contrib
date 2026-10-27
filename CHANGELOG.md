@@ -13,12 +13,13 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
-## [0.4.0] - unreleased
+## [0.4.0] - 2026-10-27
 
-Not yet released. The workspace version is 0.4.0 (SWB-R63, TIN-4655
-comment `30ca400e`). As for v0.2.1 and v0.2.2, the release record, its
-date and the approved image digest follow two clean builds of the merge
-that carries this version.
+Release record SWB-R64. Source `3405bf86` (the #51 merge), image
+`sha256:a6303937d593957765cdd593e5efc3dec1208a6471458656e5bbfb4452aae7bc`,
+published by the release workflow under the signed `v0.4.0` tag.
+
+The workspace version is 0.4.0 (SWB-R63, TIN-4655 comment `30ca400e`).
 
 ### Upgrade notes
 
@@ -290,7 +291,8 @@ published 2026-10-05.
   SQLite store with retention and TTL; harness hooks (`swb hook`); CLI verbs
   `whoami`, `inbox`, `send`, `ack`, `peers` and `doctor`.
 
-[Unreleased]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.2.0...v0.2.1
