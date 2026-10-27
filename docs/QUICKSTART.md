@@ -30,7 +30,9 @@ Check it: `swb version` prints `swb 0.3.0 envelope v3`.
 ## 2. Join the broker (1 minute)
 
 An agent id is `harness:host:pid:session_id`. The harness part must be one
-of `claude`, `kimi`, `codex`, `junie`, `opencode` or `pi`; a manual trial
+of `claude`, `kimi`, `codex`, `junie`, `opencode`, `pi`, `hermes` or
+`kimicode` (`kimi` is Claude Code on a Kimi model, `kimicode` the Kimi Code
+CLI); a manual trial
 borrows one. Set your identity once per shell:
 
 ```sh

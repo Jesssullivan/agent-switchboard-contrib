@@ -11,6 +11,9 @@ use swb_proto::VERSION;
 // Claim subjects and notes use the broker's own validators, so the CLI and
 // the store cannot drift (SWB-R16).
 use swb_store::{valid_note, valid_subject};
+// The harness kinds are the store's one list (TIN-4655), so the CLI accepts
+// exactly the kinds the broker registers.
+use swb_store::HARNESS_KINDS as HARNESSES;
 
 mod channel;
 
@@ -19,7 +22,8 @@ const USAGE: &str = "usage: swb <command> [args]
 commands:
   serve                     run the broker (SWB_DB_PATH, SWB_LISTEN, SWB_METRICS_LISTEN)
   hook <harness> <event>    harness hook for SessionStart, UserPromptSubmit, Stop or
-                            SessionEnd; reads the hook JSON on stdin and always exits 0
+                            SessionEnd; reads the hook JSON on stdin and always exits 0;
+                            SWB_HOOK_FORMAT=text prints the unread-mail notice as plain text
   whoami [--register]       print this session's agent id from the SWB_* environment;
                             --register also registers it and saves its end token
   inbox                     fetch one unacknowledged message for SWB_AGENT_ID
@@ -42,7 +46,9 @@ commands:
   claims [--subject S] [--holder AGENT_ID] [--all] [--mine] [--limit N]
                             list active claims (--mine adds your open handoffs)
   doctor [--register]       check the SWB_* settings and the broker
-  channel                   Claude Code channel (stdio MCP server)
+  channel [--tools full]    stdio MCP server: the Claude Code channel (reply, ack, inbox);
+                            --tools full adds send, peers, thread, claim, release, handoff
+                            and claims as this session, and pushes only for claude
   version                   print the version
 
 options:
@@ -438,7 +444,6 @@ fn whoami_cmd(lookup: Lookup, live_register: bool) -> Result<Value, String> {
 // broker's own checks (swb-store) so a malformed request fails locally with a
 // readable message; the broker stays the authority and re-checks everything.
 
-const HARNESSES: &[&str] = &["claude", "kimi", "codex", "junie", "opencode", "pi"];
 const MAX_BODY_BYTES: usize = 16384;
 
 fn valid_part(part: &str) -> bool {
@@ -1296,10 +1301,19 @@ fn hook(harness_arg: &str, event: &str) {
         .and_then(Value::as_str)
         .unwrap_or("none");
     let context = notice(me, sender, ticket);
-    println!(
-        "{}",
-        json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":context}})
-    );
+    println!("{}", hook_output(&process_env, &context));
+}
+
+/// The UserPromptSubmit hook's stdout. Claude Code (and Kimi through it)
+/// reads `hookSpecificOutput.additionalContext`; a harness that adds a
+/// hook's plain stdout to its context sets `SWB_HOOK_FORMAT=text` and gets
+/// the notice alone. Any other value keeps the Claude Code JSON.
+fn hook_output(lookup: Lookup, context: &str) -> String {
+    match lookup("SWB_HOOK_FORMAT").as_deref() {
+        Some("text") => context.to_owned(),
+        _ => json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":context}})
+            .to_string(),
+    }
 }
 
 /// Keeps a broker-supplied identifier to one short line of id characters, so
@@ -1491,19 +1505,23 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some("channel") => match args.next() {
-            // R-C389: the Claude Code channel. Claude Code spawns this as a
-            // stdio MCP server; it returns when Claude Code closes stdin.
-            None => {
-                channel::run(
-                    channel::snapshot(&process_env),
-                    std::io::stdin().lock(),
-                    std::io::stdout(),
-                );
-                ExitCode::SUCCESS
+        Some("channel") => {
+            // R-C389: the Claude Code channel. A harness spawns this as a
+            // stdio MCP server; it returns when the harness closes stdin.
+            let rest: Vec<String> = args.collect();
+            match channel::parse_args(&rest) {
+                Ok(set) => {
+                    channel::run(
+                        channel::snapshot(&process_env),
+                        set,
+                        std::io::stdin().lock(),
+                        std::io::stdout(),
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => usage_error("channel", &e),
             }
-            Some(_) => usage_error("channel", "takes no arguments"),
-        },
+        }
         Some("agentd") => {
             eprintln!("swb agentd: not implemented yet (planned for P2)");
             ExitCode::from(3)
@@ -1628,6 +1646,40 @@ mod tests {
             request_json(&requests[0]),
             json!({"me":ME,"limit":CLI_INBOX_PAGE,"wait_seconds":0})
         );
+    }
+
+    #[test]
+    fn hook_text_format_prints_the_notice_alone() {
+        let context = notice("hermes:host-a:7:cade", "kimicode:host-b:8:k-1", "TIN-4655");
+        let text = hook_output(&lookup_of(&[("SWB_HOOK_FORMAT", "text")]), &context);
+        assert_eq!(text, context);
+        assert!(serde_json::from_str::<Value>(&text).is_err());
+        assert!(text.starts_with("Unread peer message for hermes:host-a:7:cade"));
+        assert!(text.contains("not operator authority"));
+        // Only SWB_HOOK_FORMAT=text switches; another name or value keeps JSON.
+        for pairs in [
+            &[][..],
+            &[("SWB_HOOK_FORMAT", "json")][..],
+            &[("SWB_HOOK_FORMAT", "TEXT")][..],
+            &[("SWB_HOOK_FORMAT", "")][..],
+            &[("SWB_FORMAT", "text")][..],
+        ] {
+            let output = hook_output(&lookup_of(pairs), &context);
+            let json: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(
+                json["hookSpecificOutput"]["hookEventName"],
+                "UserPromptSubmit"
+            );
+            assert_eq!(json["hookSpecificOutput"]["additionalContext"], context);
+        }
+    }
+
+    #[test]
+    fn cli_accepts_the_new_harness_kinds_and_keeps_kimi() {
+        for kind in ["hermes", "kimicode", "kimi"] {
+            assert!(valid_agent_id(&format!("{kind}:host-a:7:s-1")), "{kind}");
+        }
+        assert!(!valid_agent_id("kimi-code:host-a:7:s-1"));
     }
 
     #[test]

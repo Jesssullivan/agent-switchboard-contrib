@@ -13,6 +13,26 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
+### Added
+
+- Harness kinds `hermes` (a Hermes agent) and `kimicode` (the Kimi Code
+  CLI). `kimi` still means Claude Code on a Kimi model. The store, the
+  `register` schema, the envelope schema and the CLI read one list,
+  `swb_store::HARNESS_KINDS`. An older client refuses ids with the new
+  kinds, so upgrade the broker and clients together (TIN-4655).
+  `schemas/envelope-v3.schema.json` widens its `agent_id` pattern in place
+  (the schema is a draft): a validator pinned to the older copy rejects
+  the new kinds.
+- `SWB_HOOK_FORMAT=text`: `swb hook` prints the UserPromptSubmit notice as
+  plain text for a harness that is not Claude Code (TIN-4655).
+- `swb channel --tools full`: adds `send`, `peers`, `thread`, `claim`,
+  `release`, `handoff` and `claims`, with `from` and `me` pinned to the
+  resolved session and `identity_override_denied` for any other id. The
+  `claude/channel` push stays Claude-only, and only when every identity
+  setting present names `claude`. The full set does not register: a
+  harness without a SessionStart hook registers with
+  `swb whoami --register` and renews its lease (TIN-4655).
+
 ### Changed
 
 - Local Bazel servers are bounded (TIN-5770). `.bazelrc` sets
