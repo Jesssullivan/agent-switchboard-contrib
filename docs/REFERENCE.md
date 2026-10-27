@@ -26,6 +26,12 @@ did not register, but anyone who can register can re-register any agent id
 The store, the broker's `register` schema, the envelope schema and the CLI
 read one list (`swb_store::HARNESS_KINDS`). A broker and its clients must
 know the same kinds: an older client refuses an agent id with a newer kind.
+A v0.3.0 client refuses them as a `send` or `reply` recipient, stops `peers`
+paging at a `next_cursor` that names one, and a v0.3.0 broker refuses to
+register them. `schemas/envelope-v3.schema.json` gained `hermes` and
+`kimicode` in its `agent_id` pattern without a version change, because
+ADR-0001 marks it a draft. A validator pinned to the older copy rejects the
+new kinds.
 
 | Kind | Harness |
 | --- | --- |
@@ -221,9 +227,10 @@ acknowledges on its own.
 ### Full tool set
 
 `swb channel --tools full` serves `reply`, `ack` and `inbox` plus `send`,
-`peers`, `thread`, `claim`, `release`, `handoff` and `claims`, for a harness
-whose MCP client has no other switchboard client (TIN-4655). Every tool acts
-as the one session the channel resolved, by the same rules as above:
+`peers`, `thread`, `claim`, `release`, `handoff` and `claims` (TIN-4655).
+It is the mail and claims surface for a harness whose MCP client has no
+other switchboard client. Every tool acts as the one session the channel
+resolved, by the same rules as above:
 
 - no tool schema has a `from` or `me` field, because the channel fills them in;
 - a call whose `from` or `me` names another agent id is refused with
@@ -231,14 +238,29 @@ as the one session the channel resolved, by the same rules as above:
 - `send` refuses `operator_directed` and `ruling` with
   `operator_directed_denied`;
 - `peers` and `claims` stay passive listings unless the caller passes its
-  own `me` or `claims` passes `mine`.
+  own `me` (which renews its lease) or `claims` passes `mine`.
+
+The full set does not register the session, and it has no `register` or
+`heartbeat` tool. Without a registration the session has no `peers` row,
+although it can still send and read its mail. A harness without a
+SessionStart hook therefore registers outside the channel:
+
+| Step | How |
+| --- | --- |
+| Register | the launcher runs `swb whoami --register` with `SWB_HARNESS`, `SWB_SESSION_ID`, `SWB_HOST`, `SWB_SESSION_PID` and `SWB_PROC_START` set |
+| Stay live | `swb heartbeat` (or an `inbox` read) at least every 15 minutes; a row is `idle` after 15 minutes and `gone` after 6 hours |
+| End | `swb hook <harness> SessionEnd`, or the session's own client |
+| Service identity | a service such as a Hermes agent can instead register through its own client (planned, ADR-0003 draft) |
 
 The `claude/channel` capability and its push stay Claude-only. With
-`--tools full` the channel declares them, and polls, only when `SWB_HARNESS`
-(or the kind in `SWB_AGENT_ID`) is `claude`. Every other harness reads its
-mail with the `inbox` tool. The pinning guards this one process. The broker
-still trusts a self-asserted sender, so another client can still send as
-any id (SWB-R05).
+`--tools full` the channel declares them, and polls, only when every
+identity setting present says `claude`: `SWB_HARNESS`, the kind in
+`SWB_AGENT_ID`, or both. A mismatch, such as `SWB_HARNESS=claude` with a
+`hermes` `SWB_AGENT_ID`, does not push. A full-mode session that sets
+neither and resolves through its broker row does not push either. Every
+other harness reads its mail with the `inbox` tool. The pinning guards this
+one process. The broker still trusts a self-asserted sender, so another
+client can still send as any id (SWB-R05).
 
 ## Notices
 

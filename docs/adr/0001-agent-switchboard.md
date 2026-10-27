@@ -126,6 +126,15 @@ registered once on the tailnet so that new harness instances spawn nothing.
     `~/.pi/agent/sessions` read-only, then calls `register`.
   - Every tool takes an explicit `me`, because the mcp-mux gateway hides
     Junie's MCP session id.
+  - *Proposed 2026-10-27 (TIN-4655 harness lane, agent-switchboard #50; not normative until a dated TIN-4655 ruling is recorded under [Rulings](#rulings)):* two more harness kinds, `hermes` (a Hermes agent) and `kimicode`
+    (the Kimi Code CLI), read with the others from one list,
+    `swb_store::HARNESS_KINDS`. `kimi` keeps meaning Claude Code on a Kimi
+    model. Kimi Code is meant to call `swb hook kimicode <event>` from its
+    own hooks, with `SWB_HOOK_FORMAT=text` for a plain notice; its hook
+    configuration is unverified. A Hermes agent without hooks registers with
+    `swb whoami --register` and renews its lease, or through its own
+    client. A v0.3.0 broker or client refuses both kinds, so they ship
+    with the next release of broker and clients together.
 - **Lease:**
   - Heartbeat sources: the Claude/Kimi hooks (SessionStart, UserPromptSubmit,
     Stop) and every tool call. Codex heartbeats through tool calls only,
@@ -345,6 +354,19 @@ registered once on the tailnet so that new harness instances spawn nothing.
     `in_reply_to` unless `ack` is false, and has no operator-direction or
     ruling field), `ack` and `inbox`. It never acknowledges on its own, so
     an unloaded channel leaves the mailbox and the v1a notice unchanged.
+  - *Proposed 2026-10-27 (TIN-4655 harness lane, agent-switchboard #50; not normative until a dated TIN-4655 ruling is recorded under [Rulings](#rulings)):* `swb channel --tools full` serves the three tools plus `send`,
+    `peers`, `thread`, `claim`, `release`, `handoff` and `claims`, for a
+    harness whose MCP client has no other switchboard client. No tool
+    schema has `from` or `me`. The process fills them with the one
+    identity it resolved and refuses another id with
+    `identity_override_denied` before any broker request. `send` refuses
+    `operator_directed` and `ruling`. The full set never registers or
+    heartbeats. It declares `claude/channel` and runs the poller only
+    when every identity setting present names `claude`, and every other
+    harness polls with `inbox`. The default `swb channel` is unchanged.
+    The pinning guards one client process: SWB-R05 still holds at the
+    broker until sender binding ([ADR-0003](0003-sender-binding.md),
+    draft) is ruled.
   - It never declares `claude/channel/permission`: a peer must never be
     able to approve a tool call in another session.
   - **What it changes at the broker:** every inbox read marks the page
@@ -877,6 +899,12 @@ rulings, SWB-R25 to SWB-R32, and their amendment round, SWB-R33 to SWB-R36
 [ADR-0002 → Rulings](0002-lgtm-plane.md#rulings) with the same discipline;
 SWB-R22 to SWB-R24 are the P1a substrate rulings carried by the P1a
 receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
+
+**Pending (2026-10-27):** the harness kinds `hermes` and `kimicode` and
+`swb channel --tools full`, written above under Identity and Push and
+marked *Proposed*, await a dated TIN-4655 ruling. When it is recorded it
+takes the next `SWB-R` number in this table, and the *Proposed* marks
+become *Added* notes that cite it.
 
 | ID | Date | Source | Ruling |
 | --- | --- | --- | --- |

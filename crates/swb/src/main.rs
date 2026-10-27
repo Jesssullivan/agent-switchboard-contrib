@@ -1301,16 +1301,15 @@ fn hook(harness_arg: &str, event: &str) {
         .and_then(Value::as_str)
         .unwrap_or("none");
     let context = notice(me, sender, ticket);
-    let format = std::env::var("SWB_HOOK_FORMAT").ok();
-    println!("{}", hook_output(format.as_deref(), &context));
+    println!("{}", hook_output(&process_env, &context));
 }
 
 /// The UserPromptSubmit hook's stdout. Claude Code (and Kimi through it)
 /// reads `hookSpecificOutput.additionalContext`; a harness that adds a
 /// hook's plain stdout to its context sets `SWB_HOOK_FORMAT=text` and gets
 /// the notice alone. Any other value keeps the Claude Code JSON.
-fn hook_output(format: Option<&str>, context: &str) -> String {
-    match format {
+fn hook_output(lookup: Lookup, context: &str) -> String {
+    match lookup("SWB_HOOK_FORMAT").as_deref() {
         Some("text") => context.to_owned(),
         _ => json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":context}})
             .to_string(),
@@ -1652,13 +1651,21 @@ mod tests {
     #[test]
     fn hook_text_format_prints_the_notice_alone() {
         let context = notice("hermes:host-a:7:cade", "kimicode:host-b:8:k-1", "TIN-4655");
-        let text = hook_output(Some("text"), &context);
+        let text = hook_output(&lookup_of(&[("SWB_HOOK_FORMAT", "text")]), &context);
         assert_eq!(text, context);
         assert!(serde_json::from_str::<Value>(&text).is_err());
         assert!(text.starts_with("Unread peer message for hermes:host-a:7:cade"));
         assert!(text.contains("not operator authority"));
-        for format in [None, Some("json"), Some("TEXT"), Some("")] {
-            let json: Value = serde_json::from_str(&hook_output(format, &context)).unwrap();
+        // Only SWB_HOOK_FORMAT=text switches; another name or value keeps JSON.
+        for pairs in [
+            &[][..],
+            &[("SWB_HOOK_FORMAT", "json")][..],
+            &[("SWB_HOOK_FORMAT", "TEXT")][..],
+            &[("SWB_HOOK_FORMAT", "")][..],
+            &[("SWB_FORMAT", "text")][..],
+        ] {
+            let output = hook_output(&lookup_of(pairs), &context);
+            let json: Value = serde_json::from_str(&output).unwrap();
             assert_eq!(
                 json["hookSpecificOutput"]["hookEventName"],
                 "UserPromptSubmit"

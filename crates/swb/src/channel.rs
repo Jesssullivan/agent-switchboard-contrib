@@ -29,8 +29,11 @@
 //! `identity_override_denied` before any broker request. `send` cannot
 //! claim operator direction. The `claude/channel` capability and its push
 //! stay Claude-only: in full mode they are declared, and the poller runs,
-//! only when `SWB_HARNESS` (or the kind in `SWB_AGENT_ID`) is `claude`.
-//! Every other harness reads its mail with the `inbox` tool. The pinning is
+//! only when every identity setting present (`SWB_HARNESS`, the kind in
+//! `SWB_AGENT_ID`) is `claude`. Every other harness reads its mail with the
+//! `inbox` tool. The full set never registers the session: a harness
+//! without a SessionStart hook registers through `swb whoami --register`
+//! and renews its lease outside this process. The pinning is
 //! a client-side guard for this process; the broker itself still trusts a
 //! self-asserted sender (SWB-R05).
 //!
@@ -137,20 +140,31 @@ impl Mode {
     pub(crate) fn for_session(tools: ToolSet, lookup: Lookup) -> Mode {
         let push = match tools {
             ToolSet::Channel => true,
-            ToolSet::Full => session_harness(lookup).as_deref() == Some("claude"),
+            ToolSet::Full => names_only_claude(lookup),
         };
         Mode { tools, push }
     }
 }
 
-/// The harness kind the environment names: `SWB_HARNESS`, else the kind
-/// in a valid `SWB_AGENT_ID`.
-fn session_harness(lookup: Lookup) -> Option<String> {
-    lookup("SWB_HARNESS").filter(|v| !v.is_empty()).or_else(|| {
-        lookup("SWB_AGENT_ID")
-            .filter(|id| valid_agent_id(id))
-            .and_then(|id| id.split(':').next().map(str::to_owned))
-    })
+/// Whether the environment names this session's harness and every name is
+/// `claude`. `resolve_me` takes `SWB_AGENT_ID` before `SWB_HARNESS`, so
+/// both are checked: `SWB_HARNESS=claude` with a `hermes` `SWB_AGENT_ID`
+/// does not push for the hermes id. A session that names neither resolves
+/// through its broker row after start, and so does not push in full mode.
+fn names_only_claude(lookup: Lookup) -> bool {
+    let set = |name: &str| lookup(name).filter(|v| !v.is_empty());
+    let from_id = set("SWB_AGENT_ID").map(|id| {
+        if valid_agent_id(&id) {
+            id.split(':').next().unwrap_or_default().to_owned()
+        } else {
+            String::new()
+        }
+    });
+    let kinds: Vec<String> = [from_id, set("SWB_HARNESS")]
+        .into_iter()
+        .flatten()
+        .collect();
+    !kinds.is_empty() && kinds.iter().all(|kind| kind == "claude")
 }
 
 /// The `SWB_*` settings this command reads, captured once at start so the
@@ -549,7 +563,8 @@ fn full_tools() -> Value {
         {
             "name": "peers",
             "description": "List switchboard sessions: live only by default, one row per \
-                harness, host and session id. Changes no state.",
+                harness, host and session id. A listing only: it changes no state, except that \
+                passing this session's own me renews this session's lease.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1563,6 +1578,13 @@ mod tests {
         assert!(!mode(&[("SWB_AGENT_ID", "kimi:host-a:7:k-1")]).push);
         assert!(!mode(&[("SWB_AGENT_ID", HERMES)]).push);
         assert!(!mode(&[]).push);
+        // Identity takes SWB_AGENT_ID first, so push needs every source to
+        // say claude: a mismatch or an invalid id never pushes.
+        assert!(mode(&[("SWB_HARNESS", "claude"), ("SWB_AGENT_ID", ME)]).push);
+        assert!(!mode(&[("SWB_HARNESS", "claude"), ("SWB_AGENT_ID", HERMES)]).push);
+        assert!(!mode(&[("SWB_HARNESS", "hermes"), ("SWB_AGENT_ID", ME)]).push);
+        assert!(!mode(&[("SWB_HARNESS", "claude"), ("SWB_AGENT_ID", "claude:bad id")]).push);
+        assert!(mode(&[("SWB_HARNESS", "claude"), ("SWB_AGENT_ID", "")]).push);
         // The default channel keeps pushing whatever the harness.
         assert!(Mode::for_session(ToolSet::Channel, &lookup_of(&[])).push);
 
@@ -1591,9 +1613,12 @@ mod tests {
 
     #[test]
     fn every_tool_refuses_another_identity_before_any_broker_request() {
-        // No SWB_BROKER_URL: a call that got past the guard would fail with
-        // a missing setting instead of the refusal.
-        let lookup = lookup_of(&[("SWB_AGENT_ID", HERMES)]);
+        // A listener that never accepts: a call that got past the guard
+        // would leave a connection in its backlog, which the end checks.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_AGENT_ID", HERMES)]);
         let calls = [
             ("reply", json!({"to": PEER, "text": "x", "from": PEER})),
             ("ack", json!({"msg_id": MSG, "me": PEER})),
@@ -1629,6 +1654,10 @@ mod tests {
         ] {
             let error = full_call(&lookup, "send", arguments).unwrap_err();
             assert!(error.starts_with("operator_directed_denied"), "{error}");
+        }
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("a refused call reached the broker: {other:?}"),
         }
     }
 
