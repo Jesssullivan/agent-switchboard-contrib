@@ -11,13 +11,19 @@ default:
 
 # Bazel is the build and test authority. Never run on neo (teletype seat;
 # the local-build guard refuses it): use `just remote-check` from neo.
+# This repo has no enrolled flywheel lane, so `check` and `build` run local
+# and bounded (TIN-5770, R471): no remote endpoint, no remote fallback, and
+# the server exits after the `.bazelrc` idle limit. Their result is local,
+# non-qualifying. `ci-ok` on merge_group is the qualifying lane.
 # Run rustfmt, clippy, unit and integration tests (the labels CI runs).
 check:
-    {{clean_bazel_env}} bazelisk test --lockfile_mode=error //:check
+    @echo "check: local, non-qualifying (ci-ok on merge_group qualifies)" >&2
+    {{clean_bazel_env}} bazelisk test --lockfile_mode=error --remote_local_fallback=false //:check
 
 # Build the application and package targets CI builds.
 build:
-    {{clean_bazel_env}} bazelisk build --lockfile_mode=error //:build //deploy:image //deploy:image.digest
+    @echo "build: local, non-qualifying (ci-ok on merge_group qualifies)" >&2
+    {{clean_bazel_env}} bazelisk build --lockfile_mode=error --remote_local_fallback=false //:build //deploy:image //deploy:image.digest
 
 # Commit all three. Run on linux x86_64 (sting or honey), the platform CI
 # checks the locks on.
@@ -30,11 +36,13 @@ lock:
     git status --short -- MODULE.bazel.lock Cargo.lock cargo-bazel-lock.json
 
 # The tree is rsynced to a scratch dir on the build host; neo builds nothing.
+# The scratch dir is its own Bazel workspace, so its server is shut down
+# when the check ends, pass or fail (TIN-5770, R472).
 # Run `just check` on a build host from a teletype seat (neo).
 remote-check host="sting" dir="~/scratch/agent-switchboard-check":
     ssh {{host}} 'mkdir -p {{dir}}'
     rsync -a --delete --exclude '/bazel-*' --exclude '/target/' --exclude '/.git/' ./ {{host}}:{{dir}}/
-    ssh {{host}} 'cd {{dir}} && just check'
+    ssh {{host}} 'cd {{dir}} && trap "bazelisk shutdown >/dev/null 2>&1 || true" EXIT && just check'
 
 # Build swb, then diff the scripted demo against docs/demo/transcript.txt and
 # run the one-host selftest (R-C953, TIN-6694). Build host only, never neo.

@@ -2,5 +2,11 @@
 # --ignore_all_rc_files (xoxd-ai/ci-templates bazelisk-ci driver), so any
 # setting that a CI target needs belongs in MODULE.bazel or a BUILD file,
 # never here.
+
+# A local Bazel server exits after 2 idle minutes instead of the 3 h default,
+# so a `just check` or `just build` leaves no long-lived JVM behind
+# (TIN-5770, R470). A home or wrapper rc read later may override it.
+startup --max_idle_secs=120
+
 build --incompatible_strict_action_env
 test --test_output=errors
