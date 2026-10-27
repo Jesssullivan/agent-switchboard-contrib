@@ -6,6 +6,12 @@
 //! only: a broker restart refills every bucket, and nothing here touches the
 //! store's tables. Time comes from the store's injected clock, in whole
 //! seconds, so tests drive it with a manual clock.
+//!
+//! The bucket is a guard against a looping or flooding client that keeps
+//! one agent id. An unbound id is self-asserted, so a client that changes
+//! its `from` on every send gets a fresh bucket each time; the tailnet ACL,
+//! not this limit, bounds such a client (SECURITY.md). The map holds at most
+//! [`MAX_BUCKETS`] buckets, so rotating ids cannot grow broker memory.
 
 use std::collections::HashMap;
 
@@ -13,9 +19,11 @@ use std::collections::HashMap;
 pub const SEND_BURST_DEFAULT: u32 = 20;
 /// Default refill: one send every 2 seconds, sustained.
 pub const SEND_REFILL_PER_MINUTE_DEFAULT: u32 = 30;
-/// Above this many buckets, an admission first drops every bucket that has
-/// refilled to full, which is the same as never having sent.
-const SWEEP_ABOVE: usize = 4096;
+/// The most buckets the limiter keeps. A new sender that finds the map full
+/// first drops every bucket that has refilled to full, which is the same as
+/// never having sent. If none has, it drops the fullest one, so a client
+/// that exhausted its own bucket keeps it while ids rotate around it.
+pub(crate) const MAX_BUCKETS: usize = 4096;
 
 /// The limit's settings. `burst == 0` turns the limit off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,11 +53,37 @@ pub(crate) struct Limiter {
     buckets: HashMap<String, Bucket>,
 }
 
+fn refilled(limit: SendLimit, bucket: Bucket, now: i64) -> f64 {
+    let elapsed = (now - bucket.at).max(0) as f64;
+    let per_second = f64::from(limit.refill_per_minute) / 60.0;
+    (bucket.tokens + elapsed * per_second).min(f64::from(limit.burst))
+}
+
 impl Limiter {
     fn refilled(&self, bucket: Bucket, now: i64) -> f64 {
-        let elapsed = (now - bucket.at).max(0) as f64;
-        let per_second = f64::from(self.limit.refill_per_minute) / 60.0;
-        (bucket.tokens + elapsed * per_second).min(f64::from(self.limit.burst))
+        refilled(self.limit, bucket, now)
+    }
+
+    /// Make room for one new bucket when the map is at [`MAX_BUCKETS`].
+    fn make_room(&mut self, now: i64) {
+        if self.buckets.len() < MAX_BUCKETS {
+            return;
+        }
+        let limit = self.limit;
+        let full = f64::from(limit.burst);
+        self.buckets
+            .retain(|_, bucket| refilled(limit, *bucket, now) < full);
+        if self.buckets.len() < MAX_BUCKETS {
+            return;
+        }
+        let fullest = self
+            .buckets
+            .iter()
+            .max_by(|a, b| refilled(limit, *a.1, now).total_cmp(&refilled(limit, *b.1, now)))
+            .map(|(key, _)| key.clone());
+        if let Some(key) = fullest {
+            self.buckets.remove(&key);
+        }
     }
 
     /// Take one send from `sender`'s bucket. `Err(seconds)` is how long
@@ -58,18 +92,6 @@ impl Limiter {
         if self.limit.burst == 0 {
             return Ok(());
         }
-        if self.buckets.len() > SWEEP_ABOVE {
-            let full = f64::from(self.limit.burst);
-            let stale: Vec<String> = self
-                .buckets
-                .iter()
-                .filter(|(_, b)| self.refilled(**b, now) >= full)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for key in stale {
-                self.buckets.remove(&key);
-            }
-        }
         let current = self
             .buckets
             .get(sender)
@@ -77,6 +99,9 @@ impl Limiter {
                 self.refilled(*bucket, now)
             });
         if current >= 1.0 {
+            if !self.buckets.contains_key(sender) {
+                self.make_room(now);
+            }
             self.buckets.insert(
                 sender.to_owned(),
                 Bucket {
@@ -137,14 +162,32 @@ mod tests {
     }
 
     #[test]
-    fn full_buckets_are_swept_when_the_map_grows() {
+    fn full_buckets_are_swept_when_the_map_is_full() {
         let mut l = limiter(2, 60);
-        for n in 0..=SWEEP_ABOVE {
+        for n in 0..MAX_BUCKETS {
             l.admit(&format!("s{n}"), 0).unwrap();
         }
-        assert_eq!(l.buckets.len(), SWEEP_ABOVE + 1);
+        assert_eq!(l.buckets.len(), MAX_BUCKETS);
         // Two seconds later every bucket is full again and is dropped.
         l.admit("late", 2).unwrap();
         assert_eq!(l.buckets.len(), 1);
+    }
+
+    #[test]
+    fn rotating_ids_never_grow_the_map_or_free_a_looping_sender() {
+        let mut l = limiter(2, 1);
+        // A looping client with one id empties its bucket.
+        assert_eq!(l.admit("loop", 0), Ok(()));
+        assert_eq!(l.admit("loop", 0), Ok(()));
+        assert!(l.admit("loop", 0).is_err());
+        // A flood that changes its id on every send never refills a bucket
+        // within the second, so the map stays at the cap by dropping the
+        // fullest bucket, never the exhausted one.
+        for n in 0..(MAX_BUCKETS + 64) {
+            l.admit(&format!("flood{n}"), 0).unwrap();
+            assert!(l.buckets.len() <= MAX_BUCKETS);
+        }
+        assert_eq!(l.buckets.len(), MAX_BUCKETS);
+        assert!(l.admit("loop", 0).is_err());
     }
 }

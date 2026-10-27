@@ -45,6 +45,9 @@ defaults below are that choice.
      `session_token` field. A request without it, or with another value,
      answers HTTP 401 with code `unauthorized` and changes nothing. Over MCP
      it is a tool error with the same body.
+   - The store checks the token inside the operation's own transaction.
+     An `inbox` long-poll checks it again on every read, so a poll that
+     started while the id was unbound stops with 401 once the id is bound.
    - Only the binding's own agent id may act. An earlier pid of the same
      key is refused even with the token
      (`agent id superseded by a bound registration of its session`).
@@ -57,17 +60,31 @@ defaults below are that choice.
 2. **When a binding lapses.** A binding is live while the latest
    registration of its key asked for it, is not ended and is not gone. It
    lapses when the session ends (`end` with both tokens) or after 6 hours
-   without a call (the `gone` band). A lapsed key registers like an
-   unbound one. This is the recovery path for a lost token file: wait for
-   the lapse or use another session id.
-3. **Per-sender rate limit.** Every `send` takes one token from a bucket
-   per sender agent id, after the binding check, so a caller without the
-   session token cannot drain a bound sender's bucket. An empty bucket
-   answers HTTP 429 with code `rate_limited` and
-   `rate limited; retry in <n> s`, and stores nothing.
+   without a call (the `gone` band). A lapse is permanent: the broker marks
+   the row unbound, so a later call with or without a token (a stray
+   heartbeat, or a channel poller whose token file is gone) revives an
+   unbound session and never the binding or its old token. Only a new
+   `register` with `bind: true` binds the key again, under a new token. A
+   lapsed key registers like an unbound one. This is the recovery path for
+   a lost token file: wait for the lapse or use another session id.
+3. **Per-sender rate limit.** A `send` that stores a new message takes one
+   token from a bucket per sender agent id. The binding check, validation
+   and the SWB-R46 replay check run first, so a caller without the session
+   token cannot drain a bound sender's bucket, and an invalid send or an
+   idempotent retry of a stored one costs nothing. An empty bucket answers
+   HTTP 429 with code `rate_limited` and `rate limited; retry in <n> s`,
+   and stores nothing.
    - Defaults: a burst of 20 sends and a refill of 30 per minute (one every
      2 seconds). An agent dialog sends a few messages a minute, so the
-     defaults stop a loop or a flood without touching normal use.
+     defaults stop a client that loops or floods under one agent id
+     without touching normal use.
+   - The bucket is a loop guard, not an abuse control. An unbound `from` is
+     self-asserted, so a client that changes its id on every send gets a
+     fresh bucket each time. The tailnet ACL bounds such a client. The
+     broker keeps at most 4096 buckets: a new sender that finds the map
+     full drops the buckets that have refilled, else the fullest one, so
+     rotating ids neither grow broker memory nor reset a looping id's
+     empty bucket.
    - `swb serve` reads `SWB_SEND_BURST` and `SWB_SEND_REFILL_PER_MINUTE`
      (whole numbers up to 100000). `SWB_SEND_BURST=0` turns the limit off.
      Another value refuses to start.
@@ -126,6 +143,8 @@ defaults below are that choice.
   delivers the earlier ones.
 - Anyone can spend an unbound sender's send bucket by sending as it. A
   bound sender's bucket is spent only after the token check.
+- The send limit does not stop a flood that rotates unbound ids; the
+  tailnet ACL is the boundary for that (Decision 3).
 - Lab's mux agents group stays read-only (peers, claims and thread) until
   its callers bind, because a mux caller can pass any `from` or `me`.
 - The spoof test is

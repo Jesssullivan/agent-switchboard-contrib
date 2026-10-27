@@ -76,6 +76,32 @@ Acceptance tests named by the ruling:
 - Unbound compatibility: `unbound_sessions_work_as_in_v040` (broker) and
   `unbound_ids_behave_as_in_v040` (store).
 
+## Review fixes (PR #54)
+
+Authority: the TIN-4655 lane task to fix or decline each review finding on
+xoxd-ai/agent-switchboard#54, within SWB-R66 to SWB-R68. Reviewed at
+`ff3ddd8`.
+
+| Finding | Severity | Outcome |
+| --- | --- | --- |
+| A lapsed binding revived by a tokenless refresh | high | Fixed. `end` sets `bound=0`; `live_binding` and every lease refresh (`touch`) mark a lapsed row unbound before renewing it; a register clears `bound` on the key's earlier rows. Test `a_lapsed_binding_stays_lapsed_after_tokenless_calls` (end or gone, then heartbeat, inbox, peers, thread, claims, send or ack, then a tokenless rebind). A mutation run without the fix fails it. |
+| Binding check outside the inbox long-poll and `ack` | medium | Fixed. The store checks the token inside each operation's transaction (`send_as`, `inbox_as`, `ack_as`, `claim_as`, `release_as`, `handoff_as`, `end_as`); the broker passes the token in and no longer calls `authorize` first. Each long-poll read re-checks. Tests `a_tokenless_long_poll_stops_when_its_id_is_bound` (broker) and `a_key_bound_after_an_unbound_read_needs_the_token` (store). |
+| Bucket keyed on a self-asserted `from` | low | Narrowed, not a global bucket. A global bucket would let one flooding client deny every sender, and the tailnet ACL is the abuse boundary. The ADR, SECURITY and CHANGELOG now claim a guard for a client looping under one id. The map is capped at 4096 buckets and evicts refilled buckets, else the fullest one. Test `rotating_ids_never_grow_the_map_or_free_a_looping_sender`. |
+| Bucket charged before validation and replay | low | Fixed. `send_as` takes a bucket token only after the binding check, validation and the SWB-R46 replay check. Tests `only_a_created_send_spends_the_bucket` (store) and `a_replayed_or_invalid_send_spends_no_bucket_token` (broker). |
+
+`peers`, `claims`, `heartbeat` and `thread` still take no token and still
+renew a live binding's lease, as ADR-0003 Consequences records.
+
+Gates after the fixes, run as under Evidence above:
+
+| Gate | Result |
+| --- | --- |
+| `bazelisk --nohome_rc test --lockfile_mode=error --remote_local_fallback=false //:check` | 11 of 11 targets pass |
+| `cargo test --workspace --locked` | 157 passed: swb 60, broker 37 plus 1, store 56, proto 2, agentd 1 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all --check` | clean |
+| `just spec-dhall` | ok |
+| gitleaks (full history, `.gitleaks.toml`) | 194 commits, no leaks |
+
 ## Next
 
 - Upstream review of the PR; no merge, tag or release from this lane.

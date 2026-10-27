@@ -40,7 +40,8 @@ live:
 | `inbox` and `ack` | read mail addressed to any pid of the key, so a restart keeps unread mail |
 | `peers`, `claims`, `heartbeat`, `thread` | no token |
 
-A binding lapses when its session ends or after 6 hours without a call.
+A binding lapses when its session ends or after 6 hours without a call,
+and a lapse is permanent: no later call revives it or its old token.
 An unbound id behaves as in v0.4.0 and ignores a token it sends. The
 `swb` client binds with `SWB_BIND=1` and keeps the token in a 0600 file
 (see `SWB_STATE_DIR` below, SWB-R67).
@@ -103,7 +104,7 @@ a POST with a JSON body (`Content-Type: application/json`).
 | `POST /v1/end` | `{me, end_token, session_token?}` | any other end token answers `{"state":"unknown"}` and ends nothing |
 | `POST /v1/peers` | `{me?, all?, host?, limit?, cursor?, proc_start?}` | `me` renews that session's lease |
 | `GET /v1/peers` | `?all=&host=&limit=&cursor=` | passive listing; changes nothing |
-| `POST /v1/send` | `{from, to, ticket, body, …, session_token?}` (envelope v3) | `ticket` is `TIN-<digits>` or `none`; a body is at most 16 KiB; an empty sender bucket answers 429 |
+| `POST /v1/send` | `{from, to, ticket, body, …, session_token?}` (envelope v3) | `ticket` is `TIN-<digits>` or `none`; a body is at most 16 KiB; an empty sender bucket answers 429; an invalid send or an idempotent retry spends no bucket token |
 | `POST /v1/inbox` | `{me, limit, wait_seconds, session_token?}` | long-poll |
 | `POST /v1/ack` | `{me, msg_id, session_token?}` | |
 | `POST /v1/heartbeat` | `{me}` | renews the lease only |

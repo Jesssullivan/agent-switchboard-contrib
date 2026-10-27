@@ -13,9 +13,11 @@
 //! (harness, host, session id) is bound, `send` (by `from`), `inbox`, `ack`,
 //! `claim`, `release`, `handoff` and `end` (by `me`) need the
 //! `session_token` its latest `register` returned, or answer 401
-//! `unauthorized`. Every `send` also takes one token from its sender's
-//! bucket, or answers 429 `rate_limited`. The token is stripped from the
-//! arguments before the store sees them and never reaches an audit line.
+//! `unauthorized`. The store checks the token inside each operation's own
+//! transaction, so an `inbox` long-poll re-checks it on every read. A `send`
+//! that stores a new message also takes one token from its sender's bucket,
+//! or answers 429 `rate_limited`. The token is stripped from the arguments
+//! before the store sees them and never reaches an audit line.
 //! Authority stays `peer` on every message (SWB-R14).
 
 use axum::{
@@ -102,49 +104,35 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The agent id an operation acts as, for the operations a bound id needs
-/// its session token for (ADR-0003, SWB-R66). `register` checks its own
-/// token in the store; `peers`, `claims`, `heartbeat` and `thread` take none.
-fn acting_id<'a>(name: &str, args: &'a Value) -> Option<&'a str> {
-    let key = match name {
-        "send" => "from",
-        "inbox" | "ack" | "claim" | "release" | "handoff" | "end" => "me",
-        _ => return None,
-    };
-    args.get(key).and_then(Value::as_str)
-}
-
-/// Check a bound caller's session token and the sender's rate limit, then
-/// run the operation without the token in its arguments.
+/// Take the caller's session token out of the arguments and run the
+/// operation with it. The store checks it, for `send` (by `from`), `inbox`,
+/// `ack`, `claim`, `release`, `handoff` and `end` (by `me`), inside the
+/// operation's own transaction (ADR-0003, SWB-R66), and `register` checks
+/// its own. `peers`, `claims`, `heartbeat` and `thread` take none.
 fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError> {
     let token = match args.get("session_token") {
         None | Some(Value::Null) => None,
         Some(Value::String(token)) => Some(token.as_str()),
         Some(_) => return Err("invalid session_token".into()),
     };
-    if name == "register" {
-        return perform(store, name, args);
-    }
-    if let Some(id) = acting_id(name, args) {
-        store.authorize(id, token)?;
-    }
-    if name == "send"
-        && let Some(sender) = args.get("from").and_then(Value::as_str)
-    {
-        store.admit_send(sender)?;
-    }
-    if token.is_none() && args.get("session_token").is_none() {
-        return perform(store, name, args);
+    if name == "register" || args.get("session_token").is_none() {
+        return perform(store, name, args, token);
     }
     let mut stripped = args.clone();
     if let Some(map) = stripped.as_object_mut() {
         map.remove("session_token");
     }
-    perform(store, name, &stripped)
+    perform(store, name, &stripped, token)
 }
 
-/// One operation and its audit lines, after [`operation`]'s checks.
-fn perform(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError> {
+/// One operation and its audit lines. `token` is the caller's session
+/// token, already removed from `args` (except for `register`).
+fn perform(
+    store: &Store,
+    name: &str,
+    args: &Value,
+    token: Option<&str>,
+) -> Result<Value, StoreError> {
     let mut created = true;
     let result = match name {
         "register" => store.register(args),
@@ -159,17 +147,18 @@ fn perform(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError>
             )
         }
         "claim" => {
-            let outcome = store.claim(args)?;
+            let outcome = store.claim_as(args, token)?;
             created = outcome["recorded"] == json!(true);
             Ok(outcome)
         }
         "release" => {
-            let outcome = store.release(required(args, "me")?, required(args, "claim_id")?)?;
+            let outcome =
+                store.release_as(required(args, "me")?, required(args, "claim_id")?, token)?;
             created = outcome["released"] == json!(true);
             Ok(outcome)
         }
         "handoff" => {
-            let outcome = store.handoff(args)?;
+            let outcome = store.handoff_as(args, token)?;
             created = outcome["created"] == json!(true);
             Ok(outcome)
         }
@@ -180,16 +169,17 @@ fn perform(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError>
                     "end needs end_token; proc_start is no longer accepted (v0.3.0)".into(),
                 );
             }
-            store.end(
+            store.end_as(
                 args.get("me").and_then(Value::as_str).ok_or("missing me")?,
                 args.get("end_token")
                     .and_then(Value::as_str)
                     .ok_or("missing end_token")?,
+                token,
             )
         }
         "peers" => peers_op(store, args),
         "send" => {
-            let outcome = store.send(args)?;
+            let outcome = store.send_as(args, token)?;
             created = outcome.created;
             Ok(outcome.envelope)
         }
@@ -203,7 +193,9 @@ fn perform(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError>
                 .min(25);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
             loop {
-                let batch = store.inbox(me, limit)?;
+                // Each read checks the binding again, so a key bound during
+                // the wait is never read without its token (ADR-0003).
+                let batch = store.inbox_as(me, limit, token)?;
                 if batch["messages"].as_array().is_some_and(|v| !v.is_empty())
                     || std::time::Instant::now() >= deadline
                 {
@@ -212,11 +204,12 @@ fn perform(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError>
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
         }
-        "ack" => store.ack(
+        "ack" => store.ack_as(
             args.get("me").and_then(Value::as_str).ok_or("missing me")?,
             args.get("msg_id")
                 .and_then(Value::as_str)
                 .ok_or("missing msg_id")?,
+            token,
         ),
         _ => Err("unknown operation".into()),
     }?;
@@ -2773,6 +2766,79 @@ mod tests {
         let (status, _) =
             status_and_json(call(&app, "POST", "/v1/send", &real.to_string()).await).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Review of #54: an idempotent retry of a stored send (SWB-R46) and an
+    /// invalid send never spend the bucket, so a client that retries after a
+    /// timeout gets its receipt and not 429.
+    #[tokio::test]
+    async fn a_replayed_or_invalid_send_spends_no_bucket_token() {
+        let store = Arc::new(Store::memory().unwrap());
+        store
+            .set_send_limit(SendLimit {
+                burst: 1,
+                refill_per_minute: 1,
+            })
+            .unwrap();
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let id = "01JABCDEFGHJKMNPQRSTVWXYZ0";
+        let send = |ticket: &str| {
+            json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":ticket,"body":"x","msg_id":id})
+                .to_string()
+        };
+        let (status, _) = status_and_json(call(&app, "POST", "/v1/send", &send("bad")).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for _ in 0..3 {
+            let (status, envelope) =
+                status_and_json(call(&app, "POST", "/v1/send", &send("none")).await).await;
+            assert_eq!(status, StatusCode::OK, "{envelope}");
+            assert_eq!(envelope["msg_id"], id);
+        }
+        let fresh =
+            json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"y"});
+        let (status, error) =
+            status_and_json(call(&app, "POST", "/v1/send", &fresh.to_string()).await).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error["code"], "rate_limited");
+    }
+
+    /// Review of #54: an inbox long-poll checks the binding on every read. A
+    /// tokenless poll that starts before a service binds its id stops with
+    /// 401 once the id is bound and never receives the bound service's mail.
+    #[test]
+    fn a_tokenless_long_poll_stops_when_its_id_is_bound() {
+        let store = Arc::new(Store::memory().unwrap());
+        let poller = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                operation(&store, "inbox", &json!({"me":BOUND_ID,"wait_seconds":3}))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        let registered = operation(
+            &store,
+            "register",
+            &serde_json::from_str(BOUND_REGISTER).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registered["bound"], true);
+        operation(
+            &store,
+            "send",
+            &json!({"from":"claude:honey:1:a","to":BOUND_ID,"ticket":"none","body":"secret for bound svc"}),
+        )
+        .unwrap();
+        let error = poller.join().unwrap().unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unauthorized);
+        // The message is still unread for the token holder.
+        let read = operation(
+            &store,
+            "inbox",
+            &json!({"me":BOUND_ID,"session_token":registered["session_token"]}),
+        )
+        .unwrap();
+        assert_eq!(read["messages"][0]["body"], "secret for bound svc");
+        assert_eq!(read["messages"][0]["delivery_count"], 1);
     }
 
     #[test]

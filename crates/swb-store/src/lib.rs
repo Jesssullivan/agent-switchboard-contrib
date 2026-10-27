@@ -344,6 +344,24 @@ pub fn delivery_key(agent_id: &str) -> String {
         _ => agent_id.to_owned(),
     }
 }
+/// Renew `me`'s lease and clear `ended`, as every call by a registered
+/// session does. A binding that already lapsed (its session ended, or it
+/// went [`IDLE_MAX_AGE_SECONDS`] without a call) is marked unbound first, so
+/// a later call, with or without a token, revives an unbound session and
+/// never the binding (ADR-0003). Returns the rows renewed: 0 for an
+/// unregistered `me`.
+pub(crate) fn touch(db: &Connection, me: &str, now: i64) -> StoreResult<usize> {
+    db.execute(
+        "UPDATE sessions SET bound=0 WHERE agent_id=?1 AND bound=1 AND (ended=1 OR last_seen<?2)",
+        params![me, now - IDLE_MAX_AGE_SECONDS],
+    )
+    .map_err(sql_err)?;
+    db.execute(
+        "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
+        params![me, now],
+    )
+    .map_err(sql_err)
+}
 fn unauthorized(message: &str) -> StoreError {
     StoreError::new(ErrorKind::Unauthorized, message)
 }
@@ -581,7 +599,10 @@ impl Store {
     /// The live binding of `agent_id`'s delivery key, if any: the latest
     /// registration of that (harness, host, session id) asked for a binding,
     /// is not ended and is not gone (ADR-0003). A binding lapses when its
-    /// session ends or after [`IDLE_MAX_AGE_SECONDS`] without a call.
+    /// session ends or after [`IDLE_MAX_AGE_SECONDS`] without a call, and a
+    /// lapse is permanent: the row is marked unbound here, so no later call
+    /// can bring the binding or its old token back. Only a new `register`
+    /// with `bind: true` binds the key again, under a new token.
     fn live_binding(db: &Connection, agent_id: &str, now: i64) -> StoreResult<Option<Binding>> {
         let [harness, host, _, session] = match agent_id.splitn(4, ':').collect::<Vec<_>>()[..] {
             [a, b, c, d] => [a, b, c, d],
@@ -600,6 +621,11 @@ impl Store {
         Ok(match row {
             Some((agent_id, Some(nonce), 1, 0, seen)) if seen >= now - IDLE_MAX_AGE_SECONDS => {
                 Some(Binding { agent_id, nonce })
+            }
+            Some((agent_id, _, 1, _, _)) => {
+                db.execute("UPDATE sessions SET bound=0 WHERE agent_id=?1", [&agent_id])
+                    .map_err(sql_err)?;
+                None
             }
             _ => None,
         })
@@ -625,16 +651,29 @@ impl Store {
     /// only the binding's own agent id may act, and only with the session
     /// token its latest registration returned. Every refusal is
     /// [`ErrorKind::Unauthorized`]. An invalid id passes here so the
-    /// operation itself reports it. The broker calls this before `send`
-    /// (for `from`), `inbox`, `ack`, `claim`, `release`, `handoff` and `end`
-    /// (for `me`).
+    /// operation itself reports it. [`Store::send_as`] (for `from`),
+    /// [`Store::inbox_as`], [`Store::ack_as`], [`Store::claim_as`],
+    /// [`Store::release_as`], [`Store::handoff_as`] and [`Store::end_as`]
+    /// (for `me`) run this check inside their own transaction.
     pub fn authorize(&self, agent_id: &str, session_token: Option<&str>) -> StoreResult<()> {
-        if !valid_agent_id(agent_id) {
-            return Ok(());
-        }
         let db = self.db()?;
-        let Some(binding) = Self::live_binding(&db, agent_id, self.now())? else {
-            return Ok(());
+        Self::gate(&db, agent_id, session_token, self.now()).map(|_| ())
+    }
+    /// [`Store::authorize`] on `db`, inside the caller's transaction, so the
+    /// check and the operation it guards see the same binding (ADR-0003).
+    /// `Ok(true)` means `agent_id` holds a live binding and presented its
+    /// token; `Ok(false)` means its key is unbound.
+    fn gate(
+        db: &Connection,
+        agent_id: &str,
+        session_token: Option<&str>,
+        now: i64,
+    ) -> StoreResult<bool> {
+        if !valid_agent_id(agent_id) {
+            return Ok(false);
+        }
+        let Some(binding) = Self::live_binding(db, agent_id, now)? else {
+            return Ok(false);
         };
         let Some(token) = session_token else {
             return Err(unauthorized("session token required"));
@@ -644,15 +683,10 @@ impl Store {
                 "agent id superseded by a bound registration of its session",
             ));
         }
-        if !Self::token_matches(&db, &binding, token)? {
+        if !Self::token_matches(db, &binding, token)? {
             return Err(unauthorized("invalid session token"));
         }
-        Ok(())
-    }
-    /// Whether `agent_id` is the agent id of a live binding, so its inbox
-    /// and acks key on its delivery key (ADR-0003).
-    fn holds_binding(db: &Connection, agent_id: &str, now: i64) -> StoreResult<bool> {
-        Ok(Self::live_binding(db, agent_id, now)?.is_some_and(|b| b.agent_id == agent_id))
+        Ok(true)
     }
     /// Set the per-sender send limit (ADR-0003). The broker reads it from its
     /// environment at startup; `burst` 0 turns the limit off.
@@ -756,6 +790,13 @@ impl Store {
                       session_id=excluded.session_id,registered_seq=excluded.registered_seq,token_nonce=excluded.token_nonce,
                       bound=excluded.bound",
             params![id,harness,host,proc_start,now,session_id,seq,nonce,bound]).map_err(sql_err)?;
+        // The newest registration of a key is the only row that may carry its
+        // binding, so an earlier pid's row can never become bound again.
+        tx.execute(
+            "UPDATE sessions SET bound=0 WHERE harness=?1 AND host=?2 AND session_id=?3 AND agent_id!=?4 AND bound=1",
+            params![harness, host, session_id, id],
+        )
+        .map_err(sql_err)?;
         let token = hex(&Self::end_token_mac(&tx, &id, &nonce)?
             .finalize()
             .into_bytes());
@@ -775,6 +816,16 @@ impl Store {
     /// it holds in the same transaction and lists them in
     /// `released_claims` (R-C950).
     pub fn end(&self, me: &str, end_token: &str) -> StoreResult<Value> {
+        self.end_as(me, end_token, None)
+    }
+    /// [`Store::end`] acting as `me` with its session token. Ending a bound
+    /// session lapses its binding for good (ADR-0003).
+    pub fn end_as(
+        &self,
+        me: &str,
+        end_token: &str,
+        session_token: Option<&str>,
+    ) -> StoreResult<Value> {
         if !valid_agent_id(me) {
             return Err("invalid me".into());
         }
@@ -787,6 +838,7 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
+        Self::gate(&tx, me, session_token, now)?;
         let nonce: Option<Option<Vec<u8>>> = tx
             .query_row(
                 "SELECT token_nonce FROM sessions WHERE agent_id=?1",
@@ -804,8 +856,11 @@ impl Store {
         if !matches {
             return Ok(json!({"agent_id":me,"state":"unknown"}));
         }
-        tx.execute("UPDATE sessions SET ended=1 WHERE agent_id=?1", [me])
-            .map_err(sql_err)?;
+        tx.execute(
+            "UPDATE sessions SET ended=1, bound=0 WHERE agent_id=?1",
+            [me],
+        )
+        .map_err(sql_err)?;
         let released = claims::release_all_held(&tx, me, now)?;
         tx.commit().map_err(sql_err)?;
         Ok(json!({"agent_id":me,"state":"ended","released_claims":released}))
@@ -843,13 +898,7 @@ impl Store {
             if !valid_agent_id(me) {
                 return Err("invalid me".into());
             }
-            let updated = db
-                .execute(
-                    "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
-                    params![me, now],
-                )
-                .map_err(sql_err)?;
-            if updated == 0 {
+            if touch(&db, me, now)? == 0 {
                 return Err(StoreError::new(ErrorKind::Unregistered, "unregistered me"));
             }
         }
@@ -902,6 +951,13 @@ impl Store {
         Ok(json!({"peers":peers,"next_cursor":next_cursor}))
     }
     pub fn send(&self, input: &Value) -> StoreResult<SendOutcome> {
+        self.send_as(input, None)
+    }
+    /// [`Store::send`] acting as `from` with its session token (ADR-0003).
+    /// The binding check runs inside the send's transaction. Only a send
+    /// that stores a new message takes a token from the sender's bucket: a
+    /// refused, invalid or replayed (SWB-R46) send costs nothing.
+    pub fn send_as(&self, input: &Value, session_token: Option<&str>) -> StoreResult<SendOutcome> {
         let sender = field(input, "from")?;
         let recipient = field(input, "to")?;
         if !valid_agent_id(sender) || !valid_agent_id(recipient) {
@@ -1046,6 +1102,7 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
+        Self::gate(&tx, sender, session_token, now)?;
         let old: Option<(String, String, String)> = tx
             .query_row(
                 "SELECT sender,body,envelope FROM messages WHERE msg_id=?1",
@@ -1061,17 +1118,14 @@ impl Store {
             }
             let envelope = serde_json::from_str(&envelope)
                 .map_err(|e| StoreError::new(ErrorKind::Internal, e.to_string()))?;
-            tx.execute(
-                "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
-                params![sender, now],
-            )
-            .map_err(sql_err)?;
+            touch(&tx, sender, now)?;
             tx.commit().map_err(sql_err)?;
             return Ok(SendOutcome {
                 envelope,
                 created: false,
             });
         }
+        self.admit_send(sender)?;
         tx.execute(
             "INSERT INTO thread_counters(thread_id,high_water) VALUES(?1,1)
              ON CONFLICT(thread_id) DO UPDATE SET high_water=high_water+1",
@@ -1130,21 +1184,30 @@ impl Store {
                     VALUES(?1,?2,?3,?4,?5,?6,?7,?9,?9+?8,?10)",
             params![msg_id,thread_id,seq,sender,recipient,body,envelope.to_string(),i64::from(ttl)*3600,now,delivery_key(recipient)]).map_err(sql_err)?;
         tx.execute("INSERT INTO counters(name,value) VALUES('messages_total',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
-        tx.execute(
-            "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
-            params![sender, now],
-        )
-        .map_err(sql_err)?;
+        touch(&tx, sender, now)?;
         tx.commit().map_err(sql_err)?;
         Ok(SendOutcome {
             envelope,
             created: true,
         })
     }
-    /// Fetch `me`'s unacknowledged messages. A bound agent id reads every
-    /// message addressed to its delivery key, so the mail sent to an earlier
-    /// pid of the same service stays deliverable after a restart (ADR-0003).
+    /// Fetch `me`'s unacknowledged messages, as an unbound caller (no
+    /// session token). See [`Store::inbox_as`].
     pub fn inbox(&self, me: &str, limit: u32) -> StoreResult<Value> {
+        self.inbox_as(me, limit, None)
+    }
+    /// Fetch `me`'s unacknowledged messages. A bound agent id that presents
+    /// its session token reads every message addressed to its delivery key,
+    /// so the mail sent to an earlier pid of the same service stays
+    /// deliverable after a restart (ADR-0003). The binding check runs in the
+    /// same transaction as the read, so a key bound after a caller's last
+    /// call is never read without its token.
+    pub fn inbox_as(
+        &self,
+        me: &str,
+        limit: u32,
+        session_token: Option<&str>,
+    ) -> StoreResult<Value> {
         if !valid_agent_id(me) {
             return Err("invalid agent id".into());
         }
@@ -1154,7 +1217,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
         tx.execute("UPDATE messages SET state='expired' WHERE state!='acked' AND state!='expired' AND expires_at<=?1",[now]).map_err(sql_err)?;
-        let by_key = Self::holds_binding(&tx, me, now)?;
+        let by_key = Self::gate(&tx, me, session_token, now)?;
         let messages: Vec<(String, String)> = {
             let sql = if by_key {
                 "SELECT msg_id,envelope FROM messages WHERE recipient_key=?1 AND state IN ('queued','notified','fetched') ORDER BY created_at,seq LIMIT ?2"
@@ -1177,11 +1240,7 @@ impl Store {
         for (id, _) in &messages {
             tx.execute("UPDATE messages SET state='fetched',delivery_count=delivery_count+1 WHERE msg_id=?1",[id]).map_err(sql_err)?;
         }
-        tx.execute(
-            "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
-            params![me, now],
-        )
-        .map_err(sql_err)?;
+        touch(&tx, me, now)?;
         let values = messages
             .into_iter()
             .map(|(id, body)| {
@@ -1225,13 +1284,26 @@ impl Store {
         }))
     }
     pub fn ack(&self, me: &str, msg_id: &str) -> StoreResult<Value> {
+        self.ack_as(me, msg_id, None)
+    }
+    /// Acknowledge one of `me`'s messages. A bound agent id with its session
+    /// token acknowledges by its delivery key (ADR-0003), checked in the
+    /// same transaction as the update.
+    pub fn ack_as(
+        &self,
+        me: &str,
+        msg_id: &str,
+        session_token: Option<&str>,
+    ) -> StoreResult<Value> {
         if !valid_agent_id(me) || !valid_ulid(msg_id) {
             return Err("invalid identity or msg_id".into());
         }
-        let db = self.db()?;
+        let mut db = self.db()?;
         let now = self.now();
-        // A bound agent id acknowledges by its delivery key (ADR-0003).
-        let key = if Self::holds_binding(&db, me, now)? {
+        let db = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let key = if Self::gate(&db, me, session_token, now)? {
             Some(delivery_key(me))
         } else {
             None
@@ -1253,11 +1325,8 @@ impl Store {
                 ));
             }
         }
-        db.execute(
-            "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
-            params![me, now],
-        )
-        .map_err(sql_err)?;
+        touch(&db, me, now)?;
+        db.commit().map_err(sql_err)?;
         Ok(json!({"msg_id":msg_id,"state":"acked"}))
     }
     pub fn metrics(&self) -> StoreResult<String> {
@@ -1677,9 +1746,12 @@ mod tests {
         let second = bind(&s, "hermes", "sting", 200, "svc", Some(&token_of(&first))).unwrap();
         let new = second["agent_id"].as_str().unwrap().to_owned();
         assert_ne!(new, old);
+        let token = token_of(&second);
         let after = send(&old, "addressed to the old pid after the restart");
         let direct = send(&new, "addressed to the new pid");
-        let read = s.inbox(&new, 10).unwrap();
+        // A bound id reads only with its token.
+        assert_eq!(s.inbox(&new, 10).unwrap_err().kind, ErrorKind::Unauthorized);
+        let read = s.inbox_as(&new, 10, Some(&token)).unwrap();
         let ids: Vec<&str> = read["messages"]
             .as_array()
             .unwrap()
@@ -1688,17 +1760,26 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![before.as_str(), after.as_str(), direct.as_str()]);
         // The new id acknowledges mail addressed to the old pid.
-        assert_eq!(s.ack(&new, &before).unwrap()["state"], "acked");
-        assert_eq!(s.ack(&new, &before).unwrap()["state"], "acked");
         assert_eq!(
-            s.inbox(&new, 10).unwrap()["messages"]
+            s.ack(&new, &before).unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+        assert_eq!(
+            s.ack_as(&new, &before, Some(&token)).unwrap()["state"],
+            "acked"
+        );
+        assert_eq!(
+            s.ack_as(&new, &before, Some(&token)).unwrap()["state"],
+            "acked"
+        );
+        assert_eq!(
+            s.inbox_as(&new, 10, Some(&token)).unwrap()["messages"]
                 .as_array()
                 .unwrap()
                 .len(),
             2
         );
         // Only the binding's own agent id may act; the old pid is superseded.
-        let token = token_of(&second);
         assert_eq!(
             s.authorize(&old, Some(&token)).unwrap_err(),
             "agent id superseded by a bound registration of its session"
@@ -1725,8 +1806,13 @@ mod tests {
         let (s, clock) = clocked();
         let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
         let me = first["agent_id"].as_str().unwrap().to_owned();
+        let end_token = first["end_token"].as_str().unwrap();
         assert_eq!(
-            s.end(&me, first["end_token"].as_str().unwrap()).unwrap()["state"],
+            s.end(&me, end_token).unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+        assert_eq!(
+            s.end_as(&me, end_token, Some(&token_of(&first))).unwrap()["state"],
             "ended"
         );
         s.authorize(&me, None).unwrap();
@@ -1743,6 +1829,134 @@ mod tests {
         assert_eq!(s.peers(&all()).unwrap()["peers"][0]["bound"], false);
         let taken = reg(&s, "hermes", "sting", 100, "svc", "start-100");
         assert_eq!(taken["bound"], false);
+    }
+
+    /// Review of #54: a lapse is permanent. A tokenless call after the lapse
+    /// (a stray heartbeat, or a channel poller whose token file is gone)
+    /// revives an unbound session, never the binding or its old token, so
+    /// the owner can bind again without a token.
+    #[test]
+    fn a_lapsed_binding_stays_lapsed_after_tokenless_calls() {
+        type Poke = fn(&Store, &str);
+        let heartbeat: Poke = |s, me| {
+            s.heartbeat(me).unwrap();
+        };
+        let inbox: Poke = |s, me| {
+            s.inbox(me, 10).unwrap();
+        };
+        let others: Poke = |s, me| {
+            s.peers(&PeersQuery {
+                me: Some(me),
+                ..PeersQuery::default()
+            })
+            .unwrap();
+            s.thread(me, &Ulid::new().to_string(), None, None).unwrap();
+            s.claims(&ClaimsQuery {
+                me: Some(me),
+                ..ClaimsQuery::default()
+            })
+            .unwrap();
+            s.send(&json!({"from":me,"to":"claude:honey:1:a","ticket":"none","body":"b"}))
+                .unwrap();
+            let sent = s
+                .send(&json!({"from":"claude:honey:1:a","to":me,"ticket":"none","body":"b"}))
+                .unwrap();
+            s.ack(me, sent.envelope["msg_id"].as_str().unwrap())
+                .unwrap();
+        };
+        for (lapse_by_end, poke) in [
+            (true, heartbeat),
+            (true, inbox),
+            (false, heartbeat),
+            (false, inbox),
+            (true, others),
+            (false, others),
+        ] {
+            let (s, clock) = clocked();
+            let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+            let me = first["agent_id"].as_str().unwrap().to_owned();
+            let old_token = token_of(&first);
+            if lapse_by_end {
+                s.end_as(&me, first["end_token"].as_str().unwrap(), Some(&old_token))
+                    .unwrap();
+            } else {
+                clock.advance(u32::try_from(IDLE_MAX_AGE_SECONDS).unwrap() + 1);
+            }
+            s.authorize(&me, None).unwrap();
+            poke(&s, &me);
+            // Still unbound after the tokenless call.
+            s.authorize(&me, None).unwrap();
+            assert_eq!(s.peers(&all()).unwrap()["peers"][0]["bound"], false);
+            // The owner binds again without a token, same pid or a new one,
+            // and gets a new token; the old one never works again.
+            let again = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+            assert_eq!(again["bound"], true);
+            let new_token = token_of(&again);
+            assert_ne!(new_token, old_token);
+            assert_eq!(
+                s.authorize(&me, Some(&old_token)).unwrap_err(),
+                "invalid session token"
+            );
+            s.authorize(&me, Some(&new_token)).unwrap();
+        }
+    }
+
+    /// Review of #54: the binding check runs in the operation's own
+    /// transaction. A caller that read an id's inbox while it was unbound
+    /// cannot read or ack its key's mail once the id is bound.
+    #[test]
+    fn a_key_bound_after_an_unbound_read_needs_the_token() {
+        let s = Store::memory().unwrap();
+        let me = "hermes:sting:100:svc";
+        assert!(
+            s.inbox(me, 10).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let bound = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let sent = s
+            .send(&json!({"from":"claude:honey:1:a","to":me,"ticket":"none","body":"secret"}))
+            .unwrap();
+        let msg_id = sent.envelope["msg_id"].as_str().unwrap();
+        assert_eq!(s.inbox(me, 10).unwrap_err().kind, ErrorKind::Unauthorized);
+        assert_eq!(s.ack(me, msg_id).unwrap_err().kind, ErrorKind::Unauthorized);
+        let read = s.inbox_as(me, 10, Some(&token_of(&bound))).unwrap();
+        assert_eq!(read["messages"][0]["msg_id"], msg_id);
+        assert_eq!(read["messages"][0]["delivery_count"], 1);
+    }
+
+    /// Review of #54: only a send that stores a new message spends the
+    /// sender's bucket. An invalid send, a refused bound send and an
+    /// idempotent replay (SWB-R46) cost nothing.
+    #[test]
+    fn only_a_created_send_spends_the_bucket() {
+        let s = Store::memory().unwrap();
+        s.set_send_limit(SendLimit {
+            burst: 1,
+            refill_per_minute: 1,
+        })
+        .unwrap();
+        let me = "claude:honey:1:a";
+        let msg = |ticket: &str, id: &str| json!({"from":me,"to":"pi:sting:2:b","ticket":ticket,"body":"x","msg_id":id});
+        let id = Ulid::new().to_string();
+        for _ in 0..3 {
+            assert_eq!(s.send(&msg("bad", &id)).unwrap_err(), "invalid ticket");
+        }
+        assert!(s.send(&msg("none", &id)).unwrap().created);
+        for _ in 0..3 {
+            assert!(!s.send(&msg("none", &id)).unwrap().created);
+        }
+        let limited = s.send(&msg("none", &Ulid::new().to_string())).unwrap_err();
+        assert_eq!(limited.kind, ErrorKind::RateLimited);
+        // A bound sender refused for its token keeps its bucket.
+        let bound = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let from = bound["agent_id"].as_str().unwrap();
+        let spoof = json!({"from":from,"to":"pi:sting:2:b","ticket":"none","body":"x"});
+        for _ in 0..3 {
+            assert_eq!(s.send(&spoof).unwrap_err().kind, ErrorKind::Unauthorized);
+        }
+        assert!(s.send_as(&spoof, Some(&token_of(&bound))).unwrap().created);
     }
 
     #[test]
@@ -1809,7 +2023,13 @@ mod tests {
         assert_eq!(key, "hermes:sting:svc");
         assert_eq!(delivery_key("hermes:sting:100:svc"), "hermes:sting:svc");
         let bound = bind(&s, "hermes", "sting", 200, "svc", None).unwrap();
-        let read = s.inbox(bound["agent_id"].as_str().unwrap(), 10).unwrap();
+        let read = s
+            .inbox_as(
+                bound["agent_id"].as_str().unwrap(),
+                10,
+                Some(&token_of(&bound)),
+            )
+            .unwrap();
         assert_eq!(read["messages"][0]["msg_id"], id.as_str());
         drop(s);
         let _ = std::fs::remove_file(&path);

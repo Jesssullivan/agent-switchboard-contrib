@@ -39,14 +39,21 @@ released.
   `unauthorized`, so a spoofed send from a bound id fails. A new
   `register` of the key needs the current token and rotates it. Only the
   binding's own agent id may act. A binding lapses when its session ends
-  or after 6 hours without a call.
+  or after 6 hours without a call, and a lapse is permanent: no later
+  call revives the binding or its old token. Each operation checks the
+  token in its own store transaction, and an `inbox` long-poll checks it
+  on every read.
 - Stable delivery for bound service ids: `inbox` and `ack` for a bound id
   read mail addressed to any pid of its key, so a restart keeps unread
   mail (SWB-R66).
 - Per-sender send rate limit: a token bucket per sender answers 429
   `rate_limited`. Defaults are a burst of 20 and a refill of 30 per
   minute, set with `SWB_SEND_BURST` and `SWB_SEND_REFILL_PER_MINUTE` on
-  `swb serve`; `SWB_SEND_BURST=0` turns it off.
+  `swb serve`; `SWB_SEND_BURST=0` turns it off. Only a send that stores a
+  new message spends a token, so an invalid send or an idempotent retry
+  (SWB-R46) never answers 429. The broker keeps at most 4096 buckets. The
+  limit guards against a client looping under one id, not a flood that
+  rotates unbound ids.
 - `SWB_BIND=1`: `swb whoami --register` and `swb hook` ask for a binding.
   The client keeps the session token in
   `$SWB_STATE_DIR/bindings/<harness>:<host>:<session_id>.token` (directory

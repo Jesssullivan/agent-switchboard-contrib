@@ -45,12 +45,19 @@ binding is live:
 - `peers` rows say `bound`.
 
 A binding lapses when its session ends or after 6 hours without a call;
-the key then registers like an unbound one. The client keeps the token in a
+the key then registers like an unbound one. A lapse is permanent: a later
+call, with or without a token, cannot bring the binding or its old token
+back. The broker checks the token inside each operation's transaction, and
+an `inbox` long-poll checks it on every read. The client keeps the token in a
 0600 file under `$SWB_STATE_DIR/bindings/` and never prints it.
 
 Each sender also has a token bucket for `send` (default burst 20, refill 30
 per minute, set by `SWB_SEND_BURST` and `SWB_SEND_REFILL_PER_MINUTE`). An
-empty bucket answers 429 `rate_limited`.
+empty bucket answers 429 `rate_limited`. Only a send that stores a new
+message spends a token. The bucket stops a client that loops under one
+agent id. It does not stop a flood that changes its unbound `from` on every
+send: the tailnet ACL bounds that client. The broker keeps at most 4096
+buckets.
 
 Binding does not change what a message can make an agent do: `authority`
 stays `peer` on every message (SWB-R14).
