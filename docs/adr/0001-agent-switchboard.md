@@ -738,6 +738,21 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
   broker or client refuses the new kinds, so the live broker and the lab pin
   move to v0.4.0 together (SWB-R63). SWB-R62 v0.3.0 stays published; this
   record authorizes no other image.
+- **SWB-R71 sender-binding release, v0.5.0 (2026-10-27):** opt-in sender
+  binding, the per-sender send rate limit and stable bound delivery (#54,
+  ADR-0003, SWB-R66 to SWB-R70), with the workspace at 0.5.0 (#55). The
+  operator ruled the release chain on TIN-4655 (comment `7e292300`: "cut
+  v0.5.0 with the same chain as v0.4.0"); R-C435 pre-authorizes a digest
+  that two clean builds of the merge reproduce. The two clean builds ran on
+  sting, linux x86_64 on the pinned Nix toolchain (R-C416). The approved
+  source is `cfff7913fb6bc6c5aee2974b357d0b75b371326b` (the #55 merge, the
+  last change to a protected input) at
+  `sha256:05738e97af06f767d7894b1f3e0697b9eece0888527e9937130a4041bff7498e`,
+  published through the release workflow under the signed `v0.5.0` tag.
+  The source is a GitHub merge commit signed by `B5690EEEBB952194`. A v0.4.0
+  broker ignores `bind`, so the live broker and every client that binds
+  move to v0.5.0 together, and the lab seat pins and delivers it. SWB-R64
+  v0.4.0 stays published; this record authorizes no other image.
 - **SWB-R54 state custody (2026-09-27):** TIN-5105 is blahaj-operator-owned
   dedicated OpenTofu state commissioning. Backend, separate identity/carrier,
   backup, lock contention/release and scratch restore receipts must precede
@@ -980,9 +995,13 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R62 | 2026-10-23 | Operator ruling, Linear TIN-6749 comment `a7256598` item 1 ("cut the signed v0.3.0 release following the repo's release process"), carried on TIN-4655 comment `24157077`; R-C944 (TIN-5770 comment `23fdf965`); R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | Approve the v0.3.0 security-bundle release: signed source e2bb9f75 (the #43 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:2e42fc30…` (4579-byte manifest), from two matching clean sting builds of that merge. Recorded in `approved-broker.json`; the signed v0.3.0 tag publishes only this digest, through `release.yml`. |
 | SWB-R63 | 2026-10-27 | Operator ruling (Jess, interview with the video-utils narrate seat), Linear TIN-4655 comment `30ca400e`; agent-switchboard #50 | Harness kinds `hermes` (a Hermes agent such as Cade) and `kimicode` (the Kimi Code CLI) join the identity list. `swb channel --tools full` serves ten tools beside the default three-tool channel. Push stays Claude-only: full mode pushes only when every identity setting present names `claude`. A non-Claude kind may not send `operator_directed`. Sender binding stays out of scope (SWB-R05, ADR-0003 draft). Landing is an admin merge with a release-check waiver on local evidence, then v0.4.0 with the broker and the lab pin moved together. |
 | SWB-R64 | 2026-10-27 | Operator ruling (Jess, interview with the video-utils narrate seat), Linear TIN-4655 comment `409fb2ce` ("v0.4.0 release chain approved, run end to end"); SWB-R63; R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | Approve the v0.4.0 harness-kinds release: signed source 3405bf86 (the #51 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:a6303937…` (4579-byte manifest), from two matching clean sting builds of that merge. Recorded in `approved-broker.json`; the signed v0.4.0 tag publishes only this digest, through `release.yml`. |
+| SWB-R65 | 2026-10-27 | Operator ruling (Jess, interview with the video-utils narrate seat), Linear TIN-4655 comment `409fb2ce`; SWB-R63 | Native Kimi Code registers as `kimicode`, never `kimi`; under SWB-R63, `kimi` means Claude Code on a Kimi model. Its switchboard client is `swb channel --tools full` (MCP stdio) with hooks in `SWB_HOOK_FORMAT=text`, and the Claude-JSON adapter shim is dropped once text hooks work. The lab harness parity branch switches to `SWB_HARNESS=kimicode` and lands with the v0.4.0 pin. |
 | SWB-R66 | 2026-10-27 | Operator ruling (D37, narrate seat interview; SPR-34 on TIN-7125 `c54dda62`), Linear TIN-4655 comment `0753094f` | [ADR-0003](0003-sender-binding.md) (opt-in sender binding, drafted at `bd6f88b`) is accepted and ships as v0.5.0, since v0.4.0 already shipped without it. Binding stays opt-in. Acceptance includes the spoof test: a send with `from` set to a bound id and no token fails. Amends SWB-R05 and SWB-R14 as the ADR describes; `authority` stays `peer`. |
 | SWB-R67 | 2026-10-27 | same | A bound client keeps its token in a 0600 file and rotates it on every re-register. |
 | SWB-R68 | 2026-10-27 | same | `swb peers` shows whether an id is bound. |
+| SWB-R69 | 2026-10-27 | Operator ruling (Jess, narrate seat interview), Linear TIN-4655 comment `7e292300`; agent-switchboard #54 | Accept #54's three design choices: re-registering a live bound id needs its current token; a binding lapses when its session ends or after 6 h idle, which is how a lost token file is recovered, and a lapse is permanent; the per-sender rate limit (burst 20, 30 per minute, configurable) also applies to unbound senders, as a guard against a looping client. |
+| SWB-R70 | 2026-10-27 | same | Land #54 (head 8ebddff) by admin merge with a recorded release-check waiver, as for #50. Fork PRs skip CI; the local gate receipt covers it (bazel //:check 11/11, cargo test 157, clippy, fmt, spec-dhall and gitleaks). |
+| SWB-R71 | 2026-10-27 | same; SWB-R66; R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | After #54 merges, cut v0.5.0 with the same chain as v0.4.0. Approve the v0.5.0 sender-binding release: signed source cfff7913 (the #55 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:05738e97…` (4579-byte manifest), from two matching clean sting builds of that merge. Recorded in `approved-broker.json`; the signed v0.5.0 tag publishes only this digest, through `release.yml`. The lab seat then pins and delivers it, as with lab#3064. |
 
 Estate rulings this design depends on:
 

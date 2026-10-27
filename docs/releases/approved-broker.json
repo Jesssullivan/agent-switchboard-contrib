@@ -2,30 +2,31 @@
   "file_sha256": {
     ".bazelversion": "1b9487d55bea47fea50d226cc9c53bc548877ad2a318bac8fbc8b320f429e5c5",
     "BUILD.bazel": "56e6cc630af92bd173f7d9031a4773af3d7b8bb14d7c92d3604b48bf34f31e3c",
-    "Cargo.lock": "2ea8eabfeb1c4f8c47c27313ce6c948c3462362741d1a66779c65d569b46ecc7",
-    "Cargo.toml": "c1ee35583bcbf54458e20189d5186a51fbf476eca953b3814f771e1c28fe5799",
-    "MODULE.bazel": "8440bc4fd3680b3c58f75d4917be567447bfc8514456499e2ca93454b1858679",
-    "MODULE.bazel.lock": "ea3056369198bd1cd664011d277c0776bb7d962bbab27aed17a59f30f3210722",
-    "cargo-bazel-lock.json": "0869a92c4292ebe658d49715cc6436be0cdf46db620ad953f3c8ab9538fc003a",
+    "Cargo.lock": "fc0e60b7900d5f702b9e0aa24adc647007671a33241136ad3d108ca5d8980ea3",
+    "Cargo.toml": "466894a0b090f4ccc2efc8e577ae46a53f25a4a9e308757f773df6ad993ce5f4",
+    "MODULE.bazel": "b362c5cab3dcdffd862cfd2d29ea606c06330bca46ec908bb9c13028d328991e",
+    "MODULE.bazel.lock": "cf4db60f2781df71223f6693183751525b75a443aece2eb959b82447f347cc69",
+    "cargo-bazel-lock.json": "bdf9fbd294354e931427b6b2a9f2c958489926d0ceb9b3b8195166f73b47fcc5",
     "crates/swb-agentd/BUILD.bazel": "4c53792c73662c8cf3737e36559acc042f53a28c4c5d638586e177df1f56adb7",
     "crates/swb-agentd/Cargo.toml": "9a9241ecf6f202db1835a13ff1a7191be18e29283adecd0542ff0a5a2cb097e8",
     "crates/swb-agentd/src/lib.rs": "03c8ff21db3b6556a4de5436ecf22589bf4ed43303cd6504b743394ad218bef7",
     "crates/swb-broker/BUILD.bazel": "e2913c2d01c34aa7dd5571d9d8690f96989b412e8b53fffe77ed25f5727d96b8",
     "crates/swb-broker/Cargo.toml": "b92e7edb6b245a708f197de03c8e644d166d7275084604eb2e67825122e21dc7",
-    "crates/swb-broker/src/lib.rs": "4e8228de50fe0dbd6b2dbb2c67f90661dff7b549365a64a8e09f4160869754c5",
-    "crates/swb-broker/src/service_roundtrip_tests.rs": "1f390bfd1940b8ac24a091fd691d568331bc2bd630fc17631436a9b9c3dbc07a",
+    "crates/swb-broker/src/lib.rs": "3b974fd4156c6ddd03a9a34d3f2d159e58bdcedddb8ccb4fa21532836343e150",
+    "crates/swb-broker/src/service_roundtrip_tests.rs": "c192483ffe811b51bab9895bfee105d7739c1d30c8a6d1a2bbfc707154dc26c6",
     "crates/swb-broker/tests/stamp.rs": "f07fa0a5d40fbb81aa4062354d87f3baf216aa03f66b15520ce0bb6897b117f3",
     "crates/swb-proto/BUILD.bazel": "25fcf691c3b25c02249fba3b5f880672b5da088a5566f9d8b9ab4076ae604e8c",
     "crates/swb-proto/Cargo.toml": "b88b6f22fe6d6f6fc34aff96fa459628085e44cd1841f615dfc77b8925c01471",
-    "crates/swb-proto/src/lib.rs": "c108238d546fa66cf21a5b781bdf4ca79c75609552605ed2890c8f3920c4b267",
-    "crates/swb-store/BUILD.bazel": "e9a2c5ecf35dccb9cd8a7e6762fb4e9f6e411fec12aee6e7bab23dec1f83d178",
+    "crates/swb-proto/src/lib.rs": "5e365a7b59e0fb5cd5252db95d2f3f24d2fb43e3b768852dcd44eb8ead49ca7d",
+    "crates/swb-store/BUILD.bazel": "f40f8fe61af26111872ca5c409dfc9cae57bf8b1fd95b32cfcdfb56940bec704",
     "crates/swb-store/Cargo.toml": "1c7dcf3a8476f2dbb4e6097a623326906753f919d00c8abea9722e25d332c459",
-    "crates/swb-store/src/claims.rs": "d19ef37184e1aac091ef978cd1ac11a7b7514283154af7077f3428ad606c1a89",
-    "crates/swb-store/src/lib.rs": "f05e5baaaf011298e275a8161f5a6d26303415470156a3f4160c6141ca91a7f4",
+    "crates/swb-store/src/claims.rs": "b90b3d0f98a0747156b147c71d45423126ca9bb71f69d3af9f06aef6284f9720",
+    "crates/swb-store/src/lib.rs": "ca68987014bfc1b3ee95219a6656d2c44c089673a8f673a1134105acdd167d90",
+    "crates/swb-store/src/ratelimit.rs": "0a5fa09bb182a8dd017561a23fd7dd78f44436e3790309b228298ca0dfc22032",
     "crates/swb/BUILD.bazel": "0dce5b88a9271cf234e307faeb64cacafa2b3eea865c216b8413b97a2b25fd61",
     "crates/swb/Cargo.toml": "66eeb9a4fb4d22b4735f688bc8dfa359db870b23d744cd7af74895f79b71de35",
-    "crates/swb/src/channel.rs": "c8172d9fae9bcfeb6609220a831f7612de5ca562428c0a313e08552081a76e50",
-    "crates/swb/src/main.rs": "cd1ebe6f8111e58bc3652101698c9d0613bb2d06b5b1e153b5f2ce12a5f72291",
+    "crates/swb/src/channel.rs": "0c3d514a585d96c9b839573e8a773afb97afb1a9b843f7ebd03beab43a3310bd",
+    "crates/swb/src/main.rs": "637cd07296696b3189fc1066e459beca862e4e5c4b6f15eefc615ad827e08f4a",
     "crates/swb/tests/hook_blackhole_test.sh": "7c6372a01c8d0cf5602188ad562ff77788c0dec0a2c9f3e202def88a7fa22ac3",
     "deploy/BUILD.bazel": "414e9a927e0dfb89f8236367db755014ce8b56b815621ee1d0f9da99a1265ac0",
     "platforms/BUILD.bazel": "6d5c7d3dada37113084e621e8065a05e4e58e0c7dd7d206dfd7f0cb3f4507d25",
@@ -37,7 +38,7 @@
     "tools/cc/zig_cc.nix": "f536da29f96dfce255ab24bb75999fbcf93d2196561c9aca5affa4ca7e7ab26d",
     "tools/clippy_test.sh": "1a0c16f7e334bdfae84d8f25dab84cc2dfb45a8adcd95189e0d9662d10559261"
   },
-  "image": "ghcr.io/xoxd-ai/agent-switchboard@sha256:a6303937d593957765cdd593e5efc3dec1208a6471458656e5bbfb4452aae7bc",
+  "image": "ghcr.io/xoxd-ai/agent-switchboard@sha256:05738e97af06f767d7894b1f3e0697b9eece0888527e9937130a4041bff7498e",
   "live_acceptance": false,
   "manifest_size": 4579,
   "platform": {
@@ -52,19 +53,19 @@
     "user": "65532"
   },
   "pr_heads": {
-    "51": "6af07a0e1f989f53400ed7c7b4019b121a1d6dd4"
+    "55": "0c8e28a7fc545f94441b079704b3e9b6bf542841"
   },
-  "publication_receipt": "PUBLISHED 2026-10-27T06:56Z by the release workflow under the signed v0.4.0 tag (tag object 911c5f6afe63393dee59215d72a9ca916c10c159 on c366d119111464679220b713ed1c15460d21bd90): run https://github.com/xoxd-ai/agent-switchboard/actions/runs/40462880065 rebuilt the approved digest, pushed it by digest with no registry tag (06:56:23Z-06:56:28Z) and read it back; release-check --registry-manifest passed (supplied_registry_manifest_matches true); registry readback digest sha256:a6303937d593957765cdd593e5efc3dec1208a6471458656e5bbfb4452aae7bc, 4579 bytes, byte-identical to the approved manifest; evidence artifact release-evidence-v0.4.0 (id 12716335203, zip sha256:751f3d9387e49f349995e54bbb4fd43ac8acb6d4d2bcc4d66838503b24973841, kept 90 days); anonymous readback from sting at 2026-10-27T06:58Z is byte-identical to that manifest; receipt TIN-4655 comment dc057a01; ratified SWB-R64 under TIN-4655 comment 409fb2ce (operator interview 2026-10-27) and R-C435 (TIN-5770 comment d3d90700)",
+  "publication_receipt": "PENDING: v0.5.0 release workflow registry readback; ratified SWB-R71 under TIN-4655 comment 7e292300 (operator interview 2026-10-27) and R-C435 (TIN-5770 comment d3d90700)",
   "qualification": "published-candidate-only",
   "rulings": [
-    "SWB-R64",
-    "SWB-R63",
+    "SWB-R71",
+    "SWB-R66",
     "R-C416",
     "R-C435",
     "R-N13"
   ],
   "schema": "swb.approved-release.v1",
-  "source": "3405bf8687718f1e663d5a8cc856675298b5bdb6",
+  "source": "cfff7913fb6bc6c5aee2974b357d0b75b371326b",
   "source_inputs": [
     ".bazelversion",
     "BUILD.bazel",
@@ -78,5 +79,5 @@
     "platforms/",
     "tools/"
   ],
-  "upstream_main": "c4c4c95f171b059bb0a063958583442a62317783"
+  "upstream_main": "9b128254b4072863355b681f987743c708f014f5"
 }
