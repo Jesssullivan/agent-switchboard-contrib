@@ -70,6 +70,9 @@ launcher pattern that exports `SWB_SESSION_PID` and `SWB_PROC_START`.
 - `swb hook` keeps tokens under `SWB_STATE_DIR/sessions/` (directory 0700,
   files 0600) and the CLI never prints one. Keep `SWB_STATE_DIR` local to
   each host and user: do not share it over NFS or sync it between hosts.
+  From v0.5.0 (unreleased) a session started with `SWB_BIND=1` also keeps
+  its session token under `SWB_STATE_DIR/bindings/` (ADR-0003); the same
+  rule applies.
 - Over MCP, the `register` result carries the token into the caller's
   context. An adapter that ends sessions itself should keep it and strip it
   before the model sees it.

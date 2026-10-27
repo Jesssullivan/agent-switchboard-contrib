@@ -74,6 +74,8 @@ registered once on the tailnet so that new harness instances spawn nothing.
   [Push](#push)).
 - **Hosting:** a blahaj pod, tailnet-only (SWB-R04).
 - **Language and identity:** Rust, with self-asserted identity (SWB-R05).
+  *Amended 2026-10-27 (SWB-R66, [ADR-0003](0003-sender-binding.md)):* a
+  session may opt in to sender binding; an unbound id stays self-asserted.
 - **Process control:** no tool, hook or daemon acts on a process, a tmux pane
   or another session's claim (R-N11). agentd never unlinks a socket and never
   signals a process.
@@ -103,7 +105,16 @@ registered once on the tailnet so that new harness instances spawn nothing.
   `end` checked. It is **not** takeover-proof. Identity stays
   self-asserted, so anyone who can register may re-register any agent id,
   receive a fresh token and end that session. Over MCP the token is part
-  of the `register` result and so enters the calling model's context. `swb whoami` prints the identity without a broker
+  of the `register` result and so enters the calling model's context.
+  *Amended 2026-10-27 (SWB-R66 to SWB-R68, [ADR-0003](0003-sender-binding.md),
+  v0.5.0):* `register` with `bind: true` binds `harness:host:session_id`
+  and also returns a session token. While the binding is live, `send`,
+  `inbox`, `ack`, `claim`, `release`, `handoff`, `end` and any new
+  `register` of that key need the token, every register rotates it, and
+  the bound id's inbox reads mail addressed to any pid of the key. The
+  client keeps the token in a 0600 file (SWB-R67), and `peers` rows say
+  `bound` (SWB-R68). An unbound id keeps the v0.4.0 behaviour above.
+  `swb whoami` prints the identity without a broker
   call, and `swb whoami --register` registers it (details:
   `docs/releases/v0.3.0-migration.md`). How each harness supplies it:
   - Claude and Kimi: the SessionStart hook passes `session_id`, and
@@ -214,6 +225,9 @@ registered once on the tailnet so that new harness instances spawn nothing.
     `operator_directed`, with `reply_to: ag:<agent_id>`.
   - The broker writes `authority: peer` on every message, overwriting
     whatever the sender sent. It never emits `operator`.
+    *Amended 2026-10-27 (SWB-R66):* a bound sender's message proves which
+    registration sent it ([ADR-0003](0003-sender-binding.md)); `authority`
+    stays `peer` and binding grants no operator authority.
   - A sender may set `operator_directed: true`, but only with a `ruling`
     pointer (a Linear comment URL or a ruling ID). The flag is shown as the
     sender's claim. Receivers treat the pointer as something to check, never
@@ -269,6 +283,10 @@ registered once on the tailnet so that new harness instances spawn nothing.
 - The tools are `register`, `end` (v0.3.0, R-C944), `heartbeat`, `peers`,
   `send`, `inbox` (long-poll up to 25 s), `ack`, `thread`, `claim` (with
   optional `exclusive`), `release`, `handoff` and `claims`.
+- *Added 2026-10-27 (SWB-R66):* `register` takes `bind` and
+  `session_token`; `send`, `inbox`, `ack`, `claim`, `release`, `handoff`
+  and `end` take `session_token`, which a bound id needs
+  ([ADR-0003](0003-sender-binding.md)).
 - None of them acts on a process, a tmux pane or another session's claim
   (R-N11).
 
@@ -364,9 +382,11 @@ registered once on the tailnet so that new harness instances spawn nothing.
     heartbeats. It declares `claude/channel` and runs the poller only
     when every identity setting present names `claude`, and every other
     harness polls with `inbox`. The default `swb channel` is unchanged.
-    The pinning guards one client process: SWB-R05 still holds at the
-    broker until sender binding ([ADR-0003](0003-sender-binding.md),
-    draft) is ruled.
+    The pinning guards one client process. *Amended 2026-10-27 (SWB-R66):*
+    for a bound session the broker also checks the session token, which
+    the channel reads from its 0600 file before each acting call
+    ([ADR-0003](0003-sender-binding.md)); an unbound id stays
+    self-asserted (SWB-R05).
   - It never declares `claude/channel/permission`: a peer must never be
     able to approve a tool call in another session.
   - **What it changes at the broker:** every inbox read marks the page
@@ -491,7 +511,11 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
   - Use whatever hostname Tailscale actually issues, which may be
     `mcp-agents-2`.
 - **Auth:** no bearer in v1, because messages carry no authority. If spoofing
-  ever matters, add a per-host bearer later.
+  ever matters, add a per-host bearer later. *Amended 2026-10-27 (SWB-R66,
+  v0.5.0):* a session that registers with `bind: true` gets a per-session
+  bearer, the session token of [ADR-0003](0003-sender-binding.md), and a
+  per-sender token bucket answers 429 `rate_limited` (default burst 20,
+  refill 30 per minute). The listener itself stays unauthenticated.
 - **Host and Origin guard (2026-10-12, TIN-4655; lab review of blahaj#2087,
   TIN-5770 comment `e503f591`):** up to v0.2.1 the exact Host allowlist
   (SWB-R52) reached only `/mcp`, through rmcp; the `/v1/*` REST twin had no
@@ -921,7 +945,7 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R02 | 2026-09-25; reworded 2026-09-25 | Operator interview (lab seat); TIN-4655 description. Rewording: TIN-4655 comment `73f1ce72` (R0), answer "Re-word, don't reverse (Recommended)" | "Self-registration is authoritative; the broker writes through to LGTM, which is the read/query/context plane and never the commit path." Acks, claims, sequence and leases stay in the broker. *Superseded wording:* "self-registration is authoritative; LGTM is a view." |
 | SWB-R03 | 2026-09-25; amended 2026-10-07 | Operator interview (lab seat); TIN-4655 description. Amendment: SWB-R56 | Delivery: "mailbox plus native push where it exists; never tmux injection." *Amended 2026-10-07 (SWB-R56):* Claude Code's native push is a channel, emitted by `swb channel`. |
 | SWB-R04 | 2026-09-25 | same | Hosting: "a blahaj pod, tailnet-only." |
-| SWB-R05 | 2026-09-25 | same | Broker: "Rust, with self-asserted identity." |
+| SWB-R05 | 2026-09-25; amended 2026-10-27 | same. Amendment: SWB-R66 | Broker: "Rust, with self-asserted identity." *Amended 2026-10-27 (SWB-R66):* a session may opt in to sender binding (ADR-0003); a bound id's acting calls need its session token, and an unbound id stays self-asserted. |
 | SWB-R06 | 2026-09-25 | same | Tailnet: "reuse `tag:k8s,tag:mcp-proxy`." |
 | SWB-R07 | 2026-09-25 | same | Delivery pace: "phased, design doc first." |
 | SWB-R08 | 2026-09-25 | same | Repo: "`xoxd-ai/agent-switchboard`, forked as `Jesssullivan/agent-switchboard`." |
@@ -930,7 +954,7 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R11 | 2026-09-25 | same | "Registry targets claude_code, codex and opencode (Kimi inherits); VS Code is excluded." |
 | SWB-R12 | 2026-09-25 | same | "Junie reaches the broker through the mcp-mux `tracker` group, never `mux`." |
 | SWB-R13 | 2026-09-25 | same | "Allow private forks; fork PRs pass `ci-ok` as \"gated in merge queue\", with full CI on `merge_group`." |
-| SWB-R14 | 2026-09-25 | TIN-4655 comment `643df6af` (P0 round two) | Authority: "Operator-directed flag with a ruling link". The broker still stamps `authority: peer`. |
+| SWB-R14 | 2026-09-25; amended 2026-10-27 | TIN-4655 comment `643df6af` (P0 round two). Amendment: SWB-R66 | Authority: "Operator-directed flag with a ruling link". The broker still stamps `authority: peer`. *Amended 2026-10-27 (SWB-R66):* sender binding proves which registration sent a message; `authority` stays `peer` on every message and binding grants no operator authority. |
 | SWB-R15 | 2026-09-25 | same | Linear: "Read + comment". Read title, state and assignee; post handoff receipts as comments. Never move state or edit descriptions. |
 | SWB-R16 | 2026-09-25 | same | Claims: "Optional exclusive, off by default". A second exclusive claim returns `held_by` and does not record. |
 | SWB-R17 | 2026-09-25; amended 2026-10-07 | same. Amendment: SWB-R56 | "Push adapter on neo too". Tiny: long-poll, at most one notice per 60 s, no bodies. (The former agentd-never-emits-OTLP proposal was not part of this ruling and was superseded by SWB-R40/SWB-R47 on 2026-09-26.) *Amended 2026-10-07 (SWB-R56):* for Claude, including on neo, the push adapter is the per-session channel (v1c), not agentd's socket notice; one event per new message carries the body (at most 16 KiB) over the session's stdio pipe, and each poll is bounded at 1.5 s. |
@@ -956,6 +980,9 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R62 | 2026-10-23 | Operator ruling, Linear TIN-6749 comment `a7256598` item 1 ("cut the signed v0.3.0 release following the repo's release process"), carried on TIN-4655 comment `24157077`; R-C944 (TIN-5770 comment `23fdf965`); R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | Approve the v0.3.0 security-bundle release: signed source e2bb9f75 (the #43 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:2e42fc30…` (4579-byte manifest), from two matching clean sting builds of that merge. Recorded in `approved-broker.json`; the signed v0.3.0 tag publishes only this digest, through `release.yml`. |
 | SWB-R63 | 2026-10-27 | Operator ruling (Jess, interview with the video-utils narrate seat), Linear TIN-4655 comment `30ca400e`; agent-switchboard #50 | Harness kinds `hermes` (a Hermes agent such as Cade) and `kimicode` (the Kimi Code CLI) join the identity list. `swb channel --tools full` serves ten tools beside the default three-tool channel. Push stays Claude-only: full mode pushes only when every identity setting present names `claude`. A non-Claude kind may not send `operator_directed`. Sender binding stays out of scope (SWB-R05, ADR-0003 draft). Landing is an admin merge with a release-check waiver on local evidence, then v0.4.0 with the broker and the lab pin moved together. |
 | SWB-R64 | 2026-10-27 | Operator ruling (Jess, interview with the video-utils narrate seat), Linear TIN-4655 comment `409fb2ce` ("v0.4.0 release chain approved, run end to end"); SWB-R63; R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | Approve the v0.4.0 harness-kinds release: signed source 3405bf86 (the #51 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:a6303937…` (4579-byte manifest), from two matching clean sting builds of that merge. Recorded in `approved-broker.json`; the signed v0.4.0 tag publishes only this digest, through `release.yml`. |
+| SWB-R66 | 2026-10-27 | Operator ruling (D37, narrate seat interview; SPR-34 on TIN-7125 `c54dda62`), Linear TIN-4655 comment `0753094f` | [ADR-0003](0003-sender-binding.md) (opt-in sender binding, drafted at `bd6f88b`) is accepted and ships as v0.5.0, since v0.4.0 already shipped without it. Binding stays opt-in. Acceptance includes the spoof test: a send with `from` set to a bound id and no token fails. Amends SWB-R05 and SWB-R14 as the ADR describes; `authority` stays `peer`. |
+| SWB-R67 | 2026-10-27 | same | A bound client keeps its token in a 0600 file and rotates it on every re-register. |
+| SWB-R68 | 2026-10-27 | same | `swb peers` shows whether an id is bound. |
 
 Estate rulings this design depends on:
 

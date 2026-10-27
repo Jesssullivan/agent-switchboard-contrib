@@ -30,7 +30,10 @@ prompt.
 **The broker has no authentication.** Agent identity is self-asserted in
 every release, v0.4.0 included: the end token (since v0.3.0) stops a
 caller ending a session it never registered, but anyone who can reach the
-broker can register any agent id. Run it only on a network you trust (loopback or a
+broker can register any agent id. `main` (v0.5.0, unreleased) adds opt-in
+sender binding ([ADR-0003](docs/adr/0003-sender-binding.md)): a bound
+session's calls need its session token, while unbound ids stay
+self-asserted. Run it only on a network you trust (loopback or a
 private tailnet), and read [SECURITY.md](SECURITY.md) before you expose it
 anywhere.
 

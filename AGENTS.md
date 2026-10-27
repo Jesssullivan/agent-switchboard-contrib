@@ -22,7 +22,10 @@ Linear: TIN-4655.
 
 **Read first:** [ADR-0001](docs/adr/0001-agent-switchboard.md), the broker
 design. Its Rulings table holds `SWB-R01`..`SWB-R23`, the source/release
-rulings `SWB-R49`..`SWB-R55` the Claude channel ruling `SWB-R56` the v0.2.0 release `SWB-R57`, the v0.2.1 hermetic release `SWB-R58` and the v0.2.2 Host-guard release `SWB-R59`, the claims rulings `SWB-R60` and `SWB-R61`, the v0.3.0 release `SWB-R62`, the harness-kinds ruling `SWB-R63`, the v0.4.0 release `SWB-R64`; `SWB-R24` is recorded under its History.
+rulings `SWB-R49`..`SWB-R55` the Claude channel ruling `SWB-R56` the v0.2.0 release `SWB-R57`, the v0.2.1 hermetic release `SWB-R58` and the v0.2.2 Host-guard release `SWB-R59`, the claims rulings `SWB-R60` and `SWB-R61`, the v0.3.0 release `SWB-R62`, the harness-kinds ruling `SWB-R63`, the v0.4.0 release `SWB-R64`, and the sender-binding rulings `SWB-R66` to `SWB-R68`; `SWB-R24` is recorded under its History.
+
+**Read third:** [ADR-0003](docs/adr/0003-sender-binding.md), opt-in sender
+binding (accepted under SWB-R66, ships as v0.5.0).
 
 **Read second:** [ADR-0002](docs/adr/0002-lgtm-plane.md), the LGTM plane and
 the phase order. Its Rulings table holds `SWB-R25`..`SWB-R48`.
@@ -140,6 +143,11 @@ the full text. ADR-0002 carries the phase scope and host order
 - The broker stamps `authority: peer` on every message and never emits
   `operator`. `operator_directed` is the sender's claim and needs a `ruling`
   pointer, which receivers check before acting (SWB-R14).
+- Sender binding is opt-in (SWB-R66). For a bound id, `send`, `inbox`,
+  `ack`, `claim`, `release`, `handoff`, `end` and a new `register` of its
+  key need the session token, and every register rotates it (SWB-R67). An
+  unbound id stays self-asserted (SWB-R05). Binding never changes
+  `authority`, which stays `peer`.
 - SWB-R02, verbatim: "Self-registration is authoritative; the broker writes
   through to LGTM, which is the read/query/context plane and never the
   commit path." Acks, claims, sequence and leases stay in the broker.

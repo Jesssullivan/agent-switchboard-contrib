@@ -13,6 +13,61 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
+Planned as v0.5.0 (SWB-R66, TIN-4655 comment `0753094f`). The workspace
+version stays 0.4.0 until the release bump; nothing here is tagged or
+released.
+
+### Upgrade notes
+
+- **Upgrade the broker and every client together** to use binding. A
+  v0.4.0 broker ignores `bind`, so a v0.5.0 client against it stays
+  unbound. A v0.4.0 client works against a v0.5.0 broker for unbound ids
+  only.
+- Unbound ids keep the v0.4.0 behaviour, apart from the send rate limit.
+- The store gains `sessions.bound` and `messages.recipient_key` in place
+  at startup, and fills the key for existing messages.
+- `register` results gain `bound`, and `peers` rows gain `bound`. A
+  client that rejects unknown fields needs updating.
+
+### Added
+
+- Opt-in sender binding ([ADR-0003](docs/adr/0003-sender-binding.md),
+  SWB-R66). `register` with `bind: true` binds the session's
+  `harness:host:session_id` and returns a `session_token`. While the
+  binding is live, `send` (by `from`), `inbox`, `ack`, `claim`, `release`,
+  `handoff` and `end` (by `me`) need the token or answer 401
+  `unauthorized`, so a spoofed send from a bound id fails. A new
+  `register` of the key needs the current token and rotates it. Only the
+  binding's own agent id may act. A binding lapses when its session ends
+  or after 6 hours without a call.
+- Stable delivery for bound service ids: `inbox` and `ack` for a bound id
+  read mail addressed to any pid of its key, so a restart keeps unread
+  mail (SWB-R66).
+- Per-sender send rate limit: a token bucket per sender answers 429
+  `rate_limited`. Defaults are a burst of 20 and a refill of 30 per
+  minute, set with `SWB_SEND_BURST` and `SWB_SEND_REFILL_PER_MINUTE` on
+  `swb serve`; `SWB_SEND_BURST=0` turns it off.
+- `SWB_BIND=1`: `swb whoami --register` and `swb hook` ask for a binding.
+  The client keeps the session token in
+  `$SWB_STATE_DIR/bindings/<harness>:<host>:<session_id>.token` (directory
+  0700, file 0600), presents it on every register and saves the rotated
+  one (SWB-R67). `swb send`, `ack`, `inbox`, `claim`, `release`,
+  `handoff`, SessionEnd and `swb channel` send it. `whoami --register`
+  prints `session_token_file`, never the token.
+- `peers` rows carry `bound` (SWB-R68).
+- `swb channel` reads `SWB_STATE_DIR`, `XDG_STATE_HOME` and `HOME` to find
+  the session token file.
+
+### Changed
+
+- SWB-R05 and SWB-R14 are amended in ADR-0001: a bound id is no longer
+  self-asserted, and `authority` stays `peer` on every message.
+- MCP tool schemas: `register` takes `bind` and `session_token`; `send`,
+  `inbox`, `ack`, `claim`, `release`, `handoff` and `end` take
+  `session_token`.
+- `SECURITY.md` names v0.4.0 as the current release and describes binding
+  and its residuals.
+
 ## [0.4.0] - 2026-10-27
 
 Release record SWB-R64. Source `3405bf86` (the #51 merge), image

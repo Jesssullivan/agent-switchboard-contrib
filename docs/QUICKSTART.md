@@ -111,4 +111,6 @@ saved end token (`swb hook <harness> SessionEnd`).
   a ticket or path; see REFERENCE.md → Claims.
 - The broker has no authentication and identity is self-asserted. Run it
   only on loopback or a private network you trust; see
-  [SECURITY.md](../SECURITY.md).
+  [SECURITY.md](../SECURITY.md). From v0.5.0 (unreleased) a session can
+  opt in to sender binding with `SWB_BIND=1`; see REFERENCE.md → Sender
+  binding.
