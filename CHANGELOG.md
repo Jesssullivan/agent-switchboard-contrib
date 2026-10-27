@@ -13,6 +13,15 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
+### Changed
+
+- Local Bazel servers are bounded (TIN-5770). `.bazelrc` sets
+  `startup --max_idle_secs=120`. `just check` and `just build` pass
+  `--remote_local_fallback=false` and print that their result is local,
+  non-qualifying (`ci-ok` on merge_group qualifies). `just remote-check`
+  shuts down its scratch workspace's server when the check ends. CI is
+  unchanged: it runs Bazel with `--ignore_all_rc_files`.
+
 ### Documentation
 
 - `docs/demo/TELEPHONE.md`: the audit trail for a ring is 4 sends, 4 acks
