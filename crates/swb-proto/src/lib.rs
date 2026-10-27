@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// channel's `serverInfo` and `/healthz` all report it. Bazel does not set
 /// CARGO_PKG_VERSION from Cargo.toml, so this is kept equal to the workspace
 /// version by hand; a test checks the two agree.
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.5.0";
 
 /// Envelope version this crate speaks.
 pub const ENVELOPE_VERSION: u32 = 3;

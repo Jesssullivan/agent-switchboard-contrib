@@ -13,9 +13,12 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
-Planned as v0.5.0 (SWB-R66, TIN-4655 comment `0753094f`). The workspace
-version stays 0.4.0 until the release bump; nothing here is tagged or
-released.
+## [0.5.0] - unreleased
+
+Not yet released. The workspace version is 0.5.0 (SWB-R66, TIN-4655
+comment `0753094f`; release chain SWB-R71, comment `7e292300`). As for
+v0.4.0, the release record, its date and the approved image digest follow
+two clean builds of the merge that carries this version.
 
 ### Upgrade notes
 
