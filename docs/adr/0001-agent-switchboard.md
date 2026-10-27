@@ -699,6 +699,21 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
   breaks the v0.2 wire format, so broker and clients upgrade together
   ([migration notes](../releases/v0.3.0-migration.md)). SWB-R59 v0.2.2 stays
   published; this record authorizes no other image.
+- **SWB-R64 harness-kinds release, v0.4.0 (2026-10-27):** the `hermes` and
+  `kimicode` harness kinds, text hook output and `swb channel --tools full`
+  (#50, SWB-R63), with the workspace at 0.4.0 (#51). The operator ruled the
+  release chain on TIN-4655 (comment `409fb2ce`: "v0.4.0 release chain
+  approved, run end to end"); R-C435 pre-authorizes a digest that two clean
+  builds of the merge reproduce. The two clean builds ran on sting, linux
+  x86_64 on the pinned Nix toolchain (R-C416). The approved source is
+  `3405bf8687718f1e663d5a8cc856675298b5bdb6` (the #51 merge, the last change
+  to a protected input) at
+  `sha256:a6303937d593957765cdd593e5efc3dec1208a6471458656e5bbfb4452aae7bc`,
+  published through the release workflow under the signed `v0.4.0` tag.
+  The source is a GitHub merge commit signed by `B5690EEEBB952194`. A v0.3.0
+  broker or client refuses the new kinds, so the live broker and the lab pin
+  move to v0.4.0 together (SWB-R63). SWB-R62 v0.3.0 stays published; this
+  record authorizes no other image.
 - **SWB-R54 state custody (2026-09-27):** TIN-5105 is blahaj-operator-owned
   dedicated OpenTofu state commissioning. Backend, separate identity/carrier,
   backup, lock contention/release and scratch restore receipts must precede
@@ -940,6 +955,7 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R61 | 2026-10-19 | R-C655 (standing delegated choice, Linear TIN-5770 comment `be5a4566`), recorded on TIN-4655 comment `18c7bd1c`; review of PR #40 (SHOULD 2); lane TIN-6690 | Claim cases SWB-R60 leaves open: a session holds at most one active claim per subject, and a repeat request by its holder updates that claim in place (same claim id, the later expiry); an exclusive request over the caller's own advisory claim, with no other session holding one, makes it exclusive and is `recorded`; an advisory request by the exclusive holder is recorded and never drops exclusivity. R-C950 (1) applies to handoffs as written: an acceptance that would be exclusive is refused while another session holds an active claim, and the offer stays open. |
 | SWB-R62 | 2026-10-23 | Operator ruling, Linear TIN-6749 comment `a7256598` item 1 ("cut the signed v0.3.0 release following the repo's release process"), carried on TIN-4655 comment `24157077`; R-C944 (TIN-5770 comment `23fdf965`); R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | Approve the v0.3.0 security-bundle release: signed source e2bb9f75 (the #43 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:2e42fc30…` (4579-byte manifest), from two matching clean sting builds of that merge. Recorded in `approved-broker.json`; the signed v0.3.0 tag publishes only this digest, through `release.yml`. |
 | SWB-R63 | 2026-10-27 | Operator ruling (Jess, interview with the video-utils narrate seat), Linear TIN-4655 comment `30ca400e`; agent-switchboard #50 | Harness kinds `hermes` (a Hermes agent such as Cade) and `kimicode` (the Kimi Code CLI) join the identity list. `swb channel --tools full` serves ten tools beside the default three-tool channel. Push stays Claude-only: full mode pushes only when every identity setting present names `claude`. A non-Claude kind may not send `operator_directed`. Sender binding stays out of scope (SWB-R05, ADR-0003 draft). Landing is an admin merge with a release-check waiver on local evidence, then v0.4.0 with the broker and the lab pin moved together. |
+| SWB-R64 | 2026-10-27 | Operator ruling (Jess, interview with the video-utils narrate seat), Linear TIN-4655 comment `409fb2ce` ("v0.4.0 release chain approved, run end to end"); SWB-R63; R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | Approve the v0.4.0 harness-kinds release: signed source 3405bf86 (the #51 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:a6303937…` (4579-byte manifest), from two matching clean sting builds of that merge. Recorded in `approved-broker.json`; the signed v0.4.0 tag publishes only this digest, through `release.yml`. |
 
 Estate rulings this design depends on:
 
