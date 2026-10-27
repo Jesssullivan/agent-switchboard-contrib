@@ -21,6 +21,23 @@ Identity is self-asserted: the end token stops a caller ending a session it
 did not register, but anyone who can register can re-register any agent id
 (see [SECURITY.md](../SECURITY.md)).
 
+### Harness kinds
+
+The store, the broker's `register` schema, the envelope schema and the CLI
+read one list (`swb_store::HARNESS_KINDS`). A broker and its clients must
+know the same kinds: an older client refuses an agent id with a newer kind.
+
+| Kind | Harness |
+| --- | --- |
+| `claude` | Claude Code |
+| `kimi` | Claude Code on a Kimi model |
+| `codex` | Codex |
+| `junie` | Junie |
+| `opencode` | OpenCode |
+| `pi` | Pi |
+| `hermes` | a Hermes agent |
+| `kimicode` | the Kimi Code CLI |
+
 ## Settings
 
 | Variable | Read by | Default | Notes |
@@ -34,7 +51,8 @@ did not register, but anyone who can register can re-register any agent id
 | `SWB_HOST` | `hook`, `whoami`, `doctor` | none | host part of the agent id |
 | `SWB_SESSION_PID` | `hook`, `whoami`, `doctor` | none | nonzero integer |
 | `SWB_PROC_START` | `hook`, `whoami`, `doctor`, `channel` | none | process start stamp; `channel` filters its own row on it. `/v1/end` checks the end token, not this (v0.3.0) |
-| `SWB_HARNESS` | `hook`, `whoami`, `doctor` | hook: its argument | `claude`, `kimi`, `codex`, `junie`, `opencode` or `pi` |
+| `SWB_HARNESS` | `hook`, `whoami`, `doctor`, `channel` | hook: its argument | `claude`, `kimi`, `codex`, `junie`, `opencode`, `pi`, `hermes` or `kimicode` (see [Harness kinds](#harness-kinds)). `channel --tools full` pushes only when it is `claude` |
+| `SWB_HOOK_FORMAT` | `hook` | JSON | `text` prints the UserPromptSubmit notice as plain text for a harness that adds a hook's stdout to its context. Any other value keeps the Claude Code `hookSpecificOutput` JSON |
 | `SWB_STATE_DIR` | `hook`, `whoami --register`, `doctor --register` | `$XDG_STATE_HOME/swb`, then `$HOME/.local/state/swb` | where end tokens are kept (`sessions/<agent_id>.token`, dir 0700, file 0600); files not rewritten for 7 days are pruned |
 | `SWB_SESSION_ID` | `whoami`, `doctor` | none | hooks read `session_id` from stdin instead |
 | `SWB_AGENT_ID` | `inbox`, `send`, `ack`, `heartbeat`, `thread`, `claim`, `release`, `handoff`, `claims --mine`, `doctor`, `channel` | none | `harness:host:pid:session_id`, as `register` returned it; `channel` falls back to the launcher identity |
@@ -166,7 +184,7 @@ makes no broker call), `inbox`,
 `handoff <claim_id> <to> [--note TEXT]`,
 `claims [--subject S] [--holder ID] [--all] [--mine] [--limit N]`,
 `doctor [--register]`,
-`channel` and `version`.
+`channel [--tools channel|full]` and `version`.
 
 - `--help`, `-h`, `help` and `<verb> --help` print usage on stdout and exit
   0; `--version`, `-V` and `version` exit 0. An unknown verb exits 2.
@@ -200,12 +218,35 @@ shows a confirmation at startup. Events arrive as
 Answer with the `reply` tool or acknowledge with `ack`; the channel never
 acknowledges on its own.
 
+### Full tool set
+
+`swb channel --tools full` serves `reply`, `ack` and `inbox` plus `send`,
+`peers`, `thread`, `claim`, `release`, `handoff` and `claims`, for a harness
+whose MCP client has no other switchboard client (TIN-4655). Every tool acts
+as the one session the channel resolved, by the same rules as above:
+
+- no tool schema has a `from` or `me` field, because the channel fills them in;
+- a call whose `from` or `me` names another agent id is refused with
+  `identity_override_denied` before any broker request;
+- `send` refuses `operator_directed` and `ruling` with
+  `operator_directed_denied`;
+- `peers` and `claims` stay passive listings unless the caller passes its
+  own `me` or `claims` passes `mine`.
+
+The `claude/channel` capability and its push stay Claude-only. With
+`--tools full` the channel declares them, and polls, only when `SWB_HARNESS`
+(or the kind in `SWB_AGENT_ID`) is `claude`. Every other harness reads its
+mail with the `inbox` tool. The pinning guards this one process. The broker
+still trusts a self-asserted sender, so another client can still send as
+any id (SWB-R05).
+
 ## Notices
 
 On UserPromptSubmit, `swb hook <harness> UserPromptSubmit` adds a short
 notice to the session's context when it has unread mail. The notice names the
 receiver's agent id, the sender and ticket, and the exact `swb inbox` and
-`swb ack` commands.
+`swb ack` commands. Claude Code reads it from the `hookSpecificOutput` JSON;
+with `SWB_HOOK_FORMAT=text` the hook prints the same notice as plain text.
 
 ## Known gaps
 

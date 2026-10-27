@@ -31,7 +31,7 @@ use rmcp::{
 use serde_json::{Value, json};
 use std::{collections::HashMap, future::Future, io, sync::Arc, time::Duration};
 use swb_proto::{Authority, VERSION};
-use swb_store::{ClaimsQuery, ErrorKind, PeersQuery, Store, StoreError};
+use swb_store::{ClaimsQuery, ErrorKind, HARNESS_KINDS, PeersQuery, Store, StoreError};
 
 pub const HOOK_TIMEOUT_MS: u64 = 2_000;
 /// Production retention interval. The store no longer prunes inside `send`
@@ -290,31 +290,38 @@ fn status_of(kind: ErrorKind) -> StatusCode {
     }
 }
 
-const AGENT_ID: &str = "Agent id <harness>:<host>:<pid>:<session_id>; harness is one of claude, kimi, codex, junie, opencode, pi; the other parts use [A-Za-z0-9._-]; at most 512 bytes";
+/// The agent id field description, naming every kind in [`HARNESS_KINDS`].
+fn agent_id_desc() -> String {
+    format!(
+        "Agent id <harness>:<host>:<pid>:<session_id>; harness is one of {}; the other parts use [A-Za-z0-9._-]; at most 512 bytes",
+        HARNESS_KINDS.join(", ")
+    )
+}
 const ULID_DESC: &str = "Canonical 26-character Crockford base32 ULID";
 const SUBJECT_DESC: &str = "What is claimed: a ticket (TIN-4655), a path (lab:nix/hosts/sting.nix) or another token in [A-Za-z0-9._:/#@+-], at most 256 bytes";
 
 fn tools() -> Vec<Tool> {
+    let agent_id = agent_id_desc();
     [
         ("register", "Register (or re-register) a self-asserted agent session. Returns agent_id, lease_seconds and end_token. Every register mints a new end_token and invalidates earlier ones. Over MCP the token is part of this result and so enters the caller's context; an adapter that ends sessions itself should keep it and strip it before the model sees it. Never repeat it.", json!({"type":"object","required":["harness","host","pid","session_id","proc_start"],"properties":{
-            "harness":{"type":"string","enum":["claude","kimi","codex","junie","opencode","pi"],"description":"The harness kind"},
+            "harness":{"type":"string","enum":HARNESS_KINDS,"description":"The harness kind"},
             "host":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"Short host name"},
             "pid":{"type":"integer","minimum":1,"description":"The harness launcher's process id"},
             "session_id":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"The harness's own session id"},
             "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Opaque process start stamp. peers never returns it; a caller may filter peers on its own."}}})),
         ("end", "End this session. Needs the end_token its latest register returned; any other token answers state unknown and ends nothing.", json!({"type":"object","required":["me","end_token"],"properties":{
-            "me":{"type":"string","description":AGENT_ID},
+            "me":{"type":"string","description":agent_id},
             "end_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The end_token register returned"}}})),
         ("peers", "List sessions: live only by default, one row per harness, host and session id (latest registration wins), paginated. A registered me also renews that caller's own lease; omitting me is passive discovery.", json!({"type":"object","properties":{
-            "me":{"type":"string","description":format!("{AGENT_ID}. Optional; renews only this caller's lease")},
+            "me":{"type":"string","description":format!("{agent_id}. Optional; renews only this caller's lease")},
             "all":{"type":"boolean","description":"Include idle, gone and ended sessions (default false: live only)"},
             "host":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"Only sessions on this host"},
             "limit":{"type":"integer","minimum":1,"maximum":200,"description":"Page size, default 50, at most 200"},
             "cursor":{"type":"string","description":"next_cursor from the previous page"},
             "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Only sessions whose latest registration used this proc_start (the caller's own stamp; rows never show it)"}}})),
         ("send", "Send a peer-authority message. The broker stamps authority peer whatever the sender claims.", json!({"type":"object","required":["from","to","ticket","body"],"properties":{
-            "from":{"type":"string","description":format!("Sender. {AGENT_ID}")},
-            "to":{"type":"string","description":format!("Recipient. {AGENT_ID}")},
+            "from":{"type":"string","description":format!("Sender. {agent_id}")},
+            "to":{"type":"string","description":format!("Recipient. {agent_id}")},
             "ticket":{"type":"string","pattern":"^(TIN-[0-9]+|none)$","maxLength":64,"description":"TIN-<digits> or none"},
             "body":{"type":"string","maxLength":16384,"description":"Message text, at most 16 KiB; control characters are removed"},
             "msg_id":{"type":"string","description":format!("{ULID_DESC}. Optional idempotency key; a retry with the same sender and body returns the stored envelope")},
@@ -327,38 +334,38 @@ fn tools() -> Vec<Tool> {
             "artifacts":{"type":"array","maxItems":20,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":2048},"description":"Up to 20 artifact references"},
             "ttl_hours":{"type":"integer","minimum":1,"maximum":336,"description":"Message lifetime, default 72 h, clamped to 1..336"}}})),
         ("inbox", "Fetch this caller's unacknowledged messages, oldest first. Each fetch counts a delivery and renews the caller's lease.", json!({"type":"object","required":["me"],"properties":{
-            "me":{"type":"string","description":AGENT_ID},
+            "me":{"type":"string","description":agent_id},
             "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Page size, default 20, at most 100"},
             "wait_seconds":{"type":"integer","minimum":0,"maximum":25,"description":"Long-poll up to this many seconds when the mailbox is empty (default 0)"}}})),
         ("ack", "Acknowledge a received message so it is not delivered again.", json!({"type":"object","required":["me","msg_id"],"properties":{
-            "me":{"type":"string","description":AGENT_ID},
+            "me":{"type":"string","description":agent_id},
             "msg_id":{"type":"string","description":ULID_DESC}}})),
         ("heartbeat", "Renew this session's lease without reading or sending anything.", json!({"type":"object","required":["me"],"properties":{
-            "me":{"type":"string","description":AGENT_ID}}})),
+            "me":{"type":"string","description":agent_id}}})),
         ("thread", "Read one thread's messages that this session sent or received, in seq order. Changes no delivery state; renews the caller's lease.", json!({"type":"object","required":["me","thread_id"],"properties":{
-            "me":{"type":"string","description":AGENT_ID},
+            "me":{"type":"string","description":agent_id},
             "thread_id":{"type":"string","description":ULID_DESC},
             "after_seq":{"type":"integer","minimum":0,"description":"Only messages after this seq; pass next_after_seq from the previous page"},
             "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Page size, default 20, at most 100"}}})),
         ("claim", "Claim a subject. Advisory: a non-exclusive claim is always recorded and lists every other holder in overlaps. An exclusive claim is refused (outcome refused, held_by lists the holders, nothing recorded) while another session holds any active claim on the subject; repeating your own exclusive claim renews it (same claim_id, later expiry). With handoff_id, accept a handoff offered to you. Ending your session releases your claims.", json!({"type":"object","required":["me"],"properties":{
-            "me":{"type":"string","description":AGENT_ID},
+            "me":{"type":"string","description":agent_id},
             "subject":{"type":"string","pattern":"^[A-Za-z0-9._:/#@+-]{1,256}$","description":format!("{SUBJECT_DESC}. Required unless handoff_id is given")},
             "exclusive":{"type":"boolean","description":"Ask for exclusive use (default false)"},
             "lease_hours":{"type":"integer","minimum":1,"maximum":24,"description":"Claim lease, default 4 h, clamped to 1..24"},
             "note":{"type":"string","maxLength":512,"description":"Short note shown in claims; no control characters. Never put a secret here"},
             "handoff_id":{"type":"string","description":format!("{ULID_DESC} of a handoff offered to you; accepting it moves the claim to you")}}})),
         ("release", "Release one of your own claims. Releasing it again changes nothing. Another session's claim answers claim_unavailable.", json!({"type":"object","required":["me","claim_id"],"properties":{
-            "me":{"type":"string","description":AGENT_ID},
+            "me":{"type":"string","description":agent_id},
             "claim_id":{"type":"string","description":ULID_DESC}}})),
         ("handoff", "Offer one of your active claims to another session. Creates a receipt in offered; the claim moves only when the receiver calls claim with the handoff_id.", json!({"type":"object","required":["me","claim_id","to"],"properties":{
-            "me":{"type":"string","description":AGENT_ID},
+            "me":{"type":"string","description":agent_id},
             "claim_id":{"type":"string","description":format!("{ULID_DESC} of your active claim")},
-            "to":{"type":"string","description":format!("Receiver. {AGENT_ID}")},
+            "to":{"type":"string","description":format!("Receiver. {agent_id}")},
             "note":{"type":"string","maxLength":512,"description":"Short note for the receiver; no control characters. Never put a secret here"}}})),
         ("claims", "List claims: active ones by default, each marked orphaned while its holder is gone. With me, also lists the handoffs offered to or by you and renews your lease.", json!({"type":"object","properties":{
-            "me":{"type":"string","description":format!("{AGENT_ID}. Optional; renews only this caller's lease and adds its open handoffs")},
+            "me":{"type":"string","description":format!("{agent_id}. Optional; renews only this caller's lease and adds its open handoffs")},
             "subject":{"type":"string","pattern":"^[A-Za-z0-9._:/#@+-]{1,256}$","description":format!("Only claims on this subject. {SUBJECT_DESC}")},
-            "holder":{"type":"string","description":format!("Only claims this session holds. {AGENT_ID}")},
+            "holder":{"type":"string","description":format!("Only claims this session holds. {agent_id}")},
             "all":{"type":"boolean","description":"Include released, handed-off and expired claims still retained (default false)"},
             "limit":{"type":"integer","minimum":1,"maximum":500,"description":"Page size, default 100, at most 500"}}})),
     ].into_iter().map(|(name,description,schema)| Tool::new(name,description,Arc::new(schema.as_object().expect("static object schema").clone()))).collect()
@@ -1588,6 +1595,56 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn harness_kinds_come_from_the_one_store_constant() {
+        let register = tools().into_iter().find(|t| t.name == "register").unwrap();
+        assert_eq!(
+            register.input_schema["properties"]["harness"]["enum"],
+            json!(HARNESS_KINDS)
+        );
+        for kind in ["hermes", "kimicode", "kimi", "claude"] {
+            assert!(HARNESS_KINDS.contains(&kind), "{kind}");
+        }
+        // Every agent id description names every kind.
+        for tool in tools() {
+            for (key, schema) in tool.input_schema["properties"].as_object().unwrap() {
+                let text = schema["description"].as_str().unwrap_or("");
+                if text.contains("<harness>") {
+                    for kind in HARNESS_KINDS {
+                        assert!(text.contains(kind), "{}.{key} misses {kind}", tool.name);
+                    }
+                }
+            }
+        }
+        // The envelope schema's agent id pattern names exactly these kinds.
+        let schema: Value = serde_json::from_str(swb_proto::ENVELOPE_V3_SCHEMA).unwrap();
+        let pattern = schema.to_string();
+        let expected = format!("^({}):", HARNESS_KINDS.join("|"));
+        assert!(
+            pattern.contains(&expected),
+            "{expected} not in the envelope schema"
+        );
+    }
+
+    #[test]
+    fn register_operation_round_trips_each_harness_kind() {
+        let store = Store::memory().unwrap();
+        for (pid, kind) in (1u64..).zip(HARNESS_KINDS) {
+            let args = json!({"harness":kind,"host":"host-a","pid":pid,
+                "session_id":"s-1","proc_start":"start-1"});
+            let row = operation(&store, "register", &args).unwrap();
+            assert_eq!(row["agent_id"], format!("{kind}:host-a:{pid}:s-1"));
+        }
+        let refused = operation(
+            &store,
+            "register",
+            &json!({"harness":"kimi-code","host":"host-a","pid":9,
+                "session_id":"s-1","proc_start":"start-1"}),
+        )
+        .unwrap_err();
+        assert_eq!(refused.message, "invalid harness");
+    }
+
     #[tokio::test]
     async fn rmcp_streamable_http_initialize_and_tools() {
         let app = router(Arc::new(Store::memory().unwrap()), vec!["localhost".into()]);

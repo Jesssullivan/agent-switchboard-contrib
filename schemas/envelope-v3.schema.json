@@ -140,7 +140,7 @@
     "agent_id": {
       "type": "string",
       "description": "harness:host:pid:session_id. Registration also records proc_start to guard against PID reuse.",
-      "pattern": "^(claude|kimi|codex|junie|opencode|pi):[A-Za-z0-9._-]+:[0-9]+:[A-Za-z0-9._-]+$"
+      "pattern": "^(claude|kimi|codex|junie|opencode|pi|hermes|kimicode):[A-Za-z0-9._-]+:[0-9]+:[A-Za-z0-9._-]+$"
     }
   }
 }

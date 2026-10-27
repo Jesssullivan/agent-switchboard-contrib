@@ -217,6 +217,23 @@ fn field<'a>(v: &'a Value, key: &str) -> StoreResult<&'a str> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("missing {key}").into())
 }
+
+/// The harness kinds an agent id may name, in the order the docs list them.
+/// The store, the broker's `register` schema and the `swb` CLI all read this
+/// one list, so a new kind cannot reach one of them and miss another.
+///
+/// - `kimi` is Claude Code running on a Kimi model (lab `kimi-claude.sh`);
+/// - `kimicode` is the official Kimi Code CLI;
+/// - `hermes` is a Hermes agent.
+pub const HARNESS_KINDS: [&str; 8] = [
+    "claude", "kimi", "codex", "junie", "opencode", "pi", "hermes", "kimicode",
+];
+
+/// Whether `harness` is one of [`HARNESS_KINDS`].
+pub fn valid_harness(harness: &str) -> bool {
+    HARNESS_KINDS.contains(&harness)
+}
+
 fn valid_part(p: &str) -> bool {
     !p.is_empty()
         && p.chars()
@@ -228,10 +245,7 @@ fn valid_agent_id(id: &str) -> bool {
     }
     let parts: Vec<_> = id.split(':').collect();
     parts.len() == 4
-        && matches!(
-            parts[0],
-            "claude" | "kimi" | "codex" | "junie" | "opencode" | "pi"
-        )
+        && valid_harness(parts[0])
         && parts[2].parse::<u32>().is_ok()
         && parts[1..].iter().all(|p| valid_part(p))
 }
@@ -473,10 +487,7 @@ impl Store {
     /// that registers on every prompt saves the newest token each time.
     pub fn register(&self, input: &Value) -> StoreResult<Value> {
         let harness = field(input, "harness")?;
-        if !matches!(
-            harness,
-            "claude" | "kimi" | "codex" | "junie" | "opencode" | "pi"
-        ) {
+        if !valid_harness(harness) {
             return Err("invalid harness".into());
         }
         let host = field(input, "host")?;
@@ -1187,6 +1198,42 @@ mod tests {
         assert_eq!(effective_ttl_hours(Some(10_000)), 336);
         assert_eq!(effective_ttl_hours(Some(0)), 1);
     }
+    #[test]
+    fn every_harness_kind_registers_and_round_trips_its_agent_id() {
+        let s = Store::memory().unwrap();
+        for (pid, harness) in (1u32..).zip(HARNESS_KINDS) {
+            let row = reg(&s, harness, "host-a", pid, "s-1", "start-1");
+            let id = format!("{harness}:host-a:{pid}:s-1");
+            assert_eq!(row["agent_id"], id.as_str());
+            assert!(valid_agent_id(&id), "{id}");
+            // The id is usable as a sender and a receiver.
+            let sent = s
+                .send(&json!({"from":id,"to":id,"ticket":"none","body":"ping"}))
+                .unwrap();
+            assert_eq!(sent.envelope["from"], id.as_str());
+        }
+        let listed = s.peers(&all()).unwrap();
+        let mut kinds: Vec<&str> = listed["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["harness"].as_str().unwrap())
+            .collect();
+        kinds.sort_unstable();
+        let mut expected = HARNESS_KINDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(kinds, expected);
+        // `kimi` stays Claude Code on Kimi; near misses are not kinds.
+        assert!(!valid_harness(""));
+        for bad in ["kimi-code", "Hermes", "kimi_code", "hermes-agent"] {
+            assert!(!valid_harness(bad), "{bad}");
+            let refused = s.register(&json!({"harness":bad,"host":"host-a","pid":9,
+                "session_id":"s-1","proc_start":"start-1"}));
+            assert_eq!(refused.unwrap_err(), "invalid harness");
+            assert!(!valid_agent_id(&format!("{bad}:host-a:9:s-1")));
+        }
+    }
+
     #[test]
     fn end_requires_the_latest_registration_token() {
         let s = Store::memory().unwrap();
