@@ -25,7 +25,9 @@ commands:
                             SessionEnd; reads the hook JSON on stdin and always exits 0;
                             SWB_HOOK_FORMAT=text prints the unread-mail notice as plain text
   whoami [--register]       print this session's agent id from the SWB_* environment;
-                            --register also registers it and saves its end token
+                            --register also registers it and saves its end token;
+                            with SWB_BIND=1 it binds the session and saves its
+                            session token (ADR-0003)
   inbox                     fetch one unacknowledged message for SWB_AGENT_ID
   send <to-agent-id> <ticket> [--ruling ID] [--operator-directed] [--in-reply-to ULID]
        [--thread ULID] [--msg-id ULID]
@@ -229,8 +231,9 @@ fn launcher_pid(lookup: Lookup) -> Result<u32, String> {
 }
 
 /// `POST /v1/register` for this launcher process. The response carries the
-/// session's end token; callers save it with [`save_token`] and never print
-/// it.
+/// session's end token, and for a bound session its session token; callers
+/// save them with [`save_token`] and [`save_session_token`] and never print
+/// them.
 fn register_with(lookup: Lookup, harness: &str, session_id: &str) -> Result<Value, String> {
     if !HARNESSES.contains(&harness) {
         return Err("invalid harness".into());
@@ -239,26 +242,25 @@ fn register_with(lookup: Lookup, harness: &str, session_id: &str) -> Result<Valu
     if session_id.is_empty() {
         return Err("missing session identity".into());
     }
-    call_with(
+    let payload = binding_payload(
         lookup,
-        "POST",
-        "/v1/register",
-        Some(&json!({
+        json!({
             "harness":harness, "host":need(lookup, "SWB_HOST")?, "pid":pid,
             "session_id":session_id, "proc_start":need(lookup, "SWB_PROC_START")?
-        })),
-    )
+        }),
+    );
+    call_with(lookup, "POST", "/v1/register", Some(&payload))
 }
 
 fn inbox_with(lookup: Lookup, me: &str) -> Result<Value, String> {
     if !valid_agent_id(me) {
         return Err("invalid SWB_AGENT_ID".into());
     }
-    call_with(
+    call_as(
         lookup,
-        "POST",
+        me,
         "/v1/inbox",
-        Some(&json!({"me":me,"limit":CLI_INBOX_PAGE,"wait_seconds":0})),
+        json!({"me":me,"limit":CLI_INBOX_PAGE,"wait_seconds":0}),
     )
 }
 
@@ -272,13 +274,18 @@ fn inbox_with(lookup: Lookup, me: &str) -> Result<Value, String> {
 // `$HOME/.local/state/swb`. The directory is 0700 and the file 0600. The
 // token is never printed, logged or put on a command line.
 
-fn token_dir(lookup: Lookup) -> Option<PathBuf> {
+/// The client state directory: `$SWB_STATE_DIR`, then
+/// `$XDG_STATE_HOME/swb`, then `$HOME/.local/state/swb`.
+fn state_dir(lookup: Lookup) -> Option<PathBuf> {
     let absolute = |name: &str| lookup(name).filter(|v| v.starts_with('/'));
     absolute("SWB_STATE_DIR")
         .map(PathBuf::from)
         .or_else(|| absolute("XDG_STATE_HOME").map(|d| PathBuf::from(d).join("swb")))
         .or_else(|| absolute("HOME").map(|h| PathBuf::from(h).join(".local/state/swb")))
-        .map(|d| d.join("sessions"))
+}
+
+fn token_dir(lookup: Lookup) -> Option<PathBuf> {
+    state_dir(lookup).map(|d| d.join("sessions"))
 }
 
 fn token_path(lookup: Lookup, agent_id: &str) -> Result<PathBuf, String> {
@@ -301,7 +308,6 @@ fn valid_token(token: &str) -> bool {
 /// Saves the end token from a register response, if it carries one. Returns
 /// the file it wrote, or `None` when the response had no token.
 fn save_token(lookup: Lookup, response: &Value) -> Result<Option<PathBuf>, String> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     let (Some(agent_id), Some(token)) = (
         response.get("agent_id").and_then(Value::as_str),
         response.get("end_token").and_then(Value::as_str),
@@ -315,6 +321,18 @@ fn save_token(lookup: Lookup, response: &Value) -> Result<Option<PathBuf>, Strin
     if std::fs::read_to_string(&path).is_ok_and(|saved| saved == token) {
         return Ok(Some(path));
     }
+    write_private(&path, token)?;
+    if let Some(dir) = path.parent() {
+        prune_stale_tokens(dir, TOKEN_FILE_MAX_AGE);
+    }
+    Ok(Some(path))
+}
+
+/// Writes `token` to `path` as a private file: the directory 0700, the file
+/// 0600, written to a temporary name and renamed over the old file, so a
+/// reader sees the old token or the new one, never a partial write.
+fn write_private(path: &std::path::Path, token: &str) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     let dir = path.parent().ok_or("token path has no directory")?;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -323,20 +341,23 @@ fn save_token(lookup: Lookup, response: &Value) -> Result<Option<PathBuf>, Strin
         .map_err(|e| format!("{}: {e}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("{}: {e}", dir.display()))?;
-    let temp = dir.join(format!(".{agent_id}.{}.tmp", std::process::id()));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&temp)
         .and_then(|mut file| file.write_all(token.as_bytes()))
-        .and_then(|()| std::fs::rename(&temp, &path));
+        .and_then(|()| std::fs::rename(&temp, path));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&temp);
         return Err(format!("{}: {e}", path.display()));
     }
-    prune_stale_tokens(dir, TOKEN_FILE_MAX_AGE);
-    Ok(Some(path))
+    Ok(())
 }
 
 /// How long a token file may go unwritten before a later save removes it.
@@ -379,6 +400,139 @@ fn load_token(lookup: Lookup, agent_id: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{}: not an end token", path.display()))
 }
 
+// ---- ADR-0003 session tokens (SWB-R66, SWB-R67) ----------------------------
+//
+// `register` with `bind: true` (`SWB_BIND=1`) binds the session's harness,
+// host and session id and returns a session token. The client keeps it in a
+// private file named by that key, without the pid, so a restarted process
+// finds it: `$SWB_STATE_DIR/bindings/<harness>:<host>:<session_id>.token`,
+// directory 0700, file 0600. Every register presents the saved token and
+// saves the rotated one the broker returns (SWB-R67). A register that comes
+// back unbound removes the file, and so does a SessionEnd that ends the
+// session. The token is never printed, logged or put on a command line, and
+// these files are never pruned by age: a long-running service may be idle.
+
+/// `harness:host:session_id`, the key a binding and its token file use.
+fn binding_key(agent_id: &str) -> Option<String> {
+    match agent_id.split(':').collect::<Vec<_>>()[..] {
+        [harness, host, _, session] if valid_agent_id(agent_id) => {
+            Some(format!("{harness}:{host}:{session}"))
+        }
+        _ => None,
+    }
+}
+
+/// The token file of a binding key. A key holds only [A-Za-z0-9._-] and
+/// ':', so it is a safe file name.
+fn binding_path(lookup: Lookup, key: &str) -> Result<PathBuf, String> {
+    let parts: Vec<&str> = key.split(':').collect();
+    if parts.len() != 3
+        || !HARNESSES.contains(&parts[0])
+        || !parts[1..].iter().all(|p| valid_part(p))
+        || key.len() > 240
+    {
+        return Err("cannot name a session token file".into());
+    }
+    let dir = state_dir(lookup)
+        .ok_or("no SWB_STATE_DIR, XDG_STATE_HOME or HOME for the session token")?;
+    Ok(dir.join("bindings").join(format!("{key}.token")))
+}
+
+fn session_token_path(lookup: Lookup, agent_id: &str) -> Result<PathBuf, String> {
+    binding_path(
+        lookup,
+        &binding_key(agent_id).ok_or("agent id cannot name a session token file")?,
+    )
+}
+
+fn read_session_token(path: Result<PathBuf, String>) -> Option<String> {
+    let token = std::fs::read_to_string(path.ok()?).ok()?;
+    let token = token.trim();
+    valid_token(token).then(|| token.to_owned())
+}
+
+/// The saved session token for `agent_id`'s binding, if there is one.
+fn load_session_token(lookup: Lookup, agent_id: &str) -> Option<String> {
+    read_session_token(session_token_path(lookup, agent_id))
+}
+
+/// Whether this session asks to be bound: `SWB_BIND` is `1` or `true`.
+fn wants_bind(lookup: Lookup) -> bool {
+    matches!(lookup("SWB_BIND").as_deref(), Some("1" | "true"))
+}
+
+/// A register payload with `bind` when `SWB_BIND` asks for it, and the saved
+/// session token for its key when there is one.
+fn binding_payload(lookup: Lookup, mut payload: Value) -> Value {
+    if wants_bind(lookup) {
+        payload["bind"] = json!(true);
+    }
+    let text = |key: &str| payload[key].as_str().unwrap_or("").to_owned();
+    let key = format!(
+        "{}:{}:{}",
+        text("harness"),
+        text("host"),
+        text("session_id")
+    );
+    if let Some(token) = read_session_token(binding_path(lookup, &key)) {
+        payload["session_token"] = json!(token);
+    }
+    payload
+}
+
+/// Saves the rotated session token from a register response (SWB-R67), or
+/// removes a saved one when the response says the session is not bound.
+/// Returns the file it wrote.
+fn save_session_token(lookup: Lookup, response: &Value) -> Result<Option<PathBuf>, String> {
+    let Some(agent_id) = response.get("agent_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    match (
+        response.get("bound").and_then(Value::as_bool),
+        response.get("session_token").and_then(Value::as_str),
+    ) {
+        (Some(true), Some(token)) => {
+            if !valid_token(token) {
+                return Err("broker returned a malformed session token".into());
+            }
+            let path = session_token_path(lookup, agent_id)?;
+            write_private(&path, token)?;
+            Ok(Some(path))
+        }
+        (Some(false), _) => {
+            if let Ok(path) = session_token_path(lookup, agent_id) {
+                let _ = std::fs::remove_file(path);
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `POST path` acting as `me`, with `me`'s saved session token when it has
+/// one. A hook re-registering at the same moment may rotate the token
+/// between the read and the request, so an `unauthorized` answer is retried
+/// once when the saved token has changed since.
+fn call_as(lookup: Lookup, me: &str, path: &str, mut payload: Value) -> Result<Value, String> {
+    let token = load_session_token(lookup, me);
+    if let Some(token) = &token {
+        payload["session_token"] = json!(token);
+    }
+    match call_with(lookup, "POST", path, Some(&payload)) {
+        Err(e) if e.starts_with("broker HTTP 401") => {
+            let fresh = load_session_token(lookup, me);
+            match fresh {
+                Some(fresh) if Some(&fresh) != token.as_ref() => {
+                    payload["session_token"] = json!(fresh);
+                    call_with(lookup, "POST", path, Some(&payload))
+                }
+                _ => Err(e),
+            }
+        }
+        other => other,
+    }
+}
+
 /// SessionEnd: end this session with its saved token, then forget the
 /// token. Without a saved token there is nothing to do: the session decays
 /// from live to idle to gone on its own.
@@ -389,14 +543,15 @@ fn end_session(lookup: Lookup, harness: &str, session_id: &str) -> Result<Value,
         launcher_pid(lookup)?
     );
     let token = load_token(lookup, &me)?;
-    let result = call_with(
-        lookup,
-        "POST",
-        "/v1/end",
-        Some(&json!({"me":me,"end_token":token})),
-    )?;
+    let result = call_as(lookup, &me, "/v1/end", json!({"me":me,"end_token":token}))?;
     // Ended, or a token the broker no longer knows: either way it is spent.
     let _ = std::fs::remove_file(token_path(lookup, &me)?);
+    // An ended session's binding has lapsed, so its session token is spent.
+    if result.get("state").and_then(Value::as_str) == Some("ended")
+        && let Ok(path) = session_token_path(lookup, &me)
+    {
+        let _ = std::fs::remove_file(path);
+    }
     Ok(result)
 }
 
@@ -419,10 +574,13 @@ fn whoami_cmd(lookup: Lookup, live_register: bool) -> Result<Value, String> {
     if !live_register {
         return Ok(json!({"agent_id":agent_id,"registered":false}));
     }
+    let payload = binding_payload(lookup, payload);
     let mut response = call_with(lookup, "POST", "/v1/register", Some(&payload))?;
     let saved = save_token(lookup, &response);
+    let bound = save_session_token(lookup, &response);
     if let Some(map) = response.as_object_mut() {
         map.remove("end_token");
+        map.remove("session_token");
         map.insert("registered".into(), json!(true));
         map.insert(
             "end_token_file".into(),
@@ -431,9 +589,19 @@ fn whoami_cmd(lookup: Lookup, live_register: bool) -> Result<Value, String> {
                 _ => Value::Null,
             },
         );
+        map.insert(
+            "session_token_file".into(),
+            match &bound {
+                Ok(Some(path)) => json!(path.display().to_string()),
+                _ => Value::Null,
+            },
+        );
     }
     if let Err(e) = saved {
         eprintln!("swb whoami: end token not saved: {e}");
+    }
+    if let Err(e) = bound {
+        eprintln!("swb whoami: session token not saved: {e}");
     }
     Ok(response)
 }
@@ -575,8 +743,9 @@ fn read_body(input: impl Read) -> Result<String, String> {
 }
 
 fn send_cmd(lookup: Lookup, args: &SendArgs, body: &str) -> Result<Value, String> {
-    let payload = send_payload(&me_from(lookup)?, args, body)?;
-    call_with(lookup, "POST", "/v1/send", Some(&payload))
+    let me = me_from(lookup)?;
+    let payload = send_payload(&me, args, body)?;
+    call_as(lookup, &me, "/v1/send", payload)
 }
 
 fn ack_cmd(lookup: Lookup, msg_id: &str) -> Result<Value, String> {
@@ -584,12 +753,7 @@ fn ack_cmd(lookup: Lookup, msg_id: &str) -> Result<Value, String> {
     if !valid_ulid(msg_id) {
         return Err("invalid msg_id (ULID)".into());
     }
-    call_with(
-        lookup,
-        "POST",
-        "/v1/ack",
-        Some(&json!({"me":me,"msg_id":msg_id})),
-    )
+    call_as(lookup, &me, "/v1/ack", json!({"me":me,"msg_id":msg_id}))
 }
 
 /// Options for `swb peers`.
@@ -736,7 +900,8 @@ fn parse_claim_args(args: &[String]) -> Result<ClaimArgs, String> {
 }
 
 fn claim_cmd(lookup: Lookup, args: &ClaimArgs) -> Result<Value, String> {
-    let mut payload = json!({"me":me_from(lookup)?});
+    let me = me_from(lookup)?;
+    let mut payload = json!({"me":me});
     if let Some(subject) = &args.subject {
         payload["subject"] = json!(subject);
     }
@@ -752,7 +917,7 @@ fn claim_cmd(lookup: Lookup, args: &ClaimArgs) -> Result<Value, String> {
     if let Some(id) = &args.handoff_id {
         payload["handoff_id"] = json!(id);
     }
-    call_with(lookup, "POST", "/v1/claim", Some(&payload))
+    call_as(lookup, &me, "/v1/claim", payload)
 }
 
 fn release_cmd(lookup: Lookup, claim_id: &str) -> Result<Value, String> {
@@ -760,11 +925,11 @@ fn release_cmd(lookup: Lookup, claim_id: &str) -> Result<Value, String> {
     if !valid_ulid(claim_id) {
         return Err("invalid claim_id (ULID)".into());
     }
-    call_with(
+    call_as(
         lookup,
-        "POST",
+        &me,
         "/v1/release",
-        Some(&json!({"me":me,"claim_id":claim_id})),
+        json!({"me":me,"claim_id":claim_id}),
     )
 }
 
@@ -801,8 +966,9 @@ fn parse_handoff_args(args: &[String]) -> Result<Value, String> {
 }
 
 fn handoff_cmd(lookup: Lookup, mut payload: Value) -> Result<Value, String> {
-    payload["me"] = json!(me_from(lookup)?);
-    call_with(lookup, "POST", "/v1/handoff", Some(&payload))
+    let me = me_from(lookup)?;
+    payload["me"] = json!(me);
+    call_as(lookup, &me, "/v1/handoff", payload)
 }
 
 /// Options for `swb claims`. Like `swb peers`, a plain listing passes no
@@ -1174,11 +1340,23 @@ fn doctor_checks(lookup: Lookup, live_register: bool) -> Vec<(&'static str, Chec
                 }),
                 true,
                 true,
-            ) => match call_with(lookup, "POST", "/v1/register", Some(payload)) {
+            ) => match call_with(
+                lookup,
+                "POST",
+                "/v1/register",
+                Some(&binding_payload(lookup, payload.clone())),
+            ) {
                 Ok(v) if v.get("agent_id").and_then(Value::as_str) == Some(id.as_str()) => {
-                    // Keep the hook's saved end token current (R-C944).
+                    // Keep the hook's saved end token current (R-C944), and a
+                    // bound session's rotated session token (SWB-R67).
                     let _ = save_token(lookup, &v);
-                    Check::Ok(format!("POST /v1/register returned {id}"))
+                    let _ = save_session_token(lookup, &v);
+                    let bound = if v.get("bound") == Some(&json!(true)) {
+                        " (bound)"
+                    } else {
+                        ""
+                    };
+                    Check::Ok(format!("POST /v1/register returned {id}{bound}"))
                 }
                 Ok(v) => fail(
                     format!("broker returned agent_id {}", v["agent_id"]),
@@ -1276,6 +1454,7 @@ fn hook(harness_arg: &str, event: &str) {
         return;
     };
     let _ = save_token(&process_env, &identity);
+    let _ = save_session_token(&process_env, &identity);
     if event != "UserPromptSubmit" {
         return;
     }
@@ -2211,6 +2390,209 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
         // With no usable state directory the token cannot be saved.
         assert!(save_token(&lookup_of(&[]), &json!({"agent_id":ME,"end_token":TOKEN})).is_err());
+    }
+
+    /// Low-entropy 64-hex fixtures, so a secret scanner never mistakes them
+    /// for a credential.
+    fn session_token() -> String {
+        "fe".repeat(32)
+    }
+    fn rotated() -> String {
+        "0f".repeat(32)
+    }
+
+    #[test]
+    fn a_bound_client_keeps_its_session_token_in_a_0600_file_and_rotates_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = scratch_state_dir("bind");
+        let response = |pid: u32, token: String| -> &'static str {
+            Box::leak(
+                json!({"agent_id":format!("hermes:sting:{pid}:cade"),"lease_seconds":900,
+                    "end_token":TOKEN,"bound":true,"session_token":token})
+                .to_string()
+                .into_boxed_str(),
+            )
+        };
+        let (url, server) = mock(vec![
+            (200, "application/json", response(100, session_token())),
+            (200, "application/json", response(200, rotated())),
+            (
+                200,
+                "application/json",
+                r#"{"msg_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
+            ),
+            (
+                200,
+                "application/json",
+                r#"{"agent_id":"hermes:sting:200:cade","state":"ended","released_claims":[]}"#,
+            ),
+        ]);
+        let env = |pid: &'static str| {
+            let url = url.clone();
+            let state = state.clone();
+            move |name: &str| match name {
+                "SWB_BROKER_URL" => Some(url.clone()),
+                "SWB_STATE_DIR" => Some(state.clone()),
+                "SWB_HOST" => Some("sting".into()),
+                "SWB_SESSION_PID" => Some(pid.into()),
+                "SWB_PROC_START" => Some(format!("start-{pid}")),
+                "SWB_HARNESS" => Some("hermes".into()),
+                "SWB_SESSION_ID" => Some("cade".into()),
+                "SWB_BIND" => Some("1".into()),
+                _ => None,
+            }
+        };
+        // First start: no saved token, so register asks to bind and sends none.
+        let started = whoami_cmd(&env("100"), true).unwrap();
+        let file = PathBuf::from(&state).join("bindings/hermes:sting:cade.token");
+        assert_eq!(started["session_token_file"], file.display().to_string());
+        assert!(started.get("session_token").is_none(), "{started}");
+        assert!(!started.to_string().contains(&session_token()));
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(file.parent().unwrap()), 0o700);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), session_token());
+        // A restart with a new pid finds the file (it is named without the
+        // pid), presents the token and saves the rotated one (SWB-R67).
+        whoami_cmd(&env("200"), true).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), rotated());
+        // Every acting verb sends the current token.
+        let me = "hermes:sting:200:cade";
+        let acting = |name: &str| match name {
+            "SWB_AGENT_ID" => Some(me.to_owned()),
+            other => env("200")(other),
+        };
+        let args = parse_send_args(&strings(&["claude:honey:1:a", "none"])).unwrap();
+        send_cmd(&acting, &args, "hello").unwrap();
+        // SessionEnd ends the session and spends both tokens.
+        save_token(&acting, &json!({"agent_id":me,"end_token":TOKEN})).unwrap();
+        end_session(&acting, "hermes", "cade").unwrap();
+        assert!(!file.exists(), "an ended binding kept its token file");
+        let requests = server.join().unwrap();
+        let first_register = request_json(&requests[0]);
+        assert_eq!(first_register["bind"], true);
+        assert!(first_register.get("session_token").is_none());
+        let second_register = request_json(&requests[1]);
+        assert_eq!(second_register["pid"], 200);
+        assert_eq!(second_register["session_token"], session_token());
+        assert_eq!(request_json(&requests[2])["session_token"], rotated());
+        assert_eq!(request_json(&requests[2])["from"], me);
+        assert_eq!(request_json(&requests[3])["session_token"], rotated());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn an_unbound_answer_removes_a_saved_session_token_and_unbound_calls_send_none() {
+        let state = scratch_state_dir("unbind");
+        let lookup = lookup_of(&[("SWB_STATE_DIR", &state)]);
+        let id = "hermes:sting:100:cade";
+        let saved = save_session_token(
+            &lookup,
+            &json!({"agent_id":id,"bound":true,"session_token":session_token()}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            load_session_token(&lookup, "hermes:sting:999:cade").unwrap(),
+            session_token()
+        );
+        assert!(
+            save_session_token(
+                &lookup,
+                &json!({"agent_id":id,"bound":true,"session_token":"short"})
+            )
+            .is_err()
+        );
+        // A v0.4.0 broker says nothing about binding: the file stays.
+        assert_eq!(
+            save_session_token(&lookup, &json!({"agent_id":id})).unwrap(),
+            None
+        );
+        assert!(saved.exists());
+        assert_eq!(
+            save_session_token(&lookup, &json!({"agent_id":id,"bound":false})).unwrap(),
+            None
+        );
+        assert!(!saved.exists(), "an unbound answer kept the token file");
+        // No token file: requests carry no session_token, as in v0.4.0.
+        let (url, server) = mock(vec![(200, "application/json", r#"{"messages":[]}"#)]);
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_STATE_DIR", &state)]);
+        inbox_with(&lookup, ME).unwrap();
+        let requests = server.join().unwrap();
+        assert!(request_json(&requests[0]).get("session_token").is_none());
+        assert!(!wants_bind(&lookup_of(&[("SWB_BIND", "yes")])));
+        assert!(wants_bind(&lookup_of(&[("SWB_BIND", "true")])));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn an_unauthorized_answer_is_retried_once_with_a_rotated_token() {
+        let state = scratch_state_dir("retry");
+        let id = "hermes:sting:100:cade";
+        let lookup_state = lookup_of(&[("SWB_STATE_DIR", &state)]);
+        save_session_token(
+            &lookup_state,
+            &json!({"agent_id":id,"bound":true,"session_token":session_token()}),
+        )
+        .unwrap();
+        let path = session_token_path(&lookup_state, id).unwrap();
+        // A broker that rotates the saved token (as a hook's re-register
+        // would) while the first request is in flight, then answers 401;
+        // later requests get 200 for the rotated token and 401 otherwise.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for n in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !String::from_utf8_lossy(&request).contains("}") {
+                    let read = stream.read(&mut chunk).unwrap();
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let text = String::from_utf8_lossy(&request).into_owned();
+                if n == 0 {
+                    std::fs::write(&path, rotated()).unwrap();
+                }
+                let (status, body) = if n == 1 && text.contains(&rotated()) {
+                    (
+                        200,
+                        r#"{"msg_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","state":"acked"}"#,
+                    )
+                } else {
+                    (
+                        401,
+                        r#"{"error":"invalid session token","code":"unauthorized"}"#,
+                    )
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                seen.push(text);
+            }
+            seen
+        });
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_STATE_DIR", &state)]);
+        let ack = json!({"me":id,"msg_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"});
+        assert_eq!(
+            call_as(&lookup, id, "/v1/ack", ack.clone()).unwrap()["state"],
+            "acked"
+        );
+        // The token did not change since: the 401 stands, with no retry.
+        let refused = call_as(&lookup, id, "/v1/ack", ack).unwrap_err();
+        assert!(refused.starts_with("broker HTTP 401"), "{refused}");
+        let requests = server.join().unwrap();
+        assert_eq!(request_json(&requests[0])["session_token"], session_token());
+        assert_eq!(request_json(&requests[1])["session_token"], rotated());
+        assert_eq!(request_json(&requests[2])["session_token"], rotated());
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]

@@ -24,6 +24,28 @@ Identity is self-asserted: the end token stops a caller ending a session it
 did not register, but anyone who can register can re-register any agent id
 (see [SECURITY.md](../SECURITY.md)).
 
+### Sender binding (unreleased, v0.5.0)
+
+A session can opt in to sender binding
+([ADR-0003](adr/0003-sender-binding.md), SWB-R66). `register` with
+`bind: true` binds `harness:host:session_id` (the agent id without its pid)
+and returns a `session_token` beside the end token. While the binding is
+live:
+
+| Call | Rule |
+| --- | --- |
+| `send` (as `from`), `inbox`, `ack`, `claim`, `release`, `handoff`, `end` (as `me`) | need `session_token`; otherwise 401 `unauthorized` |
+| `register` of the same key, any pid | needs the current `session_token`, keeps the binding and rotates the token |
+| an earlier pid of the key | refused, even with the token |
+| `inbox` and `ack` | read mail addressed to any pid of the key, so a restart keeps unread mail |
+| `peers`, `claims`, `heartbeat`, `thread` | no token |
+
+A binding lapses when its session ends or after 6 hours without a call,
+and a lapse is permanent: no later call revives it or its old token.
+An unbound id behaves as in v0.4.0 and ignores a token it sends. The
+`swb` client binds with `SWB_BIND=1` and keeps the token in a 0600 file
+(see `SWB_STATE_DIR` below, SWB-R67).
+
 ### Harness kinds
 
 The store, the broker's `register` schema, the envelope schema and the CLI
@@ -55,6 +77,8 @@ new kinds.
 | `SWB_LISTEN` | `serve` | `0.0.0.0:8080` | MCP `/mcp` and REST `/v1/*` |
 | `SWB_METRICS_LISTEN` | `serve` | `0.0.0.0:9090` | `/metrics` |
 | `SWB_MCP_ALLOWED_HOSTS` | `serve` | `localhost,127.0.0.1,::1` | comma-separated `Host` allowlist for every route on `SWB_LISTEN` (`/mcp` and `/v1/*`); a deployment sets its tailnet name. A host without a port admits any port. Missing or unlisted Host is 403; an empty list refuses to start |
+| `SWB_SEND_BURST` | `serve` | `20` | per-sender send bucket size (v0.5.0); `0` turns the send rate limit off |
+| `SWB_SEND_REFILL_PER_MINUTE` | `serve` | `30` | sends a bucket regains per minute (v0.5.0); whole numbers up to 100000, another value refuses to start |
 | `SWB_ALLOWED_ORIGINS` | `serve` | empty | comma-separated browser origins (`scheme://host[:port]` or `null`) admitted on `SWB_LISTEN`. Any request carrying another `Origin` is 403; requests without `Origin` (every `swb` and MCP client) pass |
 | `SWB_BROKER_URL` | every client verb | none | `http://host:port` only: no path, no trailing `/`, no `https` |
 | `SWB_HOST` | `hook`, `whoami`, `doctor` | none | host part of the agent id |
@@ -62,7 +86,8 @@ new kinds.
 | `SWB_PROC_START` | `hook`, `whoami`, `doctor`, `channel` | none | process start stamp; `channel` filters its own row on it. `/v1/end` checks the end token, not this (v0.3.0) |
 | `SWB_HARNESS` | `hook`, `whoami`, `doctor`, `channel` | hook: its argument | `claude`, `kimi`, `codex`, `junie`, `opencode`, `pi`, `hermes` or `kimicode` (see [Harness kinds](#harness-kinds)). `channel --tools full` pushes only when it is `claude` |
 | `SWB_HOOK_FORMAT` | `hook` | JSON | `text` prints the UserPromptSubmit notice as plain text for a harness that adds a hook's stdout to its context. Any other value keeps the Claude Code `hookSpecificOutput` JSON |
-| `SWB_STATE_DIR` | `hook`, `whoami --register`, `doctor --register` | `$XDG_STATE_HOME/swb`, then `$HOME/.local/state/swb` | where end tokens are kept (`sessions/<agent_id>.token`, dir 0700, file 0600); files not rewritten for 7 days are pruned |
+| `SWB_STATE_DIR` | `hook`, `whoami --register`, `doctor --register`, every acting verb, `channel` | `$XDG_STATE_HOME/swb`, then `$HOME/.local/state/swb` | where end tokens are kept (`sessions/<agent_id>.token`, dir 0700, file 0600); files not rewritten for 7 days are pruned. A bound session's token is in `bindings/<harness>:<host>:<session_id>.token` (dir 0700, file 0600), rewritten on every register and never pruned by age |
+| `SWB_BIND` | `hook`, `whoami --register` | unset | `1` or `true` asks `register` to bind the session (v0.5.0, ADR-0003) |
 | `SWB_SESSION_ID` | `whoami`, `doctor` | none | hooks read `session_id` from stdin instead |
 | `SWB_AGENT_ID` | `inbox`, `send`, `ack`, `heartbeat`, `thread`, `claim`, `release`, `handoff`, `claims --mine`, `doctor`, `channel` | none | `harness:host:pid:session_id`, as `register` returned it; `channel` falls back to the launcher identity |
 | `SWB_CHANNEL_POLL_SECONDS` | `channel` | `5` | inbox poll interval, clamped to 2–60 |
@@ -75,31 +100,37 @@ a POST with a JSON body (`Content-Type: application/json`).
 
 | Route | Body or query | Notes |
 | --- | --- | --- |
-| `POST /v1/register` | `{harness, host, pid, session_id, proc_start}` | returns `{agent_id, lease_seconds, end_token}` |
-| `POST /v1/end` | `{me, end_token}` | any other token answers `{"state":"unknown"}` and ends nothing |
+| `POST /v1/register` | `{harness, host, pid, session_id, proc_start, bind?, session_token?}` | returns `{agent_id, lease_seconds, end_token, bound}`, plus `session_token` when bound |
+| `POST /v1/end` | `{me, end_token, session_token?}` | any other end token answers `{"state":"unknown"}` and ends nothing |
 | `POST /v1/peers` | `{me?, all?, host?, limit?, cursor?, proc_start?}` | `me` renews that session's lease |
 | `GET /v1/peers` | `?all=&host=&limit=&cursor=` | passive listing; changes nothing |
-| `POST /v1/send` | `{from, to, ticket, body, …}` (envelope v3) | `ticket` is `TIN-<digits>` or `none`; a body is at most 16 KiB |
-| `POST /v1/inbox` | `{me, limit, wait_seconds}` | long-poll |
-| `POST /v1/ack` | `{me, msg_id}` | |
+| `POST /v1/send` | `{from, to, ticket, body, …, session_token?}` (envelope v3) | `ticket` is `TIN-<digits>` or `none`; a body is at most 16 KiB; an empty sender bucket answers 429; an invalid send or an idempotent retry spends no bucket token |
+| `POST /v1/inbox` | `{me, limit, wait_seconds, session_token?}` | long-poll |
+| `POST /v1/ack` | `{me, msg_id, session_token?}` | |
 | `POST /v1/heartbeat` | `{me}` | renews the lease only |
 | `POST /v1/thread` | `{me, thread_id, after_seq?, limit?}` | one thread's messages that `me` sent or received, in seq order; pages of `limit` (default 20, at most 100) with `next_after_seq`; changes no delivery state |
-| `POST /v1/claim` | `{me, subject?, exclusive?, lease_hours?, note?, handoff_id?}` | see Claims below |
-| `POST /v1/release` | `{me, claim_id}` | your own claim only; releasing it again changes nothing |
-| `POST /v1/handoff` | `{me, claim_id, to, note?}` | offers your active claim to `to`; the same offer again returns the open receipt |
+| `POST /v1/claim` | `{me, subject?, exclusive?, lease_hours?, note?, handoff_id?, session_token?}` | see Claims below |
+| `POST /v1/release` | `{me, claim_id, session_token?}` | your own claim only; releasing it again changes nothing |
+| `POST /v1/handoff` | `{me, claim_id, to, note?, session_token?}` | offers your active claim to `to`; the same offer again returns the open receipt |
 | `POST /v1/claims` | `{me?, subject?, holder?, all?, limit?}` | active claims (`all` adds released, handed-off and expired ones still kept); `me` renews that lease and adds its open `handoffs` |
 | `GET /healthz` | | also on `SWB_METRICS_LISTEN`, where it is not Host-guarded |
 
 `peers` lists live sessions by default (`all` adds idle, gone and ended),
 one row per harness, host and session id, in pages of `limit` (default 50,
 at most 200) with a `next_cursor`. A row is
-`{agent_id, harness, host, last_seen, state}`. `GET /v1/peers?me=` and
+`{agent_id, harness, host, last_seen, state, bound}`; `bound` is true
+while the row's binding is live (v0.5.0, SWB-R68). `GET /v1/peers?me=` and
 `GET /v1/inbox` answer 405.
 
+`session_token` is required only for a bound id (see
+[Sender binding](#sender-binding-unreleased-v050)).
+
 Errors are `{"error", "code"}` with a status per kind: 400
-(`invalid_argument`, `invalid_json`), 404 (`unregistered`,
-`message_unavailable`, `claim_unavailable`, `not_found`), 405 (`method_not_allowed`), 409
-(`msg_id_conflict`), 415 (`unsupported_media_type`), 500 (`internal`). The
+(`invalid_argument`, `invalid_json`), 401 (`unauthorized`, v0.5.0), 404
+(`unregistered`, `message_unavailable`, `claim_unavailable`, `not_found`),
+405 (`method_not_allowed`), 409 (`msg_id_conflict`), 415
+(`unsupported_media_type`), 429 (`rate_limited`, v0.5.0), 500
+(`internal`). The
 guard's refusals are 403. The full table is in the migration notes.
 
 `/metrics` is on `SWB_METRICS_LISTEN`. It includes `swb_claims_active`,
@@ -112,7 +143,7 @@ The broker writes one JSON audit line to stdout for each successful
 refused claim, release and handoff. Fields are named explicitly: `ts`, `op`,
 `me`, `to`, `ticket`, `ruling`, `msg_id`, `thread_id`, `seq`,
 `in_reply_to`, `size`, `body_hmac` and the claim fields. A line never
-carries a body, a note or an end token. The message lines share `msg_id`,
+carries a body, a note, an end token or a session token. The message lines share `msg_id`,
 `thread_id` and `ticket`, so a log reader can follow one thread from send
 through delivery to ack (ADR-0002 L1-lite). The broker has no log client;
 the lines go to stdout only.
@@ -177,8 +208,9 @@ At `/mcp`: `register`, `end`, `peers`, `send`, `inbox`, `ack`, `heartbeat`,
 `thread`, `claim`, `release`, `handoff` and `claims`, with the same fields
 and rules as the REST routes; every input field is described in the
 tool schema. Tool errors carry the same JSON error object as their text. Over
-MCP the `register` result carries `end_token` into the model's context; an
-adapter that ends sessions itself should keep the token and strip it.
+MCP the `register` result carries `end_token`, and for a bound session
+`session_token`, into the model's context; an adapter should keep both
+tokens and strip them before the model sees them.
 
 ## CLI verbs
 
@@ -203,6 +235,12 @@ makes no broker call), `inbox`,
   `$SWB_STATE_DIR/sessions/`; SessionEnd spends it and deletes the file.
   The CLI never prints the token: `whoami --register` prints
   `end_token_file` in its place.
+- With `SWB_BIND=1`, `whoami --register` and the hooks bind the session and
+  save its session token under `$SWB_STATE_DIR/bindings/`; every register
+  presents the saved token and saves the rotated one. `whoami --register`
+  prints `session_token_file`. `send`, `ack`, `inbox`, `claim`, `release`,
+  `handoff` and SessionEnd send the saved token for `SWB_AGENT_ID`, and
+  retry once on 401 when the file changed meanwhile.
 - `agentd` is planned for P2 and exits 3; it is not in the usage text.
 
 Exit codes: 0 ok, 2 usage, 3 missing setting, broker error or a failed
@@ -253,7 +291,7 @@ SessionStart hook therefore registers outside the channel:
 | Register | the launcher runs `swb whoami --register` with `SWB_HARNESS`, `SWB_SESSION_ID`, `SWB_HOST`, `SWB_SESSION_PID` and `SWB_PROC_START` set |
 | Stay live | `swb heartbeat` (or an `inbox` read) at least every 15 minutes; a row is `idle` after 15 minutes and `gone` after 6 hours |
 | End | `swb hook <harness> SessionEnd`, or the session's own client |
-| Service identity | a service such as a Hermes agent can instead register through its own client (planned, ADR-0003 draft) |
+| Service identity | with `SWB_BIND=1`, `swb whoami --register` binds the session id, so a restarted service keeps its unread mail and its id cannot be spoofed (v0.5.0, ADR-0003) |
 
 The `claude/channel` capability and its push stay Claude-only. With
 `--tools full` the channel declares them, and polls, only when every
@@ -262,8 +300,11 @@ identity setting present says `claude`: `SWB_HARNESS`, the kind in
 `hermes` `SWB_AGENT_ID`, does not push. A full-mode session that sets
 neither and resolves through its broker row does not push either. Every
 other harness reads its mail with the `inbox` tool. The pinning guards this
-one process. The broker still trusts a self-asserted sender, so another
-client can still send as any id (SWB-R05).
+one process. For an unbound id the broker still trusts a self-asserted
+sender, so another client can still send as it (SWB-R05). For a bound id
+the channel sends the saved session token with `send`, `inbox`, `ack`,
+`claim`, `release` and `handoff`, and the broker refuses a caller without
+it (v0.5.0, ADR-0003).
 
 ## Notices
 

@@ -44,7 +44,8 @@
       "$ref": "#/$defs/ulid"
     },
     "from": {
-      "$ref": "#/$defs/agent_id"
+      "$ref": "#/$defs/agent_id",
+      "description": "The sender. Self-asserted for an unbound id. For a bound id (ADR-0003, SWB-R66, v0.5.0) the broker accepts the send only with the session token of the binding's latest registration; the token is a request field and never part of the envelope. A bound sender still gets authority peer."
     },
     "to": {
       "$ref": "#/$defs/agent_id"

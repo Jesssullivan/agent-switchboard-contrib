@@ -4,18 +4,19 @@
 
 | Version | Supported |
 | --- | --- |
-| 0.2.2 | Yes (current release) |
-| `main` (0.3.0, unreleased) | Yes: fixes land here first |
-| 0.2.1 and earlier | No: upgrade to 0.2.2 |
+| 0.4.0 | Yes (current release) |
+| `main` (0.5.0, unreleased) | Yes: fixes land here first |
+| 0.3.0 and earlier | No: upgrade to 0.4.0 |
 | 0.2.0 | Never published; do not use the tag |
 
 Pre-1.0, only the latest release and `main` get fixes.
 
-## Deployment model: tailnet-only, no authentication
+## Deployment model: tailnet-only, no listener authentication
 
 `swb` is designed to run on a private network that already authenticates its
 members: loopback, or a tailnet such as Tailscale where every peer is a
-known device. **`swb` has no authentication, in any release.** Agent
+known device. **`swb` does not authenticate its listeners, in any
+release.** Up to v0.4.0, and for every unbound id from v0.5.0, agent
 identity is self-asserted: any client that can reach the broker's main
 listener can register as any agent id (`harness:host:pid:session_id`), read
 that agent's inbox, send and acknowledge. In v0.2.2 it can also end any
@@ -25,6 +26,55 @@ and receive a fresh token, so the token is not takeover-proof. Messages are
 marked `authority: peer` and are teammate information only, which limits
 what a spoofed message can make an agent do, but it does not stop the
 spoofing.
+
+### Opt-in sender binding (v0.5.0, unreleased)
+
+From v0.5.0 a session can opt in to sender binding
+([ADR-0003](docs/adr/0003-sender-binding.md), SWB-R66 to SWB-R68).
+`register` with `bind: true` (`SWB_BIND=1` for the `swb` client) binds the
+session's `harness:host:session_id` and returns a session token. While the
+binding is live:
+
+- `send` with that id as `from`, and `inbox`, `ack`, `claim`, `release`,
+  `handoff` and `end` with it as `me`, need the token. Without it they
+  answer 401 `unauthorized` and change nothing. A spoofed `send` from a
+  bound id therefore fails.
+- A new `register` of the same key, from any pid, needs the current token,
+  and every register rotates it. Nobody can take a live binding over by
+  registering again.
+- `peers` rows say `bound`.
+
+A binding lapses when its session ends or after 6 hours without a call;
+the key then registers like an unbound one. A lapse is permanent: a later
+call, with or without a token, cannot bring the binding or its old token
+back. The broker checks the token inside each operation's transaction, and
+an `inbox` long-poll checks it on every read. The client keeps the token in a
+0600 file under `$SWB_STATE_DIR/bindings/` and never prints it.
+
+Each sender also has a token bucket for `send` (default burst 20, refill 30
+per minute, set by `SWB_SEND_BURST` and `SWB_SEND_REFILL_PER_MINUTE`). An
+empty bucket answers 429 `rate_limited`. Only a send that stores a new
+message spends a token. The bucket stops a client that loops under one
+agent id. It does not stop a flood that changes its unbound `from` on every
+send: the tailnet ACL bounds that client. The broker keeps at most 4096
+buckets.
+
+Binding does not change what a message can make an agent do: `authority`
+stays `peer` on every message (SWB-R14).
+
+Residuals of binding:
+
+- The session token is a bearer secret. Anyone who can read the 0600 file,
+  or a model context that received an MCP `register` result, can act as
+  the bound id until the next register rotates it.
+- `thread`, `heartbeat`, `peers` and `claims` need no token. Anyone can
+  read a bound id's threads and refresh its lease, which also delays the
+  6-hour lapse.
+- Unbound ids keep every v0.4.0 property above, including takeover by
+  re-registering. Anyone can also spend an unbound sender's send bucket by
+  sending as it.
+- The token travels in the request body over plain http, so it relies on
+  the tailnet's encryption, like every message body.
 
 So:
 
@@ -36,9 +86,9 @@ So:
   it is not Host-guarded.
 - Never put a secret in a message body.
 
-## Known residuals in v0.2.2
+## Residuals fixed in v0.3.0
 
-Both are fixed on `main` for v0.3.0 (R-C944), which ships them together
+These applied to v0.2.2. v0.3.0 fixed both (R-C944) and shipped the fixes
 with the clients that need the changed routes; see
 [docs/releases/v0.3.0-migration.md](docs/releases/v0.3.0-migration.md).
 
@@ -78,6 +128,6 @@ Please report privately, not with details in a public issue or pull request.
 
 Include the affected version or commit, how to reproduce, and the impact you
 see. A maintainer will acknowledge the report and agree a disclosure date
-with you once a fix is ready. The two residuals above and the
-self-asserted identity are already known and public; no report is needed
+with you once a fix is ready. The residuals above and the self-asserted
+identity of unbound ids are already known and public; no report is needed
 for them.

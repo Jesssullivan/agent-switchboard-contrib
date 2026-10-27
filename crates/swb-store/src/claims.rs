@@ -120,13 +120,7 @@ fn stamp(db: &Connection, t: i64) -> StoreResult<String> {
 /// Refresh a registered caller's lease (and clear ended), like every other
 /// broker operation. An unregistered caller is an error.
 fn refresh(db: &Connection, me: &str, now: i64) -> StoreResult<()> {
-    let n = db
-        .execute(
-            "UPDATE sessions SET last_seen=?2, ended=0 WHERE agent_id=?1",
-            params![me, now],
-        )
-        .map_err(sql_err)?;
-    if n == 0 {
+    if super::touch(db, me, now)? == 0 {
         return Err(StoreError::new(ErrorKind::Unregistered, "unregistered me"));
     }
     Ok(())
@@ -387,6 +381,12 @@ impl Store {
     /// caller's claim is recorded in the same transaction, or neither
     /// happens.
     pub fn claim(&self, input: &Value) -> StoreResult<Value> {
+        self.claim_as(input, None)
+    }
+
+    /// [`Store::claim`] acting as `me` with its session token (ADR-0003),
+    /// checked inside the claim's transaction.
+    pub fn claim_as(&self, input: &Value, session_token: Option<&str>) -> StoreResult<Value> {
         only_fields(
             input,
             &[
@@ -435,6 +435,7 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
+        Self::gate(&tx, me, session_token, now)?;
         refresh(&tx, me, now)?;
 
         // Accepting a handoff: the offer must be open, addressed to me, and
@@ -590,6 +591,17 @@ impl Store {
     /// `claim_unavailable` without saying which (R-N11: never acts on
     /// another session's claim).
     pub fn release(&self, me: &str, claim_id: &str) -> StoreResult<Value> {
+        self.release_as(me, claim_id, None)
+    }
+
+    /// [`Store::release`] acting as `me` with its session token (ADR-0003),
+    /// checked inside the release's transaction.
+    pub fn release_as(
+        &self,
+        me: &str,
+        claim_id: &str,
+        session_token: Option<&str>,
+    ) -> StoreResult<Value> {
         if !valid_agent_id(me) {
             return Err("invalid me".into());
         }
@@ -601,6 +613,7 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
+        Self::gate(&tx, me, session_token, now)?;
         let row: Option<(String, String, String, i64)> = tx
             .query_row(
                 "SELECT holder, subject, state, expires_at FROM claims WHERE claim_id=?1",
@@ -649,6 +662,12 @@ impl Store {
     /// The Linear receipt comment (SWB-R15) is not posted by this broker
     /// yet.
     pub fn handoff(&self, input: &Value) -> StoreResult<Value> {
+        self.handoff_as(input, None)
+    }
+
+    /// [`Store::handoff`] acting as `me` with its session token (ADR-0003),
+    /// checked inside the handoff's transaction.
+    pub fn handoff_as(&self, input: &Value, session_token: Option<&str>) -> StoreResult<Value> {
         only_fields(input, &["me", "claim_id", "to", "note"])?;
         let me = me_of(input)?;
         let claim_id = input
@@ -677,6 +696,7 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
+        Self::gate(&tx, me, session_token, now)?;
         refresh(&tx, me, now)?;
         let source: Option<(String, bool)> = tx
             .query_row(
