@@ -21,16 +21,16 @@ prompt.
 
 | | |
 | --- | --- |
-| Current release | **v0.3.0** ([CHANGELOG](CHANGELOG.md)), **breaking:** per-session end tokens, POST-only state changes, typed errors, `/healthz` ([migration notes](docs/releases/v0.3.0-migration.md)) |
-| Previous | v0.2.2, the wire format v0.3.0 replaces |
+| Current release | **v0.4.0** ([CHANGELOG](CHANGELOG.md)): harness kinds `hermes` and `kimicode`, `swb channel --tools full`, `SWB_HOOK_FORMAT=text`. Same routes as v0.3.0, but a v0.3.0 broker or client refuses the new kinds, so upgrade them together |
+| Previous | v0.3.0, **breaking** from v0.2: per-session end tokens, POST-only state changes, typed errors, `/healthz` ([migration notes](docs/releases/v0.3.0-migration.md)); v0.2.2, the wire format v0.3.0 replaces |
 | Where it runs | In production in its home estate (the Tinyland tailnet), as a digest-pinned OCI image |
-| MCP tools | 12 in v0.3.0: `register`, `end`, `peers`, `send`, `inbox`, `ack`, `heartbeat`, `thread`, `claim`, `release`, `handoff`, `claims` (v0.2.2 ships 5: `register`, `peers`, `send`, `inbox`, `ack`) |
+| MCP tools | 12 since v0.3.0: `register`, `end`, `peers`, `send`, `inbox`, `ack`, `heartbeat`, `thread`, `claim`, `release`, `handoff`, `claims` (v0.2.2 ships 5: `register`, `peers`, `send`, `inbox`, `ack`) |
 | Later (P2) | The per-host push adapter `swb agentd` and the Linear handoff-receipt comment |
 
 **The broker has no authentication.** Agent identity is self-asserted in
-every release, v0.3.0 included: its end token stops a caller ending a
-session it never registered, but anyone who can reach the broker can
-register any agent id. Run it only on a network you trust (loopback or a
+every release, v0.4.0 included: the end token (since v0.3.0) stops a
+caller ending a session it never registered, but anyone who can reach the
+broker can register any agent id. Run it only on a network you trust (loopback or a
 private tailnet), and read [SECURITY.md](SECURITY.md) before you expose it
 anywhere.
 
@@ -44,17 +44,19 @@ and aarch64-darwin, so neither Nix nor Rust is needed. Otherwise you need
 Nix (with flakes) or Rust 1.97.1; the repository's `rust-toolchain.toml`
 pins that release, so `rustup` installs it on first use.
 
-**Broker and clients must run the same minor version.** v0.3.0 cannot
-talk to a v0.2.x broker or client (the routes changed). To join a v0.2.2
-broker, install v0.2.2 (Nix or Cargo below); to try `swb` on its own,
-either works, as long as broker and clients come from the same release.
+**Broker and clients must run the same minor version.** v0.3.0 and later
+cannot talk to a v0.2.x broker or client (the routes changed), and a
+v0.3.0 broker or client refuses the harness kinds v0.4.0 adds. To join a
+v0.2.2 broker, install v0.2.2 (Nix or Cargo below); to try `swb` on its
+own, either works, as long as broker and clients come from the same
+release.
 
 **Prebuilt binary (v0.3.0 and later):**
 
 ```sh
-curl -fsSLO https://github.com/xoxd-ai/agent-switchboard/releases/download/v0.3.0/install.sh
+curl -fsSLO https://github.com/xoxd-ai/agent-switchboard/releases/download/v0.4.0/install.sh
 less install.sh          # read it first
-sh install.sh v0.3.0     # installs ~/.local/bin/swb
+sh install.sh v0.4.0     # installs ~/.local/bin/swb
 ```
 
 `install.sh` downloads `swb-<version>-<system>` and `SHA256SUMS` from the
@@ -78,9 +80,9 @@ with a browser, clear it with `xattr -d com.apple.quarantine swb`.
 **Nix:**
 
 ```sh
-# The v0.3.0 release:
-nix run github:xoxd-ai/agent-switchboard/v0.3.0#swb -- version
-nix profile install github:xoxd-ai/agent-switchboard/v0.3.0#swb   # puts `swb` on PATH
+# The v0.4.0 release:
+nix run github:xoxd-ai/agent-switchboard/v0.4.0#swb -- version
+nix profile install github:xoxd-ai/agent-switchboard/v0.4.0#swb   # puts `swb` on PATH
 
 # v0.2.2, for a v0.2.2 broker:
 nix profile install github:xoxd-ai/agent-switchboard/v0.2.2#swb
@@ -94,7 +96,7 @@ the project builds and runs on.
 ```sh
 git clone https://github.com/xoxd-ai/agent-switchboard
 cd agent-switchboard
-git checkout v0.3.0               # or v0.2.2 for a v0.2.2 broker
+git checkout v0.4.0               # or v0.2.2 for a v0.2.2 broker
 cargo build --release -p swb      # binary: target/release/swb
 ```
 
