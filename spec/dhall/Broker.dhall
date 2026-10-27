@@ -39,7 +39,7 @@ let LeaseState =
       -- peers() classification in swb-store: ended wins, then age bands.
       < live | idle | gone | ended >
 
-in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655", "R-C944", "R-C950", "SWB-R61" ]
+in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655", "R-C944", "R-C950", "SWB-R61", "SWB-R66", "SWB-R67", "SWB-R68" ]
     , session =
       { lease_seconds = 900
       , live_max_age_seconds = 900
@@ -68,6 +68,21 @@ in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655"
       , inbox_max_limit = 100
       , body_max_bytes = 16384
       , artifacts_max = 20
+      }
+    , binding =
+      -- SWB-R66 to SWB-R68 (ADR-0003, v0.5.0): opt-in sender binding. A
+      -- bound (harness, host, session id) needs its 64-hex session token on
+      -- the acting operations below and on any new register of the key;
+      -- every register rotates it. A binding lapses when its session ends or
+      -- goes (idle_max_age_seconds without a call). The send bucket defaults
+      -- are the implementing PR's choice; swb serve reads SWB_SEND_BURST and
+      -- SWB_SEND_REFILL_PER_MINUTE, and a burst of 0 turns the limit off.
+      { session_token_hex_length = 64
+      , delivery_key = [ "harness", "host", "session_id" ]
+      , token_required_for =
+        [ "send", "inbox", "ack", "claim", "release", "handoff", "end", "register" ]
+      , send_burst_default = 20
+      , send_refill_per_minute_default = 30
       }
     , claim =
       { lease_default_hours = 4

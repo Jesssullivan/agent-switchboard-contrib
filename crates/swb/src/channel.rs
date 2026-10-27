@@ -34,8 +34,11 @@
 //! `inbox` tool. The full set never registers the session: a harness
 //! without a SessionStart hook registers through `swb whoami --register`
 //! and renews its lease outside this process. The pinning is
-//! a client-side guard for this process; the broker itself still trusts a
-//! self-asserted sender (SWB-R05).
+//! a client-side guard for this process. For an unbound id the broker still
+//! trusts a self-asserted sender (SWB-R05); for a bound one (ADR-0003,
+//! SWB-R66) this process sends the session token the session's registration
+//! saved, read from its 0600 file before every `send`, `inbox`, `ack`,
+//! `claim`, `release` and `handoff` (SWB-R67).
 //!
 //! SWB-R10 holds here as it does for hooks. Every broker request runs on the
 //! bounded client (1.5 s), the inbox is read (`POST /v1/inbox`) with
@@ -43,7 +46,7 @@
 //! broker that is down, slow or wrong only makes the poller retry quietly
 //! with backoff. Nothing here blocks or ends the harness.
 use super::{
-    Check, Identity, Lookup, MAX_BODY_BYTES, SendArgs, VERSION, call_with, need,
+    Check, Identity, Lookup, MAX_BODY_BYTES, SendArgs, VERSION, call_as, call_with, need,
     predicted_identity, send_payload, valid_agent_id, valid_note, valid_part, valid_subject,
     valid_ulid,
 };
@@ -169,7 +172,9 @@ fn names_only_claude(lookup: Lookup) -> bool {
 
 /// The `SWB_*` settings this command reads, captured once at start so the
 /// poller thread never reads process-wide environment.
-const ENV_NAMES: [&str; 8] = [
+/// `SWB_STATE_DIR`, `XDG_STATE_HOME` and `HOME` locate a bound session's
+/// saved session token (ADR-0003); nothing else reads them.
+const ENV_NAMES: [&str; 11] = [
     "SWB_BROKER_URL",
     "SWB_AGENT_ID",
     "SWB_HARNESS",
@@ -178,6 +183,9 @@ const ENV_NAMES: [&str; 8] = [
     "SWB_SESSION_PID",
     "SWB_PROC_START",
     "SWB_CHANNEL_POLL_SECONDS",
+    "SWB_STATE_DIR",
+    "XDG_STATE_HOME",
+    "HOME",
 ];
 
 /// One page of unacknowledged messages. A page that exceeds the client's
@@ -304,10 +312,8 @@ fn me_or_err(lookup: Lookup) -> Result<String, String> {
 
 fn fetch(lookup: Lookup, me: &str) -> Result<Value, String> {
     let body = |limit: u32| json!({"me": me, "limit": limit, "wait_seconds": 0});
-    match call_with(lookup, "POST", "/v1/inbox", Some(&body(PAGE))) {
-        Err(e) if e == "broker response too large" => {
-            call_with(lookup, "POST", "/v1/inbox", Some(&body(1)))
-        }
+    match call_as(lookup, me, "/v1/inbox", body(PAGE)) {
+        Err(e) if e == "broker response too large" => call_as(lookup, me, "/v1/inbox", body(1)),
         other => other,
     }
 }
@@ -755,7 +761,7 @@ fn call_full_tool(lookup: Lookup, name: &str, args: &Value) -> Result<Value, Str
             let body = text("body")?.ok_or("send needs body")?;
             let me = pinned_me(lookup, args)?;
             let payload = send_payload(&me, &send, &body)?;
-            call_with(lookup, "POST", "/v1/send", Some(&payload))
+            call_as(lookup, &me, "/v1/send", payload)
         }
         "peers" => {
             let mut query = json!({});
@@ -826,17 +832,18 @@ fn call_full_tool(lookup: Lookup, name: &str, args: &Value) -> Result<Value, Str
                 opt_int(args, "lease_hours", 1..=24)?.map(Value::from),
             );
             put(&mut payload, "note", opt_note(args)?.map(Value::from));
-            payload["me"] = json!(pinned_me(lookup, args)?);
-            call_with(lookup, "POST", "/v1/claim", Some(&payload))
+            let me = pinned_me(lookup, args)?;
+            payload["me"] = json!(me);
+            call_as(lookup, &me, "/v1/claim", payload)
         }
         "release" => {
             let claim_id = need_ulid(args, "claim_id")?;
             let me = pinned_me(lookup, args)?;
-            call_with(
+            call_as(
                 lookup,
-                "POST",
+                &me,
                 "/v1/release",
-                Some(&json!({"me": me, "claim_id": claim_id})),
+                json!({"me": me, "claim_id": claim_id}),
             )
         }
         "handoff" => {
@@ -846,8 +853,9 @@ fn call_full_tool(lookup: Lookup, name: &str, args: &Value) -> Result<Value, Str
                 .ok_or("handoff needs to (a receiver agent id)")?;
             let mut payload = json!({"claim_id": claim_id, "to": to});
             put(&mut payload, "note", opt_note(args)?.map(Value::from));
-            payload["me"] = json!(pinned_me(lookup, args)?);
-            call_with(lookup, "POST", "/v1/handoff", Some(&payload))
+            let me = pinned_me(lookup, args)?;
+            payload["me"] = json!(me);
+            call_as(lookup, &me, "/v1/handoff", payload)
         }
         "claims" => {
             let mut query = json!({});
@@ -900,7 +908,7 @@ pub(crate) fn call_tool(
             let body = text("text").ok_or("reply needs text")?;
             let me = pinned_me(lookup, args)?;
             let payload = send_payload(&me, &send, &body)?;
-            let sent = call_with(lookup, "POST", "/v1/send", Some(&payload))?;
+            let sent = call_as(lookup, &me, "/v1/send", payload)?;
             let mut out = json!({
                 "sent": sent.get("msg_id"),
                 "thread_id": sent.get("thread_id"),
@@ -909,7 +917,7 @@ pub(crate) fn call_tool(
             let wants_ack = args.get("ack").and_then(Value::as_bool).unwrap_or(true);
             if let Some(id) = send.in_reply_to.filter(|_| wants_ack) {
                 let ack = json!({"me": me, "msg_id": id});
-                out["acked"] = match call_with(lookup, "POST", "/v1/ack", Some(&ack)) {
+                out["acked"] = match call_as(lookup, &me, "/v1/ack", ack) {
                     Ok(_) => json!(id),
                     Err(e) => json!(format!("not acknowledged: {e}")),
                 };
@@ -921,12 +929,7 @@ pub(crate) fn call_tool(
                 .filter(|id| valid_ulid(id))
                 .ok_or("ack needs msg_id (ULID)")?;
             let me = pinned_me(lookup, args)?;
-            call_with(
-                lookup,
-                "POST",
-                "/v1/ack",
-                Some(&json!({"me": me, "msg_id": id})),
-            )
+            call_as(lookup, &me, "/v1/ack", json!({"me": me, "msg_id": id}))
         }
         "inbox" => {
             let me = pinned_me(lookup, args)?;
@@ -1662,6 +1665,60 @@ mod tests {
     }
 
     #[test]
+    fn a_bound_session_sends_its_saved_token_and_only_where_it_acts() {
+        let state = std::env::temp_dir().join(format!(
+            "swb-channel-bind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let token = "fe".repeat(32);
+        let dir = state.join("bindings");
+        std::fs::create_dir_all(&dir).unwrap();
+        // HERMES is hermes:<host>:<pid>:<session>; the file drops the pid.
+        let parts: Vec<&str> = HERMES.split(':').collect();
+        std::fs::write(
+            dir.join(format!("{}:{}:{}.token", parts[0], parts[1], parts[3])),
+            &token,
+        )
+        .unwrap();
+        let ok = (200, "application/json", r#"{"ok":true,"messages":[]}"#);
+        let (url, server) = mock(vec![ok; 7]);
+        let state_text = state.display().to_string();
+        let env = snapshot(&lookup_of(&[
+            ("SWB_BROKER_URL", &url),
+            ("SWB_AGENT_ID", HERMES),
+            ("SWB_STATE_DIR", &state_text),
+        ]));
+        let lookup = |name: &str| env.get(name).cloned();
+        for (name, arguments) in [
+            ("send", json!({"to": PEER, "body": "hi"})),
+            ("inbox", json!({})),
+            ("ack", json!({"msg_id": MSG})),
+            ("claim", json!({"subject": "TIN-4655"})),
+            ("release", json!({"claim_id": CLAIM})),
+            ("handoff", json!({"claim_id": CLAIM, "to": PEER})),
+            ("thread", json!({"thread_id": THREAD})),
+        ] {
+            full_call(&lookup, name, arguments).unwrap();
+        }
+        let bodies: Vec<Value> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|r| request_json(r))
+            .collect();
+        for body in &bodies[..6] {
+            assert_eq!(body["session_token"], token.as_str(), "{body}");
+        }
+        // thread takes no token, so none is sent.
+        assert!(bodies[6].get("session_token").is_none());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
     fn full_tools_post_as_this_session() {
         let ok = (200, "application/json", r#"{"ok":true}"#);
         let (url, server) = mock(vec![ok; 7]);
@@ -1851,11 +1908,18 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_keeps_only_swb_settings() {
-        let lookup = lookup_of(&[("SWB_HOST", "neo"), ("HOME", "/h"), ("SWB_AGENT_ID", ME)]);
+    fn snapshot_keeps_only_swb_and_state_settings() {
+        let lookup = lookup_of(&[
+            ("SWB_HOST", "neo"),
+            ("HOME", "/h"),
+            ("SWB_AGENT_ID", ME),
+            ("PATH", "/bin"),
+            ("SWB_BIND", "1"),
+        ]);
         let env = snapshot(&lookup);
-        assert_eq!(env.len(), 2);
+        assert_eq!(env.len(), 3);
         assert_eq!(env["SWB_HOST"], "neo");
+        assert_eq!(env["HOME"], "/h");
         assert_eq!(poll_interval(&lookup_of(&[])), Duration::from_secs(5));
         assert_eq!(
             poll_interval(&lookup_of(&[("SWB_CHANNEL_POLL_SECONDS", "0")])),

@@ -8,6 +8,15 @@
 //! end token `register` returned, errors are typed JSON
 //! (`{"error": <message>, "code": <code>}`), and `/healthz` answers on both
 //! listeners.
+//!
+//! v0.5.0 (ADR-0003, SWB-R66): opt-in sender binding. For an agent id whose
+//! (harness, host, session id) is bound, `send` (by `from`), `inbox`, `ack`,
+//! `claim`, `release`, `handoff` and `end` (by `me`) need the
+//! `session_token` its latest `register` returned, or answer 401
+//! `unauthorized`. Every `send` also takes one token from its sender's
+//! bucket, or answers 429 `rate_limited`. The token is stripped from the
+//! arguments before the store sees them and never reaches an audit line.
+//! Authority stays `peer` on every message (SWB-R14).
 
 use axum::{
     Json, Router,
@@ -31,7 +40,10 @@ use rmcp::{
 use serde_json::{Value, json};
 use std::{collections::HashMap, future::Future, io, sync::Arc, time::Duration};
 use swb_proto::{Authority, VERSION};
-use swb_store::{ClaimsQuery, ErrorKind, HARNESS_KINDS, PeersQuery, Store, StoreError};
+use swb_store::{
+    ClaimsQuery, ErrorKind, HARNESS_KINDS, PeersQuery, SEND_BURST_DEFAULT,
+    SEND_REFILL_PER_MINUTE_DEFAULT, SendLimit, Store, StoreError,
+};
 
 pub const HOOK_TIMEOUT_MS: u64 = 2_000;
 /// Production retention interval. The store no longer prunes inside `send`
@@ -90,7 +102,49 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The agent id an operation acts as, for the operations a bound id needs
+/// its session token for (ADR-0003, SWB-R66). `register` checks its own
+/// token in the store; `peers`, `claims`, `heartbeat` and `thread` take none.
+fn acting_id<'a>(name: &str, args: &'a Value) -> Option<&'a str> {
+    let key = match name {
+        "send" => "from",
+        "inbox" | "ack" | "claim" | "release" | "handoff" | "end" => "me",
+        _ => return None,
+    };
+    args.get(key).and_then(Value::as_str)
+}
+
+/// Check a bound caller's session token and the sender's rate limit, then
+/// run the operation without the token in its arguments.
 fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError> {
+    let token = match args.get("session_token") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(token)) => Some(token.as_str()),
+        Some(_) => return Err("invalid session_token".into()),
+    };
+    if name == "register" {
+        return perform(store, name, args);
+    }
+    if let Some(id) = acting_id(name, args) {
+        store.authorize(id, token)?;
+    }
+    if name == "send"
+        && let Some(sender) = args.get("from").and_then(Value::as_str)
+    {
+        store.admit_send(sender)?;
+    }
+    if token.is_none() && args.get("session_token").is_none() {
+        return perform(store, name, args);
+    }
+    let mut stripped = args.clone();
+    if let Some(map) = stripped.as_object_mut() {
+        map.remove("session_token");
+    }
+    perform(store, name, &stripped)
+}
+
+/// One operation and its audit lines, after [`operation`]'s checks.
+fn perform(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError> {
     let mut created = true;
     let result = match name {
         "register" => store.register(args),
@@ -282,6 +336,8 @@ pub fn error_body(code: &str, message: &str) -> Value {
 fn status_of(kind: ErrorKind) -> StatusCode {
     match kind {
         ErrorKind::Invalid => StatusCode::BAD_REQUEST,
+        ErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+        ErrorKind::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         ErrorKind::Unregistered | ErrorKind::Unavailable | ErrorKind::ClaimUnavailable => {
             StatusCode::NOT_FOUND
         }
@@ -298,28 +354,32 @@ fn agent_id_desc() -> String {
     )
 }
 const ULID_DESC: &str = "Canonical 26-character Crockford base32 ULID";
+const SESSION_TOKEN_DESC: &str = "The session_token the latest register of a bound session returned (ADR-0003). Required while the acting id is bound; ignored for an unbound id. Never repeat it";
 const SUBJECT_DESC: &str = "What is claimed: a ticket (TIN-4655), a path (lab:nix/hosts/sting.nix) or another token in [A-Za-z0-9._:/#@+-], at most 256 bytes";
 
 fn tools() -> Vec<Tool> {
     let agent_id = agent_id_desc();
     [
-        ("register", "Register (or re-register) a self-asserted agent session. Returns agent_id, lease_seconds and end_token. Every register mints a new end_token and invalidates earlier ones. Over MCP the token is part of this result and so enters the caller's context; an adapter that ends sessions itself should keep it and strip it before the model sees it. Never repeat it.", json!({"type":"object","required":["harness","host","pid","session_id","proc_start"],"properties":{
+        ("register", "Register (or re-register) a self-asserted agent session. Returns agent_id, lease_seconds, end_token and bound. Every register mints a new end_token and invalidates earlier ones. With bind true it also binds the session's harness, host and session id and returns a session_token, which send, inbox, ack, claim, release, handoff and end then need; while that binding is live, registering the same session again (any pid) needs the current session_token and rotates it. Over MCP both tokens are part of this result and so enter the caller's context; an adapter should keep them and strip them before the model sees them. Never repeat them.", json!({"type":"object","required":["harness","host","pid","session_id","proc_start"],"properties":{
             "harness":{"type":"string","enum":HARNESS_KINDS,"description":"The harness kind"},
             "host":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"Short host name"},
             "pid":{"type":"integer","minimum":1,"description":"The harness launcher's process id"},
             "session_id":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"The harness's own session id"},
-            "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Opaque process start stamp. peers never returns it; a caller may filter peers on its own."}}})),
+            "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Opaque process start stamp. peers never returns it; a caller may filter peers on its own."},
+            "bind":{"type":"boolean","description":"Bind this harness, host and session id to the caller (ADR-0003, default false). A binding lasts until end or 6 h without a call"},
+            "session_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The current session_token, required to register a session whose binding is live"}}})),
         ("end", "End this session. Needs the end_token its latest register returned; any other token answers state unknown and ends nothing.", json!({"type":"object","required":["me","end_token"],"properties":{
             "me":{"type":"string","description":agent_id},
-            "end_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The end_token register returned"}}})),
-        ("peers", "List sessions: live only by default, one row per harness, host and session id (latest registration wins), paginated. A registered me also renews that caller's own lease; omitting me is passive discovery.", json!({"type":"object","properties":{
+            "end_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The end_token register returned"},
+            "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
+        ("peers", "List sessions: live only by default, one row per harness, host and session id (latest registration wins), paginated. Each row says whether the session is bound. A registered me also renews that caller's own lease; omitting me is passive discovery.", json!({"type":"object","properties":{
             "me":{"type":"string","description":format!("{agent_id}. Optional; renews only this caller's lease")},
             "all":{"type":"boolean","description":"Include idle, gone and ended sessions (default false: live only)"},
             "host":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"Only sessions on this host"},
             "limit":{"type":"integer","minimum":1,"maximum":200,"description":"Page size, default 50, at most 200"},
             "cursor":{"type":"string","description":"next_cursor from the previous page"},
             "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Only sessions whose latest registration used this proc_start (the caller's own stamp; rows never show it)"}}})),
-        ("send", "Send a peer-authority message. The broker stamps authority peer whatever the sender claims.", json!({"type":"object","required":["from","to","ticket","body"],"properties":{
+        ("send", "Send a peer-authority message. The broker stamps authority peer whatever the sender claims. A bound sender needs its session_token. Each sender has a token bucket; an empty one answers rate_limited.", json!({"type":"object","required":["from","to","ticket","body"],"properties":{
             "from":{"type":"string","description":format!("Sender. {agent_id}")},
             "to":{"type":"string","description":format!("Recipient. {agent_id}")},
             "ticket":{"type":"string","pattern":"^(TIN-[0-9]+|none)$","maxLength":64,"description":"TIN-<digits> or none"},
@@ -332,14 +392,17 @@ fn tools() -> Vec<Tool> {
             "reply_expires":{"type":"string","format":"date-time","description":"RFC 3339 time after which a reply is no longer useful"},
             "reply_format":{"type":"string","maxLength":512,"description":"Requested reply shape"},
             "artifacts":{"type":"array","maxItems":20,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":2048},"description":"Up to 20 artifact references"},
-            "ttl_hours":{"type":"integer","minimum":1,"maximum":336,"description":"Message lifetime, default 72 h, clamped to 1..336"}}})),
-        ("inbox", "Fetch this caller's unacknowledged messages, oldest first. Each fetch counts a delivery and renews the caller's lease.", json!({"type":"object","required":["me"],"properties":{
+            "ttl_hours":{"type":"integer","minimum":1,"maximum":336,"description":"Message lifetime, default 72 h, clamped to 1..336"},
+            "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
+        ("inbox", "Fetch this caller's unacknowledged messages, oldest first. Each fetch counts a delivery and renews the caller's lease. A bound session reads the mail of every pid of its harness, host and session id, so a restart keeps unread mail.", json!({"type":"object","required":["me"],"properties":{
             "me":{"type":"string","description":agent_id},
             "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Page size, default 20, at most 100"},
-            "wait_seconds":{"type":"integer","minimum":0,"maximum":25,"description":"Long-poll up to this many seconds when the mailbox is empty (default 0)"}}})),
+            "wait_seconds":{"type":"integer","minimum":0,"maximum":25,"description":"Long-poll up to this many seconds when the mailbox is empty (default 0)"},
+            "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
         ("ack", "Acknowledge a received message so it is not delivered again.", json!({"type":"object","required":["me","msg_id"],"properties":{
             "me":{"type":"string","description":agent_id},
-            "msg_id":{"type":"string","description":ULID_DESC}}})),
+            "msg_id":{"type":"string","description":ULID_DESC},
+            "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
         ("heartbeat", "Renew this session's lease without reading or sending anything.", json!({"type":"object","required":["me"],"properties":{
             "me":{"type":"string","description":agent_id}}})),
         ("thread", "Read one thread's messages that this session sent or received, in seq order. Changes no delivery state; renews the caller's lease.", json!({"type":"object","required":["me","thread_id"],"properties":{
@@ -353,15 +416,18 @@ fn tools() -> Vec<Tool> {
             "exclusive":{"type":"boolean","description":"Ask for exclusive use (default false)"},
             "lease_hours":{"type":"integer","minimum":1,"maximum":24,"description":"Claim lease, default 4 h, clamped to 1..24"},
             "note":{"type":"string","maxLength":512,"description":"Short note shown in claims; no control characters. Never put a secret here"},
-            "handoff_id":{"type":"string","description":format!("{ULID_DESC} of a handoff offered to you; accepting it moves the claim to you")}}})),
+            "handoff_id":{"type":"string","description":format!("{ULID_DESC} of a handoff offered to you; accepting it moves the claim to you")},
+            "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
         ("release", "Release one of your own claims. Releasing it again changes nothing. Another session's claim answers claim_unavailable.", json!({"type":"object","required":["me","claim_id"],"properties":{
             "me":{"type":"string","description":agent_id},
-            "claim_id":{"type":"string","description":ULID_DESC}}})),
+            "claim_id":{"type":"string","description":ULID_DESC},
+            "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
         ("handoff", "Offer one of your active claims to another session. Creates a receipt in offered; the claim moves only when the receiver calls claim with the handoff_id.", json!({"type":"object","required":["me","claim_id","to"],"properties":{
             "me":{"type":"string","description":agent_id},
             "claim_id":{"type":"string","description":format!("{ULID_DESC} of your active claim")},
             "to":{"type":"string","description":format!("Receiver. {agent_id}")},
-            "note":{"type":"string","maxLength":512,"description":"Short note for the receiver; no control characters. Never put a secret here"}}})),
+            "note":{"type":"string","maxLength":512,"description":"Short note for the receiver; no control characters. Never put a secret here"},
+            "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
         ("claims", "List claims: active ones by default, each marked orphaned while its holder is gone. With me, also lists the handoffs offered to or by you and renews your lease.", json!({"type":"object","properties":{
             "me":{"type":"string","description":format!("{agent_id}. Optional; renews only this caller's lease and adds its open handoffs")},
             "subject":{"type":"string","pattern":"^[A-Za-z0-9._:/#@+-]{1,256}$","description":format!("Only claims on this subject. {SUBJECT_DESC}")},
@@ -832,6 +898,28 @@ async fn guard_request(
     }
 }
 
+/// The per-sender send limit (ADR-0003) from `SWB_SEND_BURST` (default
+/// [`SEND_BURST_DEFAULT`]) and `SWB_SEND_REFILL_PER_MINUTE` (default
+/// [`SEND_REFILL_PER_MINUTE_DEFAULT`]). `SWB_SEND_BURST=0` turns it off. A
+/// value that is not a whole number up to 100000 refuses to start.
+pub fn send_limit_from(lookup: &dyn Fn(&str) -> Option<String>) -> Result<SendLimit, String> {
+    let read = |name: &str, default: u32| -> Result<u32, String> {
+        match lookup(name).map(|v| v.trim().to_owned()) {
+            None => Ok(default),
+            Some(v) if v.is_empty() => Ok(default),
+            Some(v) => v
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n <= 100_000)
+                .ok_or_else(|| format!("{name} must be a whole number from 0 to 100000")),
+        }
+    };
+    Ok(SendLimit {
+        burst: read("SWB_SEND_BURST", SEND_BURST_DEFAULT)?,
+        refill_per_minute: read("SWB_SEND_REFILL_PER_MINUTE", SEND_REFILL_PER_MINUTE_DEFAULT)?,
+    })
+}
+
 fn env_list(name: &str) -> Option<Vec<String>> {
     std::env::var(name).ok().map(|v| {
         v.split(',')
@@ -1016,6 +1104,12 @@ where
     let allowed_origins = env_list("SWB_ALLOWED_ORIGINS").unwrap_or_default();
     let guard = RequestGuard::new(&allowed_hosts, &allowed_origins)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    store
+        .set_send_limit(
+            send_limit_from(&|name| std::env::var(name).ok())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+        )
+        .map_err(io::Error::other)?;
     store.prune().map_err(io::Error::other)?;
     let config = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
     let mcp_cancel = config.cancellation_token.clone();
@@ -2435,6 +2529,313 @@ mod tests {
             audit_record("claim", &args, &result, None)["subject"],
             "TIN-1"
         );
+    }
+
+    async fn mcp_session(app: &Router) -> String {
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"swb-test","version":"1"}}});
+        let response = app
+            .clone()
+            .oneshot(guarded_request(
+                "POST",
+                "/mcp",
+                &init.to_string(),
+                &[("host", "localhost")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get("mcp-session-id")
+            .expect("rmcp session id")
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// One MCP tool call's whole `result`, error results included.
+    async fn mcp_result(app: &Router, session: &str, id: u32, name: &str, args: Value) -> Value {
+        let call = json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":args}});
+        let response = app
+            .clone()
+            .oneshot(guarded_request(
+                "POST",
+                "/mcp",
+                &call.to_string(),
+                &[("host", "localhost"), ("mcp-session-id", session)],
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let raw = std::str::from_utf8(&body).unwrap();
+        let payload = raw
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .find(|line| line.trim_start().starts_with('{'))
+            .unwrap_or(raw);
+        serde_json::from_str::<Value>(payload).unwrap()["result"].clone()
+    }
+
+    async fn status_and_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        (status, json_of(response).await)
+    }
+
+    const BOUND_REGISTER: &str = r#"{"harness":"hermes","host":"sting","pid":100,"session_id":"svc","proc_start":"s-100","bind":true}"#;
+    const BOUND_ID: &str = "hermes:sting:100:svc";
+
+    #[tokio::test]
+    async fn spoofed_send_as_a_bound_id_fails_over_rest_and_mcp() {
+        let store = Arc::new(Store::memory().unwrap());
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let (status, registered) =
+            status_and_json(call(&app, "POST", "/v1/register", BOUND_REGISTER).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(registered["bound"], true);
+        let token = registered["session_token"].as_str().unwrap().to_owned();
+        let peer = "claude:honey:1:a";
+        // The spoof test (SWB-R66): from set to a bound id and no token.
+        for body in [
+            json!({"from":BOUND_ID,"to":peer,"ticket":"none","body":"spoofed"}),
+            json!({"from":BOUND_ID,"to":peer,"ticket":"none","body":"spoofed","session_token":"0".repeat(64)}),
+            json!({"from":BOUND_ID,"to":peer,"ticket":"none","body":"spoofed","session_token":registered["end_token"]}),
+        ] {
+            let (status, error) =
+                status_and_json(call(&app, "POST", "/v1/send", &body.to_string()).await).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{error}");
+            assert_eq!(error["code"], "unauthorized");
+        }
+        assert!(
+            store.inbox(peer, 10).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // Over MCP the same send is an error result and stores nothing.
+        let session = mcp_session(&app).await;
+        let spoof = mcp_result(
+            &app,
+            &session,
+            2,
+            "send",
+            json!({"from":BOUND_ID,"to":peer,"ticket":"none","body":"spoofed over mcp"}),
+        )
+        .await;
+        assert_eq!(spoof["isError"], true, "{spoof}");
+        assert!(spoof.to_string().contains("unauthorized"), "{spoof}");
+        assert!(
+            store.inbox(peer, 10).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // Every other listed operation needs the token too.
+        for (route, body) in [
+            ("/v1/inbox", json!({"me":BOUND_ID})),
+            (
+                "/v1/ack",
+                json!({"me":BOUND_ID,"msg_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}),
+            ),
+            ("/v1/claim", json!({"me":BOUND_ID,"subject":"TIN-4655"})),
+            (
+                "/v1/release",
+                json!({"me":BOUND_ID,"claim_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}),
+            ),
+            (
+                "/v1/handoff",
+                json!({"me":BOUND_ID,"claim_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","to":peer}),
+            ),
+            (
+                "/v1/end",
+                json!({"me":BOUND_ID,"end_token":registered["end_token"]}),
+            ),
+            (
+                "/v1/register",
+                serde_json::from_str::<Value>(BOUND_REGISTER).unwrap(),
+            ),
+        ] {
+            let (status, error) =
+                status_and_json(call(&app, "POST", route, &body.to_string()).await).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}: {error}");
+        }
+        assert!(
+            store.claims(&ClaimsQuery::default()).unwrap()["claims"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // With the token the send goes through, as peer, and the token is
+        // not part of the stored envelope.
+        let body =
+            json!({"from":BOUND_ID,"to":peer,"ticket":"none","body":"real","session_token":token});
+        let (status, sent) =
+            status_and_json(call(&app, "POST", "/v1/send", &body.to_string()).await).await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        assert_eq!(sent["authority"], "peer");
+        assert!(!sent.to_string().contains(&token));
+        let received = store.inbox(peer, 10).unwrap();
+        assert_eq!(received["messages"][0]["from"], BOUND_ID);
+        assert!(!received.to_string().contains(&token));
+        let claim = json!({"me":BOUND_ID,"subject":"TIN-4655","session_token":token});
+        let (status, _) =
+            status_and_json(call(&app, "POST", "/v1/claim", &claim.to_string()).await).await;
+        assert_eq!(status, StatusCode::OK);
+        // SWB-R68: peers shows the binding.
+        let listed = json_of(call(&app, "GET", "/v1/peers", "").await).await;
+        assert_eq!(listed["peers"][0]["bound"], true);
+        // An ill-typed token is a plain invalid argument.
+        let (status, _) = status_and_json(
+            call(
+                &app,
+                "POST",
+                "/v1/inbox",
+                &json!({"me":BOUND_ID,"session_token":7}).to_string(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_bound_client_rotates_its_token_on_every_register() {
+        let store = Arc::new(Store::memory().unwrap());
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let first = json_of(call(&app, "POST", "/v1/register", BOUND_REGISTER).await).await;
+        let old = first["session_token"].as_str().unwrap().to_owned();
+        let mut again: Value = serde_json::from_str(BOUND_REGISTER).unwrap();
+        again["session_token"] = json!(old);
+        let (status, second) =
+            status_and_json(call(&app, "POST", "/v1/register", &again.to_string()).await).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let new = second["session_token"].as_str().unwrap();
+        assert_ne!(new, old);
+        let with = |token: &str| json!({"me":BOUND_ID,"session_token":token}).to_string();
+        let (status, _) = status_and_json(call(&app, "POST", "/v1/inbox", &with(&old)).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = status_and_json(call(&app, "POST", "/v1/inbox", &with(new)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        // The old token cannot register again either.
+        let (status, _) =
+            status_and_json(call(&app, "POST", "/v1/register", &again.to_string()).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_empty_send_bucket_answers_429_rate_limited() {
+        let store = Arc::new(Store::memory().unwrap());
+        store
+            .set_send_limit(SendLimit {
+                burst: 2,
+                refill_per_minute: 1,
+            })
+            .unwrap();
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let send = |from: &str| {
+            json!({"from":from,"to":"pi:sting:2:b","ticket":"none","body":"x"}).to_string()
+        };
+        for _ in 0..2 {
+            let (status, _) =
+                status_and_json(call(&app, "POST", "/v1/send", &send("claude:honey:1:a")).await)
+                    .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, error) =
+            status_and_json(call(&app, "POST", "/v1/send", &send("claude:honey:1:a")).await).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error["code"], "rate_limited");
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("rate limited; retry in")
+        );
+        // The refused send stored nothing; another sender is unaffected.
+        assert_eq!(
+            store.inbox("pi:sting:2:b", 10).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let (status, _) =
+            status_and_json(call(&app, "POST", "/v1/send", &send("codex:honey:3:c")).await).await;
+        assert_eq!(status, StatusCode::OK);
+        // A spoofer without the token cannot drain a bound sender's bucket.
+        let registered = json_of(call(&app, "POST", "/v1/register", BOUND_REGISTER).await).await;
+        for _ in 0..5 {
+            let (status, _) =
+                status_and_json(call(&app, "POST", "/v1/send", &send(BOUND_ID)).await).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let mut real: Value = serde_json::from_str(&send(BOUND_ID)).unwrap();
+        real["session_token"] = registered["session_token"].clone();
+        let (status, _) =
+            status_and_json(call(&app, "POST", "/v1/send", &real.to_string()).await).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn the_send_limit_reads_conservative_defaults_and_refuses_bad_values() {
+        let none = |_: &str| None;
+        assert_eq!(
+            send_limit_from(&none).unwrap(),
+            SendLimit {
+                burst: 20,
+                refill_per_minute: 30
+            }
+        );
+        let set = |burst: &'static str| {
+            move |name: &str| (name == "SWB_SEND_BURST").then(|| burst.to_owned())
+        };
+        assert_eq!(send_limit_from(&set("0")).unwrap().burst, 0);
+        assert_eq!(send_limit_from(&set(" 5 ")).unwrap().burst, 5);
+        assert!(send_limit_from(&set("-1")).is_err());
+        assert!(send_limit_from(&set("lots")).is_err());
+        assert!(send_limit_from(&set("100001")).is_err());
+    }
+
+    #[tokio::test]
+    async fn unbound_sessions_work_as_in_v040() {
+        let store = Arc::new(Store::memory().unwrap());
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let registered =
+            json_of(call(&app, "POST", "/v1/register", GUARDED_ROUTES[0].2).await).await;
+        assert_eq!(registered["bound"], false);
+        assert!(registered.get("session_token").is_none());
+        let me = registered["agent_id"].as_str().unwrap();
+        let send = json!({"from":me,"to":me,"ticket":"none","body":"self"}).to_string();
+        let (status, sent) = status_and_json(call(&app, "POST", "/v1/send", &send).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let inbox =
+            json_of(call(&app, "POST", "/v1/inbox", &json!({"me":me}).to_string()).await).await;
+        assert_eq!(inbox["messages"][0]["msg_id"], sent["msg_id"]);
+        let ack = json!({"me":me,"msg_id":sent["msg_id"]}).to_string();
+        let (status, _) = status_and_json(call(&app, "POST", "/v1/ack", &ack).await).await;
+        assert_eq!(status, StatusCode::OK);
+        // Anyone may still send as an unbound id (SWB-R05 for unbound ids).
+        let other =
+            json!({"from":"codex:sting:9:x","to":me,"ticket":"none","body":"unregistered sender"});
+        let (status, _) =
+            status_and_json(call(&app, "POST", "/v1/send", &other.to_string()).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = json_of(call(&app, "GET", "/v1/peers", "").await).await;
+        assert_eq!(listed["peers"][0]["bound"], false);
+    }
+
+    #[test]
+    fn audit_never_carries_a_session_token() {
+        let store = Store::memory().unwrap();
+        let args: Value = serde_json::from_str(BOUND_REGISTER).unwrap();
+        let result = store.register(&args).unwrap();
+        let token = result["session_token"].as_str().unwrap().to_owned();
+        let line = audit_record("register", &args, &result, None).to_string();
+        assert!(!line.contains(&token), "{line}");
+        let send = json!({"from":BOUND_ID,"to":"pi:sting:2:b","ticket":"none","body":"b","session_token":token});
+        let sent = operation(&store, "send", &send).unwrap();
+        for line in audit_lines(&store, "send", &send, &sent, true).unwrap() {
+            assert!(!line.to_string().contains(&token), "{line}");
+        }
     }
 
     #[test]

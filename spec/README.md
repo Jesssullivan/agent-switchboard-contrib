@@ -145,7 +145,7 @@ then point the suite at it:
 ```sh
 d="$(mktemp -d "$HOME/scratch/swb-spec.XXXXXX")"
 timeout 600 env SWB_DB_PATH="$d/swb.sqlite3" SWB_LISTEN=127.0.0.1:18080 \
-  SWB_METRICS_LISTEN=127.0.0.1:19090 bazel-bin/crates/swb/swb serve &
+  SWB_METRICS_LISTEN=127.0.0.1:19090 SWB_SEND_BURST=0 bazel-bin/crates/swb/swb serve &
 just spec-live http://127.0.0.1:18080
 ```
 
@@ -162,9 +162,14 @@ bazel build //crates/swb:swb_test_clock
 d="$(mktemp -d "$HOME/scratch/swb-spec.XXXXXX")"
 timeout 900 env SWB_TEST_CLOCK=1 SWB_DB_PATH="$d/swb.sqlite3" \
   SWB_LISTEN=127.0.0.1:18080 SWB_METRICS_LISTEN=127.0.0.1:19090 \
-  bazel-bin/crates/swb/swb_test_clock serve &
+  SWB_SEND_BURST=0 bazel-bin/crates/swb/swb_test_clock serve &
 just spec-live-clock http://127.0.0.1:18080
 ```
+
+`SWB_SEND_BURST=0` turns off the per-sender send limit (ADR-0003), which the
+model does not describe; a long trace from one sender would otherwise meet
+429 `rate_limited`. The model also has no sender binding: the suite
+registers without `bind`, so every id it uses is unbound.
 
 **Live coverage.**
 

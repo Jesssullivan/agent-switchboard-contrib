@@ -221,3 +221,94 @@ async fn owned_http_round_trip_survives_graceful_service_reopen() {
         }
     }
 }
+
+/// ADR-0003 (SWB-R66): a bound service id keeps its unread mail through a
+/// broker restart and its own restart under a new pid. The restarted process
+/// presents the session token it saved (SWB-R67) and gets a rotated one.
+#[tokio::test]
+async fn bound_service_restart_keeps_unread_mail_through_a_broker_reopen() {
+    let dir = std::env::var_os("TEST_TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join(format!(
+        "swb-bound-service-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let peer = "claude:honey:1:peer";
+    let register = |pid: u32, token: Option<&str>| {
+        let mut body = json!({"harness":"hermes","host":"sting","pid":pid,
+            "session_id":"cade","proc_start":format!("start-{pid}"),"bind":true});
+        if let Some(token) = token {
+            body["session_token"] = json!(token);
+        }
+        Some(body)
+    };
+    let (address, done, server) = fixture_service(&path).await;
+    let first = fixture_http(address, "POST", "/v1/register", register(100, None)).await;
+    assert_eq!(first["bound"], true);
+    let old_id = first["agent_id"].as_str().unwrap().to_owned();
+    let token = first["session_token"].as_str().unwrap().to_owned();
+    let sent = fixture_http(
+        address,
+        "POST",
+        "/v1/send",
+        Some(json!({"from":peer,"to":old_id,"ticket":"TIN-4655","body":"before restart"})),
+    )
+    .await;
+    let msg_id = sent["msg_id"].as_str().unwrap().to_owned();
+    done.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    // The broker reopens the same file; the service restarts with a new pid.
+    let (address, done, server) = fixture_service(&path).await;
+    let second = fixture_http(address, "POST", "/v1/register", register(200, Some(&token))).await;
+    let new_id = second["agent_id"].as_str().unwrap().to_owned();
+    assert_ne!(new_id, old_id);
+    let rotated = second["session_token"].as_str().unwrap().to_owned();
+    assert_ne!(rotated, token);
+    let unread = fixture_http(
+        address,
+        "POST",
+        "/v1/inbox",
+        Some(json!({"me":new_id,"wait_seconds":0,"session_token":rotated})),
+    )
+    .await;
+    assert_eq!(unread["messages"][0]["msg_id"], msg_id.as_str());
+    assert_eq!(unread["messages"][0]["authority"], "peer");
+    let acked = fixture_http(
+        address,
+        "POST",
+        "/v1/ack",
+        Some(json!({"me":new_id,"msg_id":msg_id,"session_token":rotated})),
+    )
+    .await;
+    assert_eq!(acked["state"], "acked");
+    let peers = fixture_http(address, "GET", "/v1/peers", None).await;
+    let rows = peers["peers"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["agent_id"], new_id.as_str());
+    assert_eq!(rows[0]["bound"], true);
+    done.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    for candidate in [
+        path.clone(),
+        std::path::PathBuf::from(format!("{}-wal", path.display())),
+        std::path::PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        if candidate.exists() {
+            std::fs::remove_file(candidate).unwrap();
+        }
+    }
+}

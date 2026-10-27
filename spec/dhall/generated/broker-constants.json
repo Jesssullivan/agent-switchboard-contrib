@@ -1,4 +1,24 @@
 {
+  "binding": {
+    "delivery_key": [
+      "harness",
+      "host",
+      "session_id"
+    ],
+    "send_burst_default": 20,
+    "send_refill_per_minute_default": 30,
+    "session_token_hex_length": 64,
+    "token_required_for": [
+      "send",
+      "inbox",
+      "ack",
+      "claim",
+      "release",
+      "handoff",
+      "end",
+      "register"
+    ]
+  },
   "claim": {
     "lease_default_hours": 4,
     "lease_max_hours": 24,
@@ -42,7 +62,10 @@
     "R-C655",
     "R-C944",
     "R-C950",
-    "SWB-R61"
+    "SWB-R61",
+    "SWB-R66",
+    "SWB-R67",
+    "SWB-R68"
   ],
   "session": {
     "end_token_hex_length": 64,
