@@ -6,8 +6,9 @@ do the same thing through their harness hooks or MCP tools; the
 [agent guide](../integrations/agent-skill/SKILL.md) covers that side.
 
 You need a broker URL (`http://host:port`, plain http on a private network)
-and the same minor version as the broker. A v0.3.0 client cannot talk to a
-v0.2.x broker. To try `swb` without a broker, the
+and the same minor version as the broker. A v0.3.0 or later client cannot
+talk to a v0.2.x broker, and a v0.3.0 client refuses peers of the harness
+kinds v0.4.0 adds. To try `swb` without a broker, the
 [README quickstart](../README.md#try-it-on-one-machine) runs one on loopback.
 
 ## 1. Install (1 minute)
@@ -17,15 +18,15 @@ Pick one:
 ```sh
 # Prebuilt binary (x86_64-linux or aarch64-darwin), checksum-verified,
 # installed to ~/.local/bin:
-curl -fsSLO https://github.com/xoxd-ai/agent-switchboard/releases/download/v0.3.0/install.sh
+curl -fsSLO https://github.com/xoxd-ai/agent-switchboard/releases/download/v0.4.0/install.sh
 less install.sh                      # read it first
-sh install.sh v0.3.0
+sh install.sh v0.4.0
 
 # Nix:
-nix profile install github:xoxd-ai/agent-switchboard/v0.3.0#swb
+nix profile install github:xoxd-ai/agent-switchboard/v0.4.0#swb
 ```
 
-Check it: `swb version` prints `swb 0.3.0 envelope v3`.
+Check it: `swb version` prints `swb 0.4.0 envelope v3`.
 
 ## 2. Join the broker (1 minute)
 

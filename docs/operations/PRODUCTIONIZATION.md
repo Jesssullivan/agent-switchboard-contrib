@@ -285,6 +285,15 @@ v0.3.0, with an install script that verifies them.
   [39888543363](https://github.com/xoxd-ai/agent-switchboard/actions/runs/39888543363)
   pushed `sha256:2e42fc30…` and read it back; `install.sh v0.3.0` passed
   with its signature check on sting (Linux) and on PZM (macOS).
+- **v0.4.0 (SWB-R64)** (2026-10-27; receipt TIN-4655 comment `dc057a01`).
+  The release workflow run
+  [40462880065](https://github.com/xoxd-ai/agent-switchboard/actions/runs/40462880065)
+  pushed `sha256:a6303937…` and read it back. `just release-binaries v0.4.0`
+  built Linux on sting and Darwin on PZM from `c366d119`, and the signed
+  `SHA256SUMS` verified against `release-signers.asc`. After publication,
+  `install.sh v0.4.0` passed on sting (Linux) with `SWB_REQUIRE_SIGNATURE=1`
+  and on PZM (macOS) with its checksum check, because the non-interactive
+  PZM shell has no `gpg`. Both printed `swb 0.4.0 envelope v3`.
 - The binaries are not part of the approved-broker record: that record and
   the release workflow pin only the OCI image. The binaries' hashes are in
   the signed `SHA256SUMS` and in the release receipt on TIN-6749.
