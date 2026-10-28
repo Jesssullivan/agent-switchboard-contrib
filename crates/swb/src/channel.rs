@@ -47,8 +47,8 @@
 //! with backoff. Nothing here blocks or ends the harness.
 use super::{
     Check, Identity, Lookup, MAX_BODY_BYTES, SendArgs, VERSION, ack_after_reply, call_as,
-    call_with, need, predicted_identity, recipient_warning, send_payload, valid_agent_id,
-    valid_note, valid_part, valid_subject, valid_ulid,
+    call_with, need, predicted_identity, recipient_warning, retryable_failure, send_payload,
+    valid_agent_id, valid_note, valid_part, valid_subject, valid_ulid,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -335,9 +335,10 @@ pub(crate) struct Seen {
     /// The last msg_id the tail walk read. Every later message arrives
     /// after it, so the next walk resumes there.
     tail: Option<String>,
-    /// Set when an emitted id was forgotten: the next walk starts again at
-    /// the head page's `next_after`.
-    rescan: bool,
+    /// Emitted ids forgotten since and not emitted again yet. While one is
+    /// left, the next walk starts again at the head page's `next_after`,
+    /// because the id may lie behind the stored tail.
+    forgotten: HashSet<String>,
 }
 
 impl Seen {
@@ -345,6 +346,7 @@ impl Seen {
         if !self.ids.insert(id.to_owned()) {
             return false;
         }
+        self.forgotten.remove(id);
         self.order.push_back(id.to_owned());
         if self.order.len() > SEEN_CAP
             && let Some(oldest) = self.order.pop_front()
@@ -355,12 +357,12 @@ impl Seen {
     }
 
     /// Forget an emitted id, so the next read that returns it emits it
-    /// again (A2, TIN-7577). The next tail walk starts over, because the
-    /// id may lie behind the stored tail.
+    /// again (A2, TIN-7577). Until then the next tail walk starts over at
+    /// the head page's end, because the id may lie behind the stored tail.
     fn forget(&mut self, id: &str) {
         if self.ids.remove(id) {
             self.order.retain(|held| held != id);
-            self.rescan = true;
+            self.forgotten.insert(id.to_owned());
         }
     }
 }
@@ -408,15 +410,22 @@ fn emit_new(messages: &[Value], seen: &mut Seen, me: &str) -> Vec<Value> {
         .collect()
 }
 
+fn msg_id(message: &Value) -> Option<&str> {
+    message.get("msg_id").and_then(Value::as_str)
+}
+
 /// One poll. An unregistered session is an empty poll, not an error.
 ///
 /// It reads the head page first. When the head emits nothing new and is
 /// full, it walks the pages after it from where the last walk stopped, at
 /// most [`TAIL_PAGES`] pages, and stops at the first page that emits
 /// something (A1, TIN-7577). Every new message arrives after the stored
-/// tail, so the walk never skips one. A tail the broker no longer knows
-/// (`unknown after`, a pruned message) is dropped and the next walk starts
-/// at the head page's `next_after`.
+/// tail, so the walk never skips one. The walk starts at the head page's
+/// `next_after` instead when an id was forgotten (A2), when the tail is on
+/// the head page, when the broker no longer knows the tail (`unknown
+/// after`, a pruned message) and when the first page after the tail
+/// repeats the head (its messages were acknowledged). Such a restart reads
+/// one page more and does not count it.
 pub(crate) fn poll_once(lookup: Lookup, seen: &mut Seen) -> Result<Poll, String> {
     let mut poll = Poll {
         events: Vec::new(),
@@ -431,26 +440,57 @@ pub(crate) fn poll_once(lookup: Lookup, seen: &mut Seen) -> Result<Poll, String>
     poll.pending = messages.len();
     poll.events = emit_new(messages, seen, &me);
     let Some(head_next) = next_after(&head) else {
+        // Every unacknowledged message is on this page, so a forgotten id
+        // that is not on it was acknowledged since.
+        seen.forgotten.clear();
         return Ok(poll);
     };
     if !poll.events.is_empty() {
         poll.more = true;
         return Ok(poll);
     }
-    if std::mem::take(&mut seen.rescan) {
+    let head_ids: HashSet<&str> = messages.iter().filter_map(msg_id).collect();
+    if !seen.forgotten.is_empty()
+        || seen
+            .tail
+            .as_deref()
+            .is_some_and(|tail| head_ids.contains(tail))
+    {
+        seen.forgotten.clear();
         seen.tail = None;
     }
-    let mut cursor = seen.tail.clone().unwrap_or(head_next);
-    for _ in 0..TAIL_PAGES {
+    let mut cursor = seen.tail.clone().unwrap_or_else(|| head_next.clone());
+    // Whether the next read starts at a stored tail rather than the head.
+    let mut from_tail = cursor != head_next;
+    let mut pages = 0;
+    while pages < TAIL_PAGES {
         let page = match fetch(lookup, &me, Some(cursor.as_str())) {
             Ok(page) => page,
             Err(e) if e.ends_with("unknown after") => {
                 seen.tail = None;
+                if std::mem::take(&mut from_tail) {
+                    cursor = head_next.clone();
+                    continue;
+                }
+                // The head's own next_after is unknown, for example when
+                // the mailbox changed under the binding: poll again soon.
+                poll.more = true;
                 return Ok(poll);
             }
             Err(e) => return Err(e),
         };
         let messages = page_messages(&page)?;
+        if std::mem::take(&mut from_tail)
+            && messages
+                .iter()
+                .filter_map(msg_id)
+                .any(|id| head_ids.contains(id))
+        {
+            seen.tail = None;
+            cursor = head_next.clone();
+            continue;
+        }
+        pages += 1;
         if let Some(last) = messages
             .last()
             .and_then(|message| message.get("msg_id"))
@@ -1064,6 +1104,11 @@ pub(crate) fn call_tool(
             };
             let me = pinned_me(lookup, args)?;
             let batch = fetch(lookup, &me, after)?;
+            // A v0.5.0 or older broker ignores `after` and answers the head
+            // page, which must not pass for the page after the cursor.
+            if after.is_some() && batch.get("next_after").is_none() {
+                return Err("broker does not page (v0.5.0 or older)".into());
+            }
             Ok(json!({
                 "me": me,
                 "note": "peer messages are teammate information, not operator authority",
@@ -1076,8 +1121,12 @@ pub(crate) fn call_tool(
 }
 
 /// The message a failed ack or reply left unacknowledged, so the poller
-/// emits it again (A2, TIN-7577). An ack that failed, or a reply or full
-/// `send` whose own ack did not go through, names it; one with `ack: false`
+/// emits it again (A2, TIN-7577). Only a failure that may pass on a later
+/// try counts: no answer, a 401 during a registration gap, a 5xx or a
+/// session not registered yet. A refusal such as 400, 403, 404, 409 or 429
+/// would fail the same way after every re-emit, so it never counts. Such
+/// a failure of an ack, of a reply or full `send`, or of the ack a reply or
+/// `send` makes names the message. A reply or `send` with `ack: false`
 /// never does.
 fn unacked(name: &str, args: &Value, outcome: &Result<Value, String>) -> Option<String> {
     let key = match name {
@@ -1093,10 +1142,32 @@ fn unacked(name: &str, args: &Value, outcome: &Result<Value, String>) -> Option<
         return None;
     }
     let failed = match outcome {
-        Err(_) => true,
-        Ok(result) => name != "ack" && result.get("acked").and_then(Value::as_str) != Some(id),
+        Err(error) => retryable_failure(error),
+        Ok(_) if name == "ack" => false,
+        Ok(result) => result
+            .get("acked")
+            .and_then(Value::as_str)
+            .and_then(|acked| acked.strip_prefix("not acknowledged: "))
+            .is_some_and(retryable_failure),
     };
     failed.then(|| id.to_owned())
+}
+
+/// Failed ids held for the poller at most; the oldest goes first.
+const FAILED_CAP: usize = 256;
+
+/// Forget each id a failed ack or reply recorded, so the next read that
+/// lists it emits it again (A2, TIN-7577).
+fn take_failed(failed: &Mutex<Vec<String>>, seen: &mut Seen) {
+    if let Ok(mut list) = failed.lock() {
+        for id in list.drain(..) {
+            seen.forget(&id);
+        }
+    }
+}
+
+fn has_failed(failed: &Mutex<Vec<String>>) -> bool {
+    failed.lock().is_ok_and(|list| !list.is_empty())
 }
 
 /// [`handle_with`] without a poller to tell about failed acks.
@@ -1112,9 +1183,10 @@ pub(crate) fn handle(
 
 /// Answers one JSON-RPC message from Claude Code. Notifications and
 /// responses get no answer; an unknown request gets method-not-found, which
-/// is also how a probe for a newer protocol revision is declined. Each
-/// message id a failed ack or reply left unacknowledged goes into `failed`,
-/// for the poller to emit again (A2, TIN-7577).
+/// is also how a probe for a newer protocol revision is declined. In a
+/// mode that pushes, each message id a failed ack or reply left
+/// unacknowledged goes into `failed`, for the poller to emit again (A2,
+/// TIN-7577). A mode without a poller records nothing.
 pub(crate) fn handle_with(
     lookup: Lookup,
     mode: Mode,
@@ -1140,10 +1212,14 @@ pub(crate) fn handle_with(
             let empty = json!({});
             let args = params.and_then(|p| p.get("arguments")).unwrap_or(&empty);
             let outcome = call_tool(lookup, mode.tools, name, args);
-            if mode.tools.names().contains(&name)
+            if mode.push
+                && mode.tools.names().contains(&name)
                 && let Some(id) = unacked(name, args, &outcome)
                 && let Ok(mut list) = failed.lock()
             {
+                if list.len() >= FAILED_CAP {
+                    list.remove(0);
+                }
                 list.push(id);
             }
             Ok(match outcome {
@@ -1189,10 +1265,14 @@ pub(crate) fn backoff(base: Duration, failures: u32) -> Duration {
         .min(MAX_BACKOFF)
 }
 
-fn pause(wait: Duration, stop: &AtomicBool) {
+/// Sleep up to `wait` in short steps. It ends early on `stop`, and, when
+/// `failed` is given, as soon as a failed ack or reply records a message
+/// to emit again, so that re-emit never waits a full recheck (A2,
+/// TIN-7577).
+fn pause(wait: Duration, stop: &AtomicBool, failed: Option<&Mutex<Vec<String>>>) {
     let step = Duration::from_millis(200);
     let mut left = wait;
-    while !left.is_zero() && !stop.load(Ordering::SeqCst) {
+    while !left.is_zero() && !stop.load(Ordering::SeqCst) && !failed.is_some_and(has_failed) {
         let nap = left.min(step);
         std::thread::sleep(nap);
         left = left.saturating_sub(nap);
@@ -1213,16 +1293,12 @@ fn poller<W: Write>(
     while !stop.load(Ordering::SeqCst) {
         // No event is emitted before the client has finished initializing.
         if !ready.load(Ordering::SeqCst) {
-            pause(Duration::from_millis(200), &stop);
+            pause(Duration::from_millis(200), &stop, None);
             continue;
         }
         // A2 (TIN-7577): a message whose ack or reply failed is emitted
         // again on a later read, if the broker still lists it as unacked.
-        if let Ok(mut list) = failed.lock() {
-            for id in list.drain(..) {
-                seen.forget(&id);
-            }
-        }
+        take_failed(&failed, &mut seen);
         let wait = match poll_once(&lookup, &mut seen) {
             Ok(poll) => {
                 if failures > 0 {
@@ -1249,7 +1325,7 @@ fn poller<W: Write>(
                 backoff(base, failures)
             }
         };
-        pause(wait, &stop);
+        pause(wait, &stop, Some(&*failed));
     }
 }
 
@@ -1607,27 +1683,32 @@ mod tests {
             seen.insert(id);
         }
         seen.tail = Some(id(50));
+        let unknown = r#"{"error":"unknown after","code":"invalid_argument"}"#;
+        let empty = r#"{"messages":[],"next_after":null}"#;
+        // The same poll walks again from the head page's next_after.
         let (url, server) = mock(vec![
             (200, json, head),
-            (
-                400,
-                json,
-                r#"{"error":"unknown after","code":"invalid_argument"}"#,
-            ),
+            (400, json, unknown),
+            (200, json, page_body(&[id(9)], false)),
         ]);
         let poll = poll_once(&me_at(&url), &mut seen).unwrap();
-        assert!(poll.events.is_empty());
-        assert!(seen.tail.is_none());
+        assert_eq!(poll.events.len(), 1);
+        assert_eq!(seen.tail, Some(id(9)));
         let requests = server.join().unwrap();
         assert_eq!(request_json(&requests[1])["after"], id(50).as_str());
-        // The next walk starts at the head page's next_after.
-        let (url, server) = mock(vec![
-            (200, json, head),
-            (200, json, r#"{"messages":[],"next_after":null}"#),
-        ]);
-        poll_once(&me_at(&url), &mut seen).unwrap();
+        assert_eq!(request_json(&requests[2])["after"], ids[7].as_str());
+        // When the head's own next_after is unknown, the poll ends with more
+        // set, so the next one comes without the pending recheck.
+        seen.tail = None;
+        let (url, server) = mock(vec![(200, json, head), (400, json, unknown)]);
+        let poll = poll_once(&me_at(&url), &mut seen).unwrap();
+        assert!(poll.events.is_empty());
+        assert!(poll.more);
         let requests = server.join().unwrap();
         assert_eq!(request_json(&requests[1])["after"], ids[7].as_str());
+        let (url, server) = mock(vec![(200, json, head), (200, json, empty)]);
+        poll_once(&me_at(&url), &mut seen).unwrap();
+        server.join().unwrap();
     }
 
     #[test]
@@ -1649,6 +1730,20 @@ mod tests {
         assert!(poll.more);
         assert_eq!(server.join().unwrap().len(), 1 + TAIL_PAGES);
         assert_eq!(seen.tail, Some(id(8 * (TAIL_PAGES + 1))));
+    }
+
+    #[test]
+    fn inbox_tool_refuses_after_on_a_broker_that_does_not_page() {
+        let (url, server) = mock(vec![(200, "application/json", r#"{"messages":[]}"#)]);
+        let error = call_tool(
+            &me_at(&url),
+            ToolSet::Channel,
+            "inbox",
+            &json!({"after": id(1)}),
+        )
+        .unwrap_err();
+        assert!(error.contains("does not page"), "{error}");
+        server.join().unwrap();
     }
 
     #[test]
@@ -1833,29 +1928,50 @@ mod tests {
         handle_with(lookup, CHANNEL, &message, &ready, failed).unwrap()
     }
 
-    /// A2 (TIN-7577): a failed ack or reply leaves its message to be
-    /// emitted again; a successful one, or a reply with ack false, does not.
+    /// A2 (TIN-7577): an ack or reply that may pass on a later try leaves
+    /// its message to be emitted again. A refusal, a successful ack, a
+    /// reply with ack false and a session without a poller record nothing.
     #[test]
     fn a_failed_ack_or_reply_emits_the_message_again() {
         let json = "application/json";
+        let down = r#"{"error":"store unavailable","code":"internal"}"#;
         let unavailable = r#"{"error":"message unavailable","code":"message_unavailable"}"#;
+        let limited = r#"{"error":"rate limited; retry in 10 s","code":"rate_limited"}"#;
         let sent =
             r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9E","thread_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9D"}"#;
-        // The ack answers 404.
-        let (url, server) = mock(vec![(404, json, unavailable)]);
+        let reply = json!({"to": PEER, "text": "on it", "in_reply_to": MSG});
+        // The ack answers 503.
+        let (url, server) = mock(vec![(503, json, down)]);
         let failed = Mutex::new(Vec::new());
         let answer = tool_call(&me_at(&url), &failed, "ack", json!({"msg_id": MSG}));
         assert_eq!(answer["result"]["isError"], true);
         assert_eq!(*failed.lock().unwrap(), vec![MSG.to_owned()]);
         server.join().unwrap();
-        // The reply is sent, and its ack fails.
-        let (url, server) = mock(vec![(200, json, sent), (404, json, unavailable)]);
+        // The reply is sent, and its ack answers 503.
+        let (url, server) = mock(vec![(200, json, sent), (503, json, down)]);
         let failed = Mutex::new(Vec::new());
-        let reply = json!({"to": PEER, "text": "on it", "in_reply_to": MSG});
-        let answer = tool_call(&me_at(&url), &failed, "reply", reply);
+        let answer = tool_call(&me_at(&url), &failed, "reply", reply.clone());
         assert_eq!(answer["result"]["isError"], false);
         assert_eq!(*failed.lock().unwrap(), vec![MSG.to_owned()]);
         server.join().unwrap();
+        // A refusal fails the same way after every re-emit: an ack answered
+        // 404, a reply refused 429 and a reply whose ack answered 404.
+        let (url, server) = mock(vec![
+            (404, json, unavailable),
+            (429, json, limited),
+            (200, json, sent),
+            (404, json, unavailable),
+        ]);
+        let lookup = me_at(&url);
+        let failed = Mutex::new(Vec::new());
+        let answer = tool_call(&lookup, &failed, "ack", json!({"msg_id": MSG}));
+        assert_eq!(answer["result"]["isError"], true);
+        let answer = tool_call(&lookup, &failed, "reply", reply.clone());
+        assert_eq!(answer["result"]["isError"], true);
+        let answer = tool_call(&lookup, &failed, "reply", reply.clone());
+        assert_eq!(answer["result"]["isError"], false);
+        assert!(failed.lock().unwrap().is_empty());
+        assert_eq!(server.join().unwrap().len(), 4);
         // A successful ack, a reply with ack false and an acknowledged reply
         // record nothing.
         let acked = r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9C","state":"acked"}"#;
@@ -1870,16 +1986,28 @@ mod tests {
         tool_call(&lookup, &failed, "ack", json!({"msg_id": MSG}));
         let quiet = json!({"to": PEER, "text": "noted", "in_reply_to": MSG, "ack": false});
         tool_call(&lookup, &failed, "reply", quiet);
-        let reply = json!({"to": PEER, "text": "done", "in_reply_to": MSG});
         tool_call(&lookup, &failed, "reply", reply);
         assert!(failed.lock().unwrap().is_empty());
         assert_eq!(server.join().unwrap().len(), 4);
+        // A mode that does not push has no poller, so nothing is recorded.
+        let (url, server) = mock(vec![(503, json, down)]);
+        let failed = Mutex::new(Vec::new());
+        let ready = AtomicBool::new(true);
+        let message = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"ack","arguments":{"msg_id": MSG}}});
+        let full = Mode {
+            tools: ToolSet::Full,
+            push: false,
+        };
+        handle_with(&me_at(&url), full, &message, &ready, &failed).unwrap();
+        assert!(failed.lock().unwrap().is_empty());
+        server.join().unwrap();
         // Once forgotten, the message is emitted on the next read, once.
-        let body = r#"{"messages":[{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9C","from":"codex:sting:42:t-1","ticket":"none","body":"hello"}]}"#;
+        let body = r#"{"messages":[{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9C","from":"codex:host-b:42:t-1","ticket":"none","body":"hello"}]}"#;
         let mut seen = Seen::default();
         assert!(seen.insert(MSG));
         seen.forget(MSG);
-        assert!(seen.rescan);
+        assert!(seen.forgotten.contains(MSG));
         for expected in [1usize, 0] {
             let (url, server) = mock(inbox_reply(body));
             assert_eq!(
@@ -1887,7 +2015,109 @@ mod tests {
                 expected
             );
             server.join().unwrap();
+            assert!(seen.forgotten.is_empty());
         }
+    }
+
+    /// A2 (TIN-7577): the poller's path. A failure that handle_with records
+    /// wakes a pause, take_failed hands it to Seen, and the next poll emits
+    /// the message again.
+    #[test]
+    fn a_recorded_failure_reaches_the_next_poll() {
+        let json = "application/json";
+        let down = r#"{"error":"store unavailable","code":"internal"}"#;
+        let (url, server) = mock(vec![(503, json, down)]);
+        let failed = Mutex::new(Vec::new());
+        let mut seen = Seen::default();
+        assert!(seen.insert(MSG));
+        tool_call(&me_at(&url), &failed, "ack", json!({"msg_id": MSG}));
+        server.join().unwrap();
+        assert!(has_failed(&failed));
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        pause(Duration::from_secs(30), &stop, Some(&failed));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        take_failed(&failed, &mut seen);
+        assert!(!has_failed(&failed));
+        let body = r#"{"messages":[{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9C","from":"codex:host-b:42:t-1","ticket":"none","body":"hello"}]}"#;
+        let (url, server) = mock(inbox_reply(body));
+        let poll = poll_once(&me_at(&url), &mut seen).unwrap();
+        assert_eq!(poll.events.len(), 1);
+        assert_eq!(poll.events[0]["params"]["meta"]["msg_id"], MSG);
+        server.join().unwrap();
+    }
+
+    /// A2 (TIN-7577): a forgotten id behind the stored tail is found by a
+    /// walk that starts again at the head page's next_after, and is emitted
+    /// once.
+    #[test]
+    fn a_forgotten_tail_id_is_emitted_again_from_the_head_end() {
+        let ids: Vec<String> = (1..=9).map(id).collect();
+        let head = page_body(&ids[..8], true);
+        let json = "application/json";
+        let empty = r#"{"messages":[],"next_after":null}"#;
+        let mut seen = Seen::default();
+        for held in &ids {
+            seen.insert(held);
+        }
+        seen.tail = Some(ids[8].clone());
+        seen.forget(&ids[8]);
+        let (url, server) = mock(vec![
+            (200, json, head),
+            (200, json, page_body(&ids[8..], false)),
+        ]);
+        let poll = poll_once(&me_at(&url), &mut seen).unwrap();
+        assert_eq!(poll.events.len(), 1);
+        assert_eq!(poll.events[0]["params"]["meta"]["msg_id"], ids[8].as_str());
+        assert!(seen.forgotten.is_empty());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(request_json(&requests[1])["after"], ids[7].as_str());
+        // The next poll resumes after it and emits it no more.
+        let (url, server) = mock(vec![(200, json, head), (200, json, empty)]);
+        assert!(
+            poll_once(&me_at(&url), &mut seen)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(request_json(&requests[1])["after"], ids[8].as_str());
+    }
+
+    /// A1 (TIN-7577): a tail behind the head page, whose messages were
+    /// acknowledged since, reads the head again. That page does not count,
+    /// and the walk goes on from the head page's next_after.
+    #[test]
+    fn a_stale_tail_restarts_at_the_head_end() {
+        let head_ids: Vec<String> = (10..=17).map(id).collect();
+        let head = page_body(&head_ids, true);
+        let json = "application/json";
+        let mut seen = Seen::default();
+        for n in 1..=17 {
+            seen.insert(&id(n));
+        }
+        seen.tail = Some(id(9));
+        let (url, server) = mock(vec![
+            (200, json, head),
+            (200, json, head),
+            (200, json, page_body(&[id(18)], false)),
+        ]);
+        let poll = poll_once(&me_at(&url), &mut seen).unwrap();
+        assert_eq!(poll.events.len(), 1);
+        assert_eq!(poll.pending, 9);
+        assert!(!poll.more);
+        let requests = server.join().unwrap();
+        assert_eq!(request_json(&requests[1])["after"], id(9).as_str());
+        assert_eq!(request_json(&requests[2])["after"], id(17).as_str());
+        assert_eq!(seen.tail, Some(id(18)));
+        // A tail on the head page is dropped before any walk.
+        seen.tail = Some(id(12));
+        let empty = r#"{"messages":[],"next_after":null}"#;
+        let (url, server) = mock(vec![(200, json, head), (200, json, empty)]);
+        poll_once(&me_at(&url), &mut seen).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(request_json(&requests[1])["after"], id(17).as_str());
     }
 
     #[test]
@@ -2202,12 +2432,12 @@ mod tests {
             (
                 200,
                 json,
-                r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9E","to":"codex:sting:42:t-1","recipient_state":"gone"}"#,
+                r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9E","to":"codex:host-b:42:t-1","recipient_state":"gone"}"#,
             ),
             (
                 200,
                 json,
-                r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9F","to":"codex:sting:42:t-1","recipient_state":"live"}"#,
+                r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9F","to":"codex:host-b:42:t-1","recipient_state":"live"}"#,
             ),
         ]);
         let lookup = me_at(&url);
