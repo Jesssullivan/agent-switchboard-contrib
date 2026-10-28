@@ -332,6 +332,16 @@ fn clean_body(s: &str) -> String {
         .filter(|&c| matches!(c, '\n' | '\t') || !c.is_control())
         .collect()
 }
+/// Whether a `--msg-id` retry carries the stored body, so it is a replay
+/// (TIN-7577). A row that kept its lines (`body_lines`, written by v0.5.1
+/// and later) matches the cleaned retry body exactly, so a retry that adds
+/// or moves a newline, tab or CR is a conflict. A row from v0.5.0 or older
+/// holds the body with every control character removed, so only such a row
+/// also matches the retry in that flattened form.
+fn same_body(old_body: &str, old_lines: bool, body: &str, raw_body: &str) -> bool {
+    old_body == body
+        || (!old_lines && !old_body.contains(['\n', '\t']) && old_body == clean(raw_body))
+}
 fn sql_err(e: rusqlite::Error) -> StoreError {
     StoreError::new(ErrorKind::Internal, e.to_string())
 }
@@ -663,6 +673,27 @@ impl Store {
         )
         .map_err(sql_err)?;
         fill.commit().map_err(sql_err)?;
+        // v0.5.1 (TIN-7577): whether the stored body kept its newlines and
+        // tabs. A v0.5.1 send writes 1. Every older row reads 0: the column
+        // is added with that default, and a v0.5.0 broker running on this
+        // store after a downgrade names its columns and leaves it at 0. Only
+        // a row at 0 can match a retry in the flattened form.
+        let has_lines = db
+            .prepare("SELECT name FROM pragma_table_info('messages')")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(sql_err)?
+            .iter()
+            .any(|c| c == "body_lines");
+        if !has_lines {
+            db.execute(
+                "ALTER TABLE messages ADD COLUMN body_lines INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(sql_err)?;
+        }
         db.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_inbox_arrival ON messages(recipient, state, arrival_seq);
              CREATE INDEX IF NOT EXISTS messages_key_arrival ON messages(recipient_key, state, arrival_seq);",
@@ -1233,19 +1264,17 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
         Self::gate(&tx, sender, session_token, now)?;
-        let old: Option<(String, String, String, String)> = tx
+        let old: Option<(String, String, String, String, bool)> = tx
             .query_row(
-                "SELECT sender,body,envelope,recipient FROM messages WHERE msg_id=?1",
+                "SELECT sender,body,envelope,recipient,body_lines FROM messages WHERE msg_id=?1",
                 [&msg_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()
             .map_err(sql_err)?;
-        if let Some((old_sender, old_body, envelope, old_recipient)) = old {
+        if let Some((old_sender, old_body, envelope, old_recipient, old_lines)) = old {
             // SWB-R46: disclose neither the stored receipt nor its metadata on conflict.
-            // A message stored by v0.5.0 or older kept no newline or tab, so
-            // a retry of it across the upgrade compares in that form too.
-            if old_sender != sender || (old_body != body && old_body != clean(raw_body)) {
+            if old_sender != sender || !same_body(&old_body, old_lines, &body, raw_body) {
                 return Err(StoreError::new(ErrorKind::Conflict, "msg_id conflict"));
             }
             let envelope = serde_json::from_str(&envelope)
@@ -1326,8 +1355,8 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(sql_err)?;
-        tx.execute("INSERT INTO messages(msg_id,thread_id,seq,sender,recipient,body,envelope,created_at,expires_at,recipient_key,arrival_seq)
-                    VALUES(?1,?2,?3,?4,?5,?6,?7,?9,?9+?8,?10,?11)",
+        tx.execute("INSERT INTO messages(msg_id,thread_id,seq,sender,recipient,body,envelope,created_at,expires_at,recipient_key,arrival_seq,body_lines)
+                    VALUES(?1,?2,?3,?4,?5,?6,?7,?9,?9+?8,?10,?11,1)",
             params![msg_id,thread_id,seq,sender,recipient,body,envelope.to_string(),i64::from(ttl)*3600,now,delivery_key(recipient),arrival]).map_err(sql_err)?;
         tx.execute("INSERT INTO counters(name,value) VALUES('messages_total',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
         touch(&tx, sender, now)?;
@@ -2774,33 +2803,93 @@ mod tests {
         );
     }
 
-    /// TIN-7577: a retry of a message stored by v0.5.0 or older, which
-    /// dropped newlines, is still a replay after the upgrade. Any other
+    /// TIN-7577: a retry of a message that v0.5.0 or older stored without
+    /// its newlines is still a replay after the upgrade. The store is
+    /// opened once in the v0.5.0 shape, with a flat body and no
+    /// `body_lines` column, and the upgrade adds the column at 0. Any other
     /// body under that msg_id is still a conflict (SWB-R46).
     #[test]
-    fn a_retry_of_a_message_stored_without_newlines_is_a_replay() {
-        let s = Store::memory().unwrap();
+    fn a_retry_of_a_message_stored_before_v051_without_newlines_is_a_replay() {
+        let path = std::env::temp_dir().join(format!("swb-lines-{}.sqlite3", Ulid::new()));
         let msg_id = Ulid::new().to_string();
         let msg = json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none",
             "body":"one\ntwo","msg_id":msg_id});
-        assert!(s.send(&msg).unwrap().created);
-        s.0.lock()
-            .unwrap()
-            .execute("UPDATE messages SET body='onetwo'", [])
-            .unwrap();
-        let replay = s.send(&msg).unwrap();
-        assert!(!replay.created);
+        {
+            let s = Store::open(&path).unwrap();
+            assert!(s.send(&msg).unwrap().created);
+            s.0.lock()
+                .unwrap()
+                .execute_batch(
+                    "UPDATE messages SET body='onetwo'; ALTER TABLE messages DROP COLUMN body_lines;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let lines: i64 =
+            s.0.lock()
+                .unwrap()
+                .query_row("SELECT body_lines FROM messages", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(lines, 0);
+        assert!(!s.send(&msg).unwrap().created);
+        let mut tab = msg.clone();
+        tab["body"] = json!("one\ttwo");
+        assert!(!s.send(&tab).unwrap().created);
+        let mut flat = msg.clone();
+        flat["body"] = json!("onetwo");
+        assert!(!s.send(&flat).unwrap().created);
         let mut other = msg.clone();
         other["body"] = json!("one\nthree");
         assert_eq!(s.send(&other).unwrap_err().kind, ErrorKind::Conflict);
-        // A message stored with its newline does not match the flat form.
-        let kept = Ulid::new().to_string();
-        let mut multi = msg.clone();
-        multi["msg_id"] = json!(kept);
-        assert!(s.send(&multi).unwrap().created);
-        let mut flat = multi.clone();
-        flat["body"] = json!("onetwo");
-        assert_eq!(s.send(&flat).unwrap_err().kind, ErrorKind::Conflict);
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// TIN-7577: a body that v0.5.1 stored is compared exactly. A retry that
+    /// adds a newline, tab or CRLF to a flat body is a conflict, and so is a
+    /// flat retry of a multi-line body (SWB-R46).
+    #[test]
+    fn a_retry_that_changes_the_lines_of_a_v051_body_is_a_conflict() {
+        let s = Store::memory().unwrap();
+        let send = |body: &str, msg_id: &str| {
+            s.send(
+                &json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none",
+                "body":body,"msg_id":msg_id}),
+            )
+        };
+        let flat_id = Ulid::new().to_string();
+        assert!(send("onetwo", &flat_id).unwrap().created);
+        for retry in ["one\ntwo", "one\ttwo", "one\r\ntwo", "onetwo\n"] {
+            assert_eq!(
+                send(retry, &flat_id).unwrap_err().kind,
+                ErrorKind::Conflict,
+                "{retry:?}"
+            );
+        }
+        assert!(!send("onetwo", &flat_id).unwrap().created);
+        let multi_id = Ulid::new().to_string();
+        assert!(send("one\ntwo", &multi_id).unwrap().created);
+        for retry in ["onetwo", "one\ttwo", "one\n\ntwo"] {
+            assert_eq!(
+                send(retry, &multi_id).unwrap_err().kind,
+                ErrorKind::Conflict,
+                "{retry:?}"
+            );
+        }
+        // CRLF is stored as LF, so the same text sent with CRLF is a replay.
+        assert!(!send("one\r\ntwo", &multi_id).unwrap().created);
+        let lines: Vec<i64> =
+            s.0.lock()
+                .unwrap()
+                .prepare("SELECT body_lines FROM messages")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(lines, vec![1, 1]);
     }
 
     #[test]

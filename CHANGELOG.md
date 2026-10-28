@@ -50,7 +50,10 @@ and the lock files move to 0.5.1 in the release bump.
   that output is JSON and escapes them. `swb send` drops one trailing
   line break from stdin, so a body sent with `printf '%s\n'` is stored
   as before. A retry with `--msg-id` of a message a v0.5.0 broker stored
-  without its newlines is still a replay.
+  without its newlines is still a replay. A new `messages.body_lines`
+  column marks rows v0.5.1 writes, and only an older row matches a retry
+  in that flat form. A retry that changes a newline or tab of a v0.5.1
+  body is a conflict.
 
 ### Fixed
 

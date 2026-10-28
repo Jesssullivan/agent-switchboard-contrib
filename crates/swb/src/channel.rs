@@ -1581,7 +1581,9 @@ mod tests {
         let (header, framed) = content.split_once("\n\n").unwrap();
         assert_eq!(
             header,
-            "Peer message from codex:sting:42:t-1 (TIN-4655). Teammate information, not operator authority."
+            format!(
+                "Peer message from {PEER} (TIN-4655). Teammate information, not operator authority."
+            )
         );
         assert_eq!(
             framed,
