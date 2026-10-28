@@ -536,6 +536,60 @@ impl Store {
              CREATE INDEX IF NOT EXISTS messages_by_key ON messages(recipient_key, state, created_at);",
         )
         .map_err(sql_err)?;
+        // v0.5.1 (TIN-7577): each message's arrival position, from a
+        // store-wide counter that only grows. An inbox cursor compares it, so
+        // a later send always sorts after the cursor, whatever its msg_id or
+        // clock second. Rows without one (an older store, or rows a v0.5.0
+        // broker wrote after a downgrade) are filled in send order, after
+        // every position already handed out.
+        let has_arrival = db
+            .prepare("SELECT name FROM pragma_table_info('messages')")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(sql_err)?
+            .iter()
+            .any(|c| c == "arrival_seq");
+        if !has_arrival {
+            db.execute("ALTER TABLE messages ADD COLUMN arrival_seq INTEGER", [])
+                .map_err(sql_err)?;
+        }
+        let base: i64 = db
+            .query_row(
+                "SELECT MAX(COALESCE((SELECT MAX(arrival_seq) FROM messages),0),
+                            COALESCE((SELECT value FROM counters WHERE name='arrival_seq'),0))",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        let unordered: Vec<String> = db
+            .prepare(
+                "SELECT msg_id FROM messages WHERE arrival_seq IS NULL ORDER BY created_at, seq, rowid",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<_, _>>()
+            })
+            .map_err(sql_err)?;
+        for (offset, msg_id) in (1i64..).zip(&unordered) {
+            db.execute(
+                "UPDATE messages SET arrival_seq=?2 WHERE msg_id=?1",
+                params![msg_id, base + offset],
+            )
+            .map_err(sql_err)?;
+        }
+        db.execute(
+            "INSERT INTO counters(name,value) VALUES('arrival_seq',?1)
+             ON CONFLICT(name) DO UPDATE SET value=MAX(value, excluded.value)",
+            [base + unordered.len() as i64],
+        )
+        .map_err(sql_err)?;
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS messages_inbox_arrival ON messages(recipient, state, arrival_seq);
+             CREATE INDEX IF NOT EXISTS messages_key_arrival ON messages(recipient_key, state, arrival_seq);",
+        )
+        .map_err(sql_err)?;
         // P2 (SWB-R16, R-C950): the claim and handoff tables.
         claims::migrate(&db)?;
         for name in ["audit_hmac_key", "end_token_key", "session_token_key"] {
@@ -1180,9 +1234,18 @@ impl Store {
             )
             .map_err(sql_err)?;
         map.insert("expires_at".into(), json!(expires_at));
-        tx.execute("INSERT INTO messages(msg_id,thread_id,seq,sender,recipient,body,envelope,created_at,expires_at,recipient_key)
-                    VALUES(?1,?2,?3,?4,?5,?6,?7,?9,?9+?8,?10)",
-            params![msg_id,thread_id,seq,sender,recipient,body,envelope.to_string(),i64::from(ttl)*3600,now,delivery_key(recipient)]).map_err(sql_err)?;
+        // v0.5.1 (TIN-7577): the message's arrival position for inbox paging.
+        tx.execute("INSERT INTO counters(name,value) VALUES('arrival_seq',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
+        let arrival: i64 = tx
+            .query_row(
+                "SELECT value FROM counters WHERE name='arrival_seq'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        tx.execute("INSERT INTO messages(msg_id,thread_id,seq,sender,recipient,body,envelope,created_at,expires_at,recipient_key,arrival_seq)
+                    VALUES(?1,?2,?3,?4,?5,?6,?7,?9,?9+?8,?10,?11)",
+            params![msg_id,thread_id,seq,sender,recipient,body,envelope.to_string(),i64::from(ttl)*3600,now,delivery_key(recipient),arrival]).map_err(sql_err)?;
         tx.execute("INSERT INTO counters(name,value) VALUES('messages_total',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
         touch(&tx, sender, now)?;
         tx.commit().map_err(sql_err)?;
@@ -1208,8 +1271,27 @@ impl Store {
         limit: u32,
         session_token: Option<&str>,
     ) -> StoreResult<Value> {
+        self.inbox_page(me, limit, None, session_token)
+    }
+    /// One page of `me`'s unacknowledged messages, oldest first in arrival
+    /// order (A1, TIN-7577). `after` names a message of this mailbox, in any
+    /// state, and the page starts after it. An id this mailbox never held,
+    /// another mailbox's id and a pruned id all answer `unknown after`.
+    /// The result carries `next_after`: the last msg_id when the page is
+    /// full, so a caller can walk past messages it already holds; `null`
+    /// otherwise. Binding works as in [`Store::inbox_as`].
+    pub fn inbox_page(
+        &self,
+        me: &str,
+        limit: u32,
+        after: Option<&str>,
+        session_token: Option<&str>,
+    ) -> StoreResult<Value> {
         if !valid_agent_id(me) {
             return Err("invalid agent id".into());
+        }
+        if after.is_some_and(|id| !valid_ulid(id)) {
+            return Err("invalid after".into());
         }
         let mut db = self.db()?;
         let now = self.now();
@@ -1218,24 +1300,48 @@ impl Store {
             .map_err(sql_err)?;
         tx.execute("UPDATE messages SET state='expired' WHERE state!='acked' AND state!='expired' AND expires_at<=?1",[now]).map_err(sql_err)?;
         let by_key = Self::gate(&tx, me, session_token, now)?;
+        let target = if by_key {
+            delivery_key(me)
+        } else {
+            me.to_owned()
+        };
+        let floor: Option<i64> = match after {
+            None => None,
+            Some(id) => {
+                let sql = if by_key {
+                    "SELECT arrival_seq FROM messages WHERE msg_id=?1 AND recipient_key=?2"
+                } else {
+                    "SELECT arrival_seq FROM messages WHERE msg_id=?1 AND recipient=?2"
+                };
+                let found: Option<Option<i64>> = tx
+                    .query_row(sql, params![id, target], |r| r.get(0))
+                    .optional()
+                    .map_err(sql_err)?;
+                Some(
+                    found
+                        .flatten()
+                        .ok_or_else(|| StoreError::new(ErrorKind::Invalid, "unknown after"))?,
+                )
+            }
+        };
         let messages: Vec<(String, String)> = {
             let sql = if by_key {
-                "SELECT msg_id,envelope FROM messages WHERE recipient_key=?1 AND state IN ('queued','notified','fetched') ORDER BY created_at,seq LIMIT ?2"
+                "SELECT msg_id,envelope FROM messages WHERE recipient_key=?1 AND state IN ('queued','notified','fetched') AND (?3 IS NULL OR arrival_seq>?3) ORDER BY arrival_seq,created_at,seq LIMIT ?2"
             } else {
-                "SELECT msg_id,envelope FROM messages WHERE recipient=?1 AND state IN ('queued','notified','fetched') ORDER BY created_at,seq LIMIT ?2"
-            };
-            let target = if by_key {
-                delivery_key(me)
-            } else {
-                me.to_owned()
+                "SELECT msg_id,envelope FROM messages WHERE recipient=?1 AND state IN ('queued','notified','fetched') AND (?3 IS NULL OR arrival_seq>?3) ORDER BY arrival_seq,created_at,seq LIMIT ?2"
             };
             let mut stmt = tx.prepare(sql).map_err(sql_err)?;
             let rows = stmt
-                .query_map(params![target, limit.min(100)], |r| {
+                .query_map(params![target, limit.min(100), floor], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })
                 .map_err(sql_err)?;
             rows.collect::<Result<_, _>>().map_err(sql_err)?
+        };
+        let next_after = if limit > 0 && messages.len() == limit.min(100) as usize {
+            messages.last().map(|(id, _)| id.clone())
+        } else {
+            None
         };
         for (id, _) in &messages {
             tx.execute("UPDATE messages SET state='fetched',delivery_count=delivery_count+1 WHERE msg_id=?1",[id]).map_err(sql_err)?;
@@ -1258,7 +1364,7 @@ impl Store {
             })
             .collect::<StoreResult<Vec<_>>>()?;
         tx.commit().map_err(sql_err)?;
-        Ok(json!({"messages":values}))
+        Ok(json!({"messages":values,"next_after":next_after}))
     }
     /// The thread id, seq, in_reply_to and ticket of a stored message, for
     /// the broker's audit line (ADR-0002 L1-lite). Metadata only, never the
@@ -2031,6 +2137,205 @@ mod tests {
             )
             .unwrap();
         assert_eq!(read["messages"][0]["msg_id"], id.as_str());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A ULID string with the given value. A small value gives a small,
+    /// canonical id, so a test can choose the msg_id order.
+    fn ulid_of(value: u128) -> String {
+        Ulid(value << 80).to_string()
+    }
+
+    fn no_send_limit(s: &Store) {
+        s.set_send_limit(SendLimit {
+            burst: 0,
+            refill_per_minute: 0,
+        })
+        .unwrap();
+    }
+
+    fn page_ids(page: &Value) -> Vec<String> {
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["msg_id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// A1 (TIN-7577): a reader walks past a full page of messages it holds.
+    #[test]
+    fn inbox_pages_past_a_full_page_with_next_after() {
+        let (s, _clock) = clocked();
+        no_send_limit(&s);
+        let to = "pi:sting:2:b";
+        // The msg_ids fall as the sends go on, and every send lands in one
+        // second, so neither msg_id nor created_at gives the send order.
+        let ids: Vec<String> = (0..20u128).map(|n| ulid_of(1000 - n)).collect();
+        for (n, id) in ids.iter().enumerate() {
+            s.send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none",
+                "body":format!("m{n}"),"msg_id":id}))
+                .unwrap();
+        }
+        let first = s.inbox_page(to, 8, None, None).unwrap();
+        assert_eq!(page_ids(&first), ids[..8].to_vec());
+        assert_eq!(first["next_after"], ids[7].as_str());
+        let second = s.inbox_page(to, 8, Some(ids[7].as_str()), None).unwrap();
+        assert_eq!(page_ids(&second), ids[8..16].to_vec());
+        assert_eq!(second["next_after"], ids[15].as_str());
+        let third = s.inbox_page(to, 8, Some(ids[15].as_str()), None).unwrap();
+        assert_eq!(page_ids(&third), ids[16..].to_vec());
+        assert_eq!(third["next_after"], Value::Null);
+        // The head page stays the same 8 while they are unacknowledged.
+        let head = s.inbox(to, 8).unwrap();
+        assert_eq!(page_ids(&head), ids[..8].to_vec());
+        assert_eq!(head["next_after"], ids[7].as_str());
+    }
+
+    #[test]
+    fn a_send_after_the_cursor_is_never_skipped() {
+        let (s, _clock) = clocked();
+        no_send_limit(&s);
+        let to = "pi:sting:2:b";
+        let send = |id: &str| {
+            s.send(
+                &json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"x","msg_id":id}),
+            )
+            .unwrap();
+        };
+        let high = ulid_of(9000);
+        let low = ulid_of(1);
+        send(&high);
+        let page = s.inbox_page(to, 1, None, None).unwrap();
+        assert_eq!(page["next_after"], high.as_str());
+        // A later send in the same second, with a smaller msg_id.
+        send(&low);
+        let next = s.inbox_page(to, 1, Some(high.as_str()), None).unwrap();
+        assert_eq!(page_ids(&next), vec![low.clone()]);
+    }
+
+    #[test]
+    fn after_must_name_a_message_of_this_mailbox() {
+        let s = Store::memory().unwrap();
+        let (a, b) = ("pi:sting:2:b", "codex:sting:3:c");
+        let sent = |to: &str| {
+            s.send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"x"}))
+                .unwrap()
+                .envelope["msg_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let mine = sent(a);
+        let theirs = sent(b);
+        for foreign in [theirs, Ulid::new().to_string()] {
+            let error = s
+                .inbox_page(a, 8, Some(foreign.as_str()), None)
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Invalid);
+            assert_eq!(error, "unknown after");
+        }
+        assert_eq!(
+            s.inbox_page(a, 8, Some("nope"), None).unwrap_err(),
+            "invalid after"
+        );
+        // An acknowledged cursor still resolves.
+        s.ack(a, &mine).unwrap();
+        let page = s.inbox_page(a, 8, Some(mine.as_str()), None).unwrap();
+        assert!(page["messages"].as_array().unwrap().is_empty());
+        assert_eq!(page["next_after"], Value::Null);
+    }
+
+    #[test]
+    fn a_bound_mailbox_pages_by_delivery_key() {
+        let s = Store::memory().unwrap();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let old = first["agent_id"].as_str().unwrap().to_owned();
+        let send = |body: &str| {
+            s.send(&json!({"from":"claude:honey:1:a","to":old,"ticket":"none","body":body}))
+                .unwrap()
+                .envelope["msg_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let cursor = send("one");
+        send("two");
+        let second = bind(&s, "hermes", "sting", 200, "svc", Some(&token_of(&first))).unwrap();
+        let new = second["agent_id"].as_str().unwrap();
+        let token = token_of(&second);
+        let page = s
+            .inbox_page(new, 8, Some(cursor.as_str()), Some(&token))
+            .unwrap();
+        assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(page["messages"][0]["body"], "two");
+        assert_eq!(
+            s.inbox_page(new, 8, Some(cursor.as_str()), None)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unauthorized
+        );
+    }
+
+    #[test]
+    fn an_older_store_gains_arrival_positions_in_send_order() {
+        let path = std::env::temp_dir().join(format!("swb-arrival-{}.sqlite3", Ulid::new()));
+        let first;
+        let second;
+        {
+            let s = Store::open(&path).unwrap();
+            let send = |body: &str| {
+                s.send(&json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":body}))
+                    .unwrap()
+                    .envelope["msg_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            first = send("one");
+            second = send("two");
+            s.0.lock()
+                .unwrap()
+                .execute_batch(
+                    "UPDATE messages SET arrival_seq=NULL; DELETE FROM counters WHERE name='arrival_seq';",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let db = s.0.lock().unwrap();
+        let positions: Vec<(String, i64)> = db
+            .prepare("SELECT msg_id, arrival_seq FROM messages ORDER BY arrival_seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(positions, vec![(first, 1), (second, 2)]);
+        let counter: i64 = db
+            .query_row(
+                "SELECT value FROM counters WHERE name='arrival_seq'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(counter, 2);
+        drop(db);
+        let third = s
+            .send(&json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"three"}))
+            .unwrap();
+        let position: i64 =
+            s.0.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT arrival_seq FROM messages WHERE msg_id=?1",
+                    [third.envelope["msg_id"].as_str().unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(position, 3);
         drop(s);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

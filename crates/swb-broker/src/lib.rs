@@ -191,11 +191,14 @@ fn perform(
             let wait = opt(args, "wait_seconds", Value::as_u64)?
                 .unwrap_or(0)
                 .min(25);
+            // A1 (TIN-7577): a page may start after a message the caller
+            // already holds, and a long-poll then waits for mail past it.
+            let after = opt(args, "after", Value::as_str)?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
             loop {
                 // Each read checks the binding again, so a key bound during
                 // the wait is never read without its token (ADR-0003).
-                let batch = store.inbox_as(me, limit, token)?;
+                let batch = store.inbox_page(me, limit, after, token)?;
                 if batch["messages"].as_array().is_some_and(|v| !v.is_empty())
                     || std::time::Instant::now() >= deadline
                 {
@@ -387,9 +390,10 @@ fn tools() -> Vec<Tool> {
             "artifacts":{"type":"array","maxItems":20,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":2048},"description":"Up to 20 artifact references"},
             "ttl_hours":{"type":"integer","minimum":1,"maximum":336,"description":"Message lifetime, default 72 h, clamped to 1..336"},
             "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
-        ("inbox", "Fetch this caller's unacknowledged messages, oldest first. Each fetch counts a delivery and renews the caller's lease. A bound session reads the mail of every pid of its harness, host and session id, so a restart keeps unread mail.", json!({"type":"object","required":["me"],"properties":{
+        ("inbox", "Fetch this caller's unacknowledged messages, oldest first in arrival order. Each fetch counts a delivery and renews the caller's lease. The result carries next_after, the last msg_id of a full page (null otherwise); pass it as after to read past messages already held. A bound session reads the mail of every pid of its harness, host and session id, so a restart keeps unread mail.", json!({"type":"object","required":["me"],"properties":{
             "me":{"type":"string","description":agent_id},
             "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Page size, default 20, at most 100"},
+            "after":{"type":"string","description":format!("{ULID_DESC}. Only messages that arrived after this one, which must be a message of this mailbox; pass next_after from the previous page")},
             "wait_seconds":{"type":"integer","minimum":0,"maximum":25,"description":"Long-poll up to this many seconds when the mailbox is empty (default 0)"},
             "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
         ("ack", "Acknowledge a received message so it is not delivered again.", json!({"type":"object","required":["me","msg_id"],"properties":{
@@ -1673,6 +1677,8 @@ mod tests {
         assert_eq!(peers.input_schema["properties"]["all"]["type"], "boolean");
         let end = tools().into_iter().find(|t| t.name == "end").unwrap();
         assert_eq!(end.input_schema["required"], json!(["me", "end_token"]));
+        let inbox = tools().into_iter().find(|t| t.name == "inbox").unwrap();
+        assert_eq!(inbox.input_schema["properties"]["after"]["type"], "string");
         let send = tools().into_iter().find(|t| t.name == "send").unwrap();
         let props = &send.input_schema["properties"];
         for key in ["artifacts", "reply_expires", "reply_format"] {
@@ -2993,5 +2999,53 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A1 (TIN-7577): REST and MCP page an inbox with `after`.
+    #[tokio::test]
+    async fn inbox_over_rest_and_mcp_pages_with_after() {
+        let store = seeded_store();
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let me = "pi:sting:2:b";
+        let mut ids = Vec::new();
+        for body in ["one", "two", "three"] {
+            let sent = store
+                .send(&json!({"from":"claude:honey:1:a","to":me,"ticket":"none","body":body}))
+                .unwrap();
+            ids.push(sent.envelope["msg_id"].as_str().unwrap().to_owned());
+        }
+        let inbox = |args: Value| {
+            let app = app.clone();
+            async move {
+                status_and_json(call(&app, "POST", "/v1/inbox", &args.to_string()).await).await
+            }
+        };
+        let (status, first) = inbox(json!({"me":me,"limit":2})).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(first["next_after"], ids[1].as_str());
+        let (status, rest) = inbox(json!({"me":me,"limit":2,"after":ids[1]})).await;
+        assert_eq!(status, StatusCode::OK, "{rest}");
+        assert_eq!(rest["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(rest["messages"][0]["msg_id"], ids[2].as_str());
+        assert_eq!(rest["next_after"], Value::Null);
+        for bad in [json!("nope"), json!(7), json!("01ARZ3NDEKTSV4RRFFQ69G5FAV")] {
+            let (status, error) = inbox(json!({"me":me,"after":bad})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert_eq!(error["code"], "invalid_argument");
+        }
+        let session = mcp_session(&app).await;
+        let paged = mcp_call(
+            &app,
+            &session,
+            2,
+            "inbox",
+            json!({"me":me,"limit":2,"after":ids[0]}),
+        )
+        .await;
+        assert_eq!(paged["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(paged["next_after"], ids[2].as_str());
+        let refused = mcp_result(&app, &session, 3, "inbox", json!({"me":me,"after":"nope"})).await;
+        assert_eq!(refused["isError"], true, "{refused}");
     }
 }

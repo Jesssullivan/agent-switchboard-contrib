@@ -28,7 +28,8 @@ commands:
                             --register also registers it and saves its end token;
                             with SWB_BIND=1 it binds the session and saves its
                             session token (ADR-0003)
-  inbox                     fetch one unacknowledged message for SWB_AGENT_ID
+  inbox [--after ULID]      fetch one unacknowledged message for SWB_AGENT_ID;
+                            --after reads the one that arrived after that msg_id
   send <to-agent-id> <ticket> [--ruling ID] [--operator-directed] [--in-reply-to ULID]
        [--thread ULID] [--msg-id ULID]
                             send a peer message; the body is read from stdin
@@ -253,15 +254,44 @@ fn register_with(lookup: Lookup, harness: &str, session_id: &str) -> Result<Valu
 }
 
 fn inbox_with(lookup: Lookup, me: &str) -> Result<Value, String> {
+    inbox_after(lookup, me, None)
+}
+
+/// One inbox page for `me`, starting after `after` when it is set (A1,
+/// TIN-7577). `after` is sent only when set.
+fn inbox_after(lookup: Lookup, me: &str, after: Option<&str>) -> Result<Value, String> {
     if !valid_agent_id(me) {
         return Err("invalid SWB_AGENT_ID".into());
     }
-    call_as(
-        lookup,
-        me,
-        "/v1/inbox",
-        json!({"me":me,"limit":CLI_INBOX_PAGE,"wait_seconds":0}),
-    )
+    let mut payload = json!({"me":me,"limit":CLI_INBOX_PAGE,"wait_seconds":0});
+    if let Some(after) = after {
+        if !valid_ulid(after) {
+            return Err("invalid --after (ULID)".into());
+        }
+        payload["after"] = json!(after);
+    }
+    call_as(lookup, me, "/v1/inbox", payload)
+}
+
+/// `swb inbox [--after ULID]`.
+fn parse_inbox_args(args: &[String]) -> Result<Option<String>, String> {
+    match args {
+        [] => Ok(None),
+        [flag] if flag.as_str() == "--after" => Err("--after needs a value".into()),
+        [flag, id] if flag.as_str() == "--after" => Ok(Some(id.clone())),
+        _ => Err("expected [--after ULID]".into()),
+    }
+}
+
+/// `swb inbox`: one page, with a note on stderr when `--after` reached a
+/// broker that does not page.
+fn inbox_cmd(lookup: Lookup, after: Option<&str>) -> Result<Value, String> {
+    let me = need(lookup, "SWB_AGENT_ID")?;
+    let batch = inbox_after(lookup, &me, after)?;
+    if after.is_some() && batch.get("next_after").is_none() {
+        eprintln!("swb inbox: broker does not page (v0.5.0 or older)");
+    }
+    Ok(batch)
 }
 
 // ---- R-C944 end tokens ------------------------------------------------------
@@ -1644,13 +1674,13 @@ fn main() -> ExitCode {
             };
             print_result("whoami", whoami_cmd(&process_env, live))
         }
-        Some("inbox") => match args.next() {
-            None => print_result(
-                "inbox",
-                need(&process_env, "SWB_AGENT_ID").and_then(|me| inbox_with(&process_env, &me)),
-            ),
-            Some(_) => usage_error("inbox", "takes no arguments"),
-        },
+        Some("inbox") => {
+            let rest: Vec<String> = args.collect();
+            match parse_inbox_args(&rest) {
+                Ok(after) => print_result("inbox", inbox_cmd(&process_env, after.as_deref())),
+                Err(e) => usage_error("inbox", &e),
+            }
+        }
         Some("serve") => {
             let path =
                 std::env::var("SWB_DB_PATH").unwrap_or_else(|_| "/var/lib/swb/swb.sqlite3".into());
@@ -1825,6 +1855,34 @@ mod tests {
             request_json(&requests[0]),
             json!({"me":ME,"limit":CLI_INBOX_PAGE,"wait_seconds":0})
         );
+    }
+
+    /// A1 (TIN-7577): `swb inbox --after` posts the cursor.
+    #[test]
+    fn inbox_after_posts_the_cursor() {
+        let (url, server) = mock(vec![(
+            200,
+            "application/json",
+            r#"{"messages":[],"next_after":null}"#,
+        )]);
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_AGENT_ID", ME)]);
+        inbox_cmd(&lookup, Some(ULID)).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(
+            request_json(&requests[0]),
+            json!({"me":ME,"limit":CLI_INBOX_PAGE,"wait_seconds":0,"after":ULID})
+        );
+        assert_eq!(
+            inbox_cmd(&lookup, Some("not-a-ulid")).unwrap_err(),
+            "invalid --after (ULID)"
+        );
+        assert_eq!(parse_inbox_args(&strings(&[])), Ok(None));
+        assert_eq!(
+            parse_inbox_args(&strings(&["--after", ULID])),
+            Ok(Some(ULID.to_owned()))
+        );
+        assert!(parse_inbox_args(&strings(&["--after"])).is_err());
+        assert!(parse_inbox_args(&strings(&["extra"])).is_err());
     }
 
     #[test]
