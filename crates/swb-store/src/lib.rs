@@ -107,6 +107,9 @@ impl ErrorKind {
 pub struct StoreError {
     pub kind: ErrorKind,
     pub message: String,
+    /// Seconds until a refused send may succeed, for
+    /// [`ErrorKind::RateLimited`] with a bucket that refills (TIN-7577).
+    pub retry_after: Option<u64>,
 }
 
 impl StoreError {
@@ -114,7 +117,13 @@ impl StoreError {
         Self {
             kind,
             message: message.into(),
+            retry_after: None,
         }
+    }
+    /// The same error with `retry_after` set.
+    pub fn with_retry_after(mut self, seconds: Option<u64>) -> Self {
+        self.retry_after = seconds;
+        self
     }
     pub fn code(&self) -> &'static str {
         self.kind.code()
@@ -792,8 +801,10 @@ impl Store {
         Ok(())
     }
     /// Take one send from `sender`'s token bucket, or answer
-    /// [`ErrorKind::RateLimited`] with the seconds until the next one. An
-    /// invalid sender passes, so `send` itself reports it.
+    /// [`ErrorKind::RateLimited`] with the seconds until the next one, in
+    /// the message and in `retry_after`. A refusal is counted by the
+    /// sender's harness kind (TIN-7577). An invalid sender passes, so `send`
+    /// itself reports it.
     pub fn admit_send(&self, sender: &str) -> StoreResult<()> {
         if !valid_agent_id(sender) {
             return Ok(());
@@ -803,14 +814,22 @@ impl Store {
             .2
             .lock()
             .map_err(|_| StoreError::new(ErrorKind::Internal, "limiter lock poisoned"))?;
-        limiter.admit(sender, now).map_err(|wait| {
-            let message = if wait == u64::MAX {
-                "rate limited".to_owned()
-            } else {
-                format!("rate limited; retry in {wait} s")
-            };
-            StoreError::new(ErrorKind::RateLimited, message)
-        })
+        match limiter.admit(sender, now) {
+            Ok(()) => Ok(()),
+            Err(wait) => {
+                let kind = sender.split(':').next().unwrap_or_default();
+                if let Some(i) = HARNESS_KINDS.iter().position(|k| *k == kind) {
+                    limiter.refused[i] = limiter.refused[i].saturating_add(1);
+                }
+                let message = if wait == u64::MAX {
+                    "rate limited".to_owned()
+                } else {
+                    format!("rate limited; retry in {wait} s")
+                };
+                Err(StoreError::new(ErrorKind::RateLimited, message)
+                    .with_retry_after((wait != u64::MAX).then_some(wait)))
+            }
+        }
     }
     /// Register (or re-register) a self-asserted session and return its
     /// agent id, lease and end token (R-C944). Every registration mints a
@@ -1517,9 +1536,29 @@ impl Store {
             .optional()
             .map_err(sql_err)?
             .unwrap_or(0);
-        Ok(format!(
+        let mut text = format!(
             "# TYPE swb_messages_total counter\nswb_messages_total {sent}\n# TYPE swb_mailbox_unacked gauge\nswb_mailbox_unacked {unacked}\n# TYPE swb_sessions gauge\nswb_sessions{{state=\"live\"}} {live}\n# TYPE swb_claims_active gauge\nswb_claims_active {claims_active}\n# TYPE swb_claim_overlaps gauge\nswb_claim_overlaps {claim_overlaps}\n# TYPE swb_handoffs_total counter\nswb_handoffs_total {handoffs}\n"
-        ))
+        );
+        // TIN-7577: send refusals by harness kind and the limit's settings.
+        // The lock order is the store, then the limiter, as in send_as.
+        // No series carries an agent id.
+        let limiter = self
+            .2
+            .lock()
+            .map_err(|_| StoreError::new(ErrorKind::Internal, "limiter lock poisoned"))?;
+        text.push_str("# TYPE swb_send_rate_limited_total counter\n");
+        for (kind, count) in HARNESS_KINDS.iter().zip(limiter.refused) {
+            text.push_str(&format!(
+                "swb_send_rate_limited_total{{harness=\"{kind}\"}} {count}\n"
+            ));
+        }
+        text.push_str(&format!(
+            "# TYPE swb_send_limit_burst gauge\nswb_send_limit_burst {}\n# TYPE swb_send_limit_refill_per_minute gauge\nswb_send_limit_refill_per_minute {}\n# TYPE swb_send_buckets gauge\nswb_send_buckets {}\n",
+            limiter.limit.burst,
+            limiter.limit.refill_per_minute,
+            limiter.buckets_held()
+        ));
+        Ok(text)
     }
 }
 #[cfg(test)]
@@ -2141,6 +2180,64 @@ mod tests {
             s.admit_send(me).unwrap();
         }
         assert_eq!(SendLimit::default().burst, SEND_BURST_DEFAULT);
+    }
+
+    /// TIN-7577: refusals are counted by harness kind, and /metrics shows
+    /// them with the limit settings, with no agent id.
+    #[test]
+    fn rate_limit_refusals_are_counted_by_harness_kind() {
+        let (s, _clock) = clocked();
+        s.set_send_limit(SendLimit {
+            burst: 1,
+            refill_per_minute: 6,
+        })
+        .unwrap();
+        for sender in ["claude:honey:1:a", "codex:sting:2:b"] {
+            s.admit_send(sender).unwrap();
+            let refused = s.admit_send(sender).unwrap_err();
+            assert_eq!(refused.kind, ErrorKind::RateLimited);
+            assert_eq!(refused.retry_after, Some(10));
+            assert_eq!(refused, "rate limited; retry in 10 s");
+        }
+        let text = s.metrics().unwrap();
+        for line in [
+            "# TYPE swb_send_rate_limited_total counter\n",
+            "swb_send_rate_limited_total{harness=\"claude\"} 1\n",
+            "swb_send_rate_limited_total{harness=\"codex\"} 1\n",
+            "swb_send_rate_limited_total{harness=\"kimi\"} 0\n",
+            "swb_send_limit_burst 1\n",
+            "swb_send_limit_refill_per_minute 6\n",
+            "swb_send_buckets 2\n",
+        ] {
+            assert!(text.contains(line), "{line:?} not in {text}");
+        }
+        assert_eq!(
+            text.matches("swb_send_rate_limited_total{").count(),
+            HARNESS_KINDS.len()
+        );
+        assert!(!text.contains("honey") && !text.contains("sting"), "{text}");
+        // Other errors carry no retry_after.
+        assert_eq!(StoreError::new(ErrorKind::Invalid, "x").retry_after, None);
+    }
+
+    #[test]
+    fn retry_after_is_none_when_the_bucket_never_refills() {
+        let s = Store::memory().unwrap();
+        s.set_send_limit(SendLimit {
+            burst: 1,
+            refill_per_minute: 0,
+        })
+        .unwrap();
+        let me = "pi:sting:2:b";
+        s.admit_send(me).unwrap();
+        let refused = s.admit_send(me).unwrap_err();
+        assert_eq!(refused, "rate limited");
+        assert_eq!(refused.retry_after, None);
+        assert!(
+            s.metrics()
+                .unwrap()
+                .contains("swb_send_rate_limited_total{harness=\"pi\"} 1\n")
+        );
     }
 
     #[test]

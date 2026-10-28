@@ -110,6 +110,55 @@ fn now_secs() -> u64 {
 /// operation's own transaction (ADR-0003, SWB-R66), and `register` checks
 /// its own. `peers`, `claims`, `heartbeat` and `thread` take none.
 fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError> {
+    operation_via(store, name, args, "rest")
+}
+
+/// [`operation`] for a named route (`rest` or `mcp`). A send refused for
+/// its rate limit writes one `send_refused` line (TIN-7577), so a 429
+/// leaves a trace although no audit line follows a failed operation.
+fn operation_via(
+    store: &Store,
+    name: &str,
+    args: &Value,
+    route: &'static str,
+) -> Result<Value, StoreError> {
+    let result = operation_inner(store, name, args);
+    if let Err(error) = &result
+        && let Some(line) = refusal_record(name, args, error, route)
+    {
+        println!("{line}");
+    }
+    result
+}
+
+/// The `send_refused` line for a send the rate limit refused, and `None`
+/// for any other outcome (TIN-7577). It names the sender's harness kind,
+/// `retry_after` and the route, and never an agent id or a body.
+fn refusal_record(
+    name: &str,
+    args: &Value,
+    error: &StoreError,
+    route: &'static str,
+) -> Option<Value> {
+    if name != "send" || error.kind != ErrorKind::RateLimited {
+        return None;
+    }
+    let harness = args
+        .get("from")
+        .and_then(Value::as_str)
+        .and_then(|from| from.split(':').next())
+        .filter(|kind| HARNESS_KINDS.contains(kind));
+    Some(json!({
+        "ts": now_secs(),
+        "op": "send_refused",
+        "code": error.code(),
+        "harness": harness,
+        "retry_after": error.retry_after,
+        "route": route,
+    }))
+}
+
+fn operation_inner(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError> {
     let token = match args.get("session_token") {
         None | Some(Value::Null) => None,
         Some(Value::String(token)) => Some(token.as_str()),
@@ -486,7 +535,8 @@ impl ServerHandler for BrokerMcp {
         }
         let args = Value::Object(request.arguments.unwrap_or_default());
         let store = Arc::clone(&self.store);
-        match tokio::task::spawn_blocking(move || operation(&store, &name, &args)).await {
+        match tokio::task::spawn_blocking(move || operation_via(&store, &name, &args, "mcp")).await
+        {
             Ok(Ok(value)) => Ok(CallToolResult::structured(value).into()),
             Ok(Err(error)) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 error_body(error.code(), &error.message).to_string(),
@@ -3118,5 +3168,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fetch_lines[0]["recipient_state"], Value::Null);
+    }
+
+    /// TIN-7577: a send the rate limit refuses yields one line with the
+    /// harness kind, retry_after and route, and no id or body.
+    #[test]
+    fn a_refused_send_logs_one_line_without_ids() {
+        let store = Store::memory().unwrap();
+        store
+            .set_send_limit(SendLimit {
+                burst: 1,
+                refill_per_minute: 6,
+            })
+            .unwrap();
+        let args = json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none",
+            "body":"body sentinel"});
+        operation(&store, "send", &args).unwrap();
+        let error = operation(&store, "send", &args).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::RateLimited);
+        let line = refusal_record("send", &args, &error, "mcp").unwrap();
+        assert_eq!(line["op"], "send_refused");
+        assert_eq!(line["code"], "rate_limited");
+        assert_eq!(line["harness"], "claude");
+        assert_eq!(line["route"], "mcp");
+        assert!(
+            line["retry_after"].as_u64().is_some_and(|s| s >= 1),
+            "{line}"
+        );
+        assert!(line["ts"].is_u64());
+        let text = line.to_string();
+        for leak in ["claude:honey", "pi:sting", "sentinel", "honey"] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+        // A forged from with an unknown kind gives a null harness.
+        let mut forged = args.clone();
+        forged["from"] = json!("bogus");
+        assert_eq!(
+            refusal_record("send", &forged, &error, "rest").unwrap()["harness"],
+            Value::Null
+        );
+        // Other errors and other operations write nothing.
+        let invalid = StoreError::new(ErrorKind::Invalid, "invalid ticket");
+        assert!(refusal_record("send", &args, &invalid, "rest").is_none());
+        assert!(refusal_record("ack", &args, &error, "rest").is_none());
+    }
+
+    /// TIN-7577: the metrics listener serves the send limit series.
+    #[tokio::test]
+    async fn metrics_lists_the_send_limit_series() {
+        let store = Arc::new(Store::memory().unwrap());
+        store
+            .set_send_limit(SendLimit {
+                burst: 1,
+                refill_per_minute: 6,
+            })
+            .unwrap();
+        let args = json!({"from":"codex:sting:9:x","to":"pi:sting:2:b","ticket":"none","body":"x"});
+        operation(&store, "send", &args).unwrap();
+        assert_eq!(
+            operation(&store, "send", &args).unwrap_err().kind,
+            ErrorKind::RateLimited
+        );
+        let response = metrics_router(Arc::clone(&store))
+            .oneshot(guarded_request(
+                "GET",
+                "/metrics",
+                "",
+                &[("host", "localhost")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        for line in [
+            "swb_send_rate_limited_total{harness=\"codex\"} 1\n",
+            "swb_send_rate_limited_total{harness=\"claude\"} 0\n",
+            "swb_send_limit_burst 1\n",
+            "swb_send_limit_refill_per_minute 6\n",
+            "swb_send_buckets 1\n",
+        ] {
+            assert!(text.contains(line), "{line:?} not in {text}");
+        }
+        assert!(!text.contains("codex:sting"), "{text}");
     }
 }
