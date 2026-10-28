@@ -208,6 +208,10 @@ pub struct Store(Mutex<Connection>, Arc<dyn Clock>, Mutex<ratelimit::Limiter>);
 pub struct SendOutcome {
     pub envelope: Value,
     pub created: bool,
+    /// Where mail to the recipient stands when the send commits: `live`,
+    /// `idle`, `gone`, `ended` or `unregistered` (A5, TIN-7577). A send
+    /// result carries it; the stored envelope never does.
+    pub recipient_state: &'static str,
 }
 
 /// A `peers` request (R-C944). The default lists live sessions only, one
@@ -374,6 +378,40 @@ struct Binding {
 }
 /// A key's latest session row: agent id, nonce, bound, ended, last_seen.
 type BindingRow = (String, Option<Vec<u8>>, i64, i64, i64);
+/// Where mail to `recipient` stands (A5, TIN-7577). A live binding of its
+/// delivery key reads mail for every pid of that key, so the binding's own
+/// lease counts. Otherwise the recipient's own row decides, and an id with
+/// no row is `unregistered`. Read-only: it never marks a lapsed binding.
+fn recipient_state_of(db: &Connection, recipient: &str, now: i64) -> StoreResult<&'static str> {
+    if let [harness, host, _, session] = recipient.splitn(4, ':').collect::<Vec<_>>()[..] {
+        let latest: Option<(i64, i64, i64)> = db
+            .query_row(
+                "SELECT bound, ended, last_seen FROM sessions
+                 WHERE harness=?1 AND host=?2 AND session_id=?3
+                 ORDER BY registered_seq DESC, agent_id DESC LIMIT 1",
+                params![harness, host, session],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if let Some((1, 0, seen)) = latest
+            && seen >= now - IDLE_MAX_AGE_SECONDS
+        {
+            return Ok(lease_state(seen, false, now));
+        }
+    }
+    let row: Option<(i64, i64)> = db
+        .query_row(
+            "SELECT last_seen, ended FROM sessions WHERE agent_id=?1",
+            [recipient],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_err)?;
+    Ok(row.map_or("unregistered", |(seen, ended)| {
+        lease_state(seen, ended != 0, now)
+    }))
+}
 fn lease_state(seen: i64, ended: bool, now: i64) -> &'static str {
     if ended {
         "ended"
@@ -1176,10 +1214,12 @@ impl Store {
             let envelope = serde_json::from_str(&envelope)
                 .map_err(|e| StoreError::new(ErrorKind::Internal, e.to_string()))?;
             touch(&tx, sender, now)?;
+            let recipient_state = recipient_state_of(&tx, recipient, now)?;
             tx.commit().map_err(sql_err)?;
             return Ok(SendOutcome {
                 envelope,
                 created: false,
+                recipient_state,
             });
         }
         self.admit_send(sender)?;
@@ -1251,10 +1291,12 @@ impl Store {
             params![msg_id,thread_id,seq,sender,recipient,body,envelope.to_string(),i64::from(ttl)*3600,now,delivery_key(recipient),arrival]).map_err(sql_err)?;
         tx.execute("INSERT INTO counters(name,value) VALUES('messages_total',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
         touch(&tx, sender, now)?;
+        let recipient_state = recipient_state_of(&tx, recipient, now)?;
         tx.commit().map_err(sql_err)?;
         Ok(SendOutcome {
             envelope,
             created: true,
+            recipient_state,
         })
     }
     /// Fetch `me`'s unacknowledged messages, as an unbound caller (no
@@ -2515,6 +2557,62 @@ mod tests {
         assert_eq!(ids(Some("p1")), vec!["claude:sting:1:shared"]);
         assert_eq!(ids(None), vec!["claude:sting:1:shared"]);
         assert!(ids(Some("p3")).is_empty());
+    }
+
+    /// A5 (TIN-7577): a send reports where mail to its recipient stands,
+    /// and the stored envelope never carries it.
+    #[test]
+    fn send_reports_the_recipient_state() {
+        let (s, clock) = clocked();
+        let to = "pi:sting:2:b";
+        let send = |body: &str| {
+            s.send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":body}))
+                .unwrap()
+        };
+        assert_eq!(send("before").recipient_state, "unregistered");
+        let row = reg(&s, "pi", "sting", 2, "b", "p");
+        assert_eq!(send("live").recipient_state, "live");
+        clock.advance(901);
+        assert_eq!(send("idle").recipient_state, "idle");
+        clock.advance(20_700);
+        assert_eq!(send("gone").recipient_state, "gone");
+        s.end(to, row["end_token"].as_str().unwrap()).unwrap();
+        let msg = json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"ended",
+            "msg_id":Ulid::new().to_string()});
+        let first = s.send(&msg).unwrap();
+        assert!(first.created);
+        assert_eq!(first.recipient_state, "ended");
+        // A replay carries it too.
+        let replay = s.send(&msg).unwrap();
+        assert!(!replay.created);
+        assert_eq!(replay.recipient_state, "ended");
+        assert!(replay.envelope.get("recipient_state").is_none());
+        let read = s.inbox(to, 10).unwrap();
+        let messages = read["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 5);
+        assert!(messages.iter().all(|m| m.get("recipient_state").is_none()));
+    }
+
+    #[test]
+    fn a_live_binding_makes_mail_to_an_old_pid_live() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let old = first["agent_id"].as_str().unwrap().to_owned();
+        // The old pid goes quiet; the restarted service binds again.
+        clock.advance(1000);
+        bind(&s, "hermes", "sting", 200, "svc", Some(&token_of(&first))).unwrap();
+        let state = |to: &str| {
+            s.send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"x"}))
+                .unwrap()
+                .recipient_state
+        };
+        assert_eq!(state(&old), "live");
+        // An unbound session that went quiet stays gone, and another pid
+        // of it with no row is unregistered.
+        reg(&s, "pi", "sting", 2, "b", "p");
+        clock.advance(21_601);
+        assert_eq!(state("pi:sting:2:b"), "gone");
+        assert_eq!(state("pi:sting:3:b"), "unregistered");
     }
 
     #[test]

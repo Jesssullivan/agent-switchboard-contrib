@@ -47,8 +47,8 @@
 //! with backoff. Nothing here blocks or ends the harness.
 use super::{
     Check, Identity, Lookup, MAX_BODY_BYTES, SendArgs, VERSION, ack_after_reply, call_as,
-    call_with, need, predicted_identity, send_payload, valid_agent_id, valid_note, valid_part,
-    valid_subject, valid_ulid,
+    call_with, need, predicted_identity, recipient_warning, send_payload, valid_agent_id,
+    valid_note, valid_part, valid_subject, valid_ulid,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -878,6 +878,12 @@ fn call_full_tool(lookup: Lookup, name: &str, args: &Value) -> Result<Value, Str
                     map.insert("acked".into(), acked);
                 }
             }
+            // A5 (TIN-7577): the result already carries recipient_state.
+            if let Some(warning) = recipient_warning(&sent)
+                && let Some(map) = sent.as_object_mut()
+            {
+                map.insert("warning".into(), json!(warning));
+            }
             Ok(sent)
         }
         "peers" => {
@@ -1031,6 +1037,13 @@ pub(crate) fn call_tool(
                 "thread_id": sent.get("thread_id"),
                 "to": send.to,
             });
+            // A5 (TIN-7577): say when nobody reads the recipient's mail now.
+            if let Some(state) = sent.get("recipient_state") {
+                out["recipient_state"] = state.clone();
+            }
+            if let Some(warning) = recipient_warning(&sent) {
+                out["warning"] = json!(warning);
+            }
             let wants_ack = args.get("ack").and_then(Value::as_bool).unwrap_or(true);
             if let Some(id) = send.in_reply_to.filter(|_| wants_ack) {
                 out["acked"] = ack_after_reply(lookup, &me, &id);
@@ -2178,6 +2191,35 @@ mod tests {
         );
         assert_eq!(bodies[5], json!({"me": HERMES}));
         assert_eq!(bodies[6], json!({"me": HERMES, "all": true}));
+    }
+
+    /// A5 (TIN-7577): reply passes recipient_state through and warns when
+    /// the recipient is not live.
+    #[test]
+    fn reply_reports_recipient_state_and_warns_when_not_live() {
+        let json = "application/json";
+        let (url, server) = mock(vec![
+            (
+                200,
+                json,
+                r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9E","to":"codex:sting:42:t-1","recipient_state":"gone"}"#,
+            ),
+            (
+                200,
+                json,
+                r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9F","to":"codex:sting:42:t-1","recipient_state":"live"}"#,
+            ),
+        ]);
+        let lookup = me_at(&url);
+        let reply = json!({"to": PEER, "text": "late", "ack": false});
+        let out = call_tool(&lookup, ToolSet::Channel, "reply", &reply).unwrap();
+        assert_eq!(out["recipient_state"], "gone");
+        let warning = out["warning"].as_str().unwrap();
+        assert!(warning.contains("6 hours"), "{warning}");
+        let out = call_tool(&lookup, ToolSet::Channel, "reply", &reply).unwrap();
+        assert_eq!(out["recipient_state"], "live");
+        assert!(out.get("warning").is_none());
+        server.join().unwrap();
     }
 
     /// A3 (TIN-7577): a full-mode send that answers a message acknowledges

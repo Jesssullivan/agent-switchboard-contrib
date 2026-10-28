@@ -40,6 +40,11 @@
       "minimum": 0,
       "description": "Broker delivery attempts. Present in inbox results; absent from the submitted and stored envelope."
     },
+    "recipient_state": {
+      "type": "string",
+      "enum": ["live", "idle", "gone", "ended", "unregistered"],
+      "description": "Where mail to the recipient stands when the send commits (v0.5.1, TIN-7577). Present only in a send result; absent from the submitted, stored and delivered envelope. A send to a recipient that is not live still succeeds."
+    },
     "in_reply_to": {
       "$ref": "#/$defs/ulid"
     },

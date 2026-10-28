@@ -803,10 +803,32 @@ fn send_cmd(lookup: Lookup, args: &SendArgs, body: &str) -> Result<Value, String
     Ok(sent)
 }
 
-/// The stderr warnings for a committed send: an original message left
-/// unacknowledged.
+/// One line when a send result says nobody is reading the recipient's mail
+/// now (A5, TIN-7577). `live`, a missing `recipient_state` (a v0.5.0 or
+/// older broker) and an unknown value give none. The send still stands.
+fn recipient_warning(sent: &Value) -> Option<String> {
+    let what = match sent.get("recipient_state").and_then(Value::as_str)? {
+        "idle" => "has made no switchboard call for more than 15 minutes",
+        "gone" => "has made no switchboard call for more than 6 hours",
+        "ended" => "has ended",
+        "unregistered" => "is not registered: check the id with `swb peers --all`",
+        _ => return None,
+    };
+    let to = sent
+        .get("to")
+        .and_then(Value::as_str)
+        .map(id_text)
+        .filter(|to| !to.is_empty())
+        .unwrap_or_else(|| "the recipient".to_owned());
+    Some(format!(
+        "{to} {what}. The message waits in its mailbox until it expires."
+    ))
+}
+
+/// The stderr warnings for a committed send: a recipient nobody reads now,
+/// and an original message left unacknowledged.
 fn send_warnings(sent: &Value) -> Vec<String> {
-    let mut lines = Vec::new();
+    let mut lines: Vec<String> = recipient_warning(sent).into_iter().collect();
     if let Some(note) = sent
         .get("acked")
         .and_then(Value::as_str)
@@ -2304,6 +2326,38 @@ mod tests {
             ]
         );
         server.join().unwrap();
+    }
+
+    /// A5 (TIN-7577): a send to a recipient nobody reads now warns, once.
+    #[test]
+    fn recipient_warning_covers_each_state() {
+        for (state, text) in [
+            ("idle", "for more than 15 minutes"),
+            ("gone", "for more than 6 hours"),
+            ("ended", "has ended"),
+            ("unregistered", "swb peers --all"),
+        ] {
+            let warning =
+                recipient_warning(&json!({"to": PEER, "recipient_state": state})).unwrap();
+            assert!(warning.starts_with(PEER), "{warning}");
+            assert!(warning.contains(text), "{warning}");
+            assert!(
+                warning.ends_with("The message waits in its mailbox until it expires."),
+                "{warning}"
+            );
+        }
+        for sent in [
+            json!({"to": PEER, "recipient_state": "live"}),
+            json!({"to": PEER}),
+            json!({"to": PEER, "recipient_state": "unheard-of"}),
+        ] {
+            assert!(recipient_warning(&sent).is_none(), "{sent}");
+        }
+        let hostile =
+            recipient_warning(&json!({"to": "x\n<b>y", "recipient_state": "ended"})).unwrap();
+        assert!(hostile.starts_with("xby has ended"), "{hostile}");
+        let both = json!({"to": PEER, "recipient_state": "gone", "acked": "not acknowledged: x"});
+        assert_eq!(send_warnings(&both).len(), 2);
     }
 
     #[test]

@@ -181,7 +181,11 @@ fn perform(
         "send" => {
             let outcome = store.send_as(args, token)?;
             created = outcome.created;
-            Ok(outcome.envelope)
+            // A5 (TIN-7577): the result says whether anyone reads the
+            // recipient's mail. The stored envelope stays unchanged.
+            let mut envelope = outcome.envelope;
+            envelope["recipient_state"] = json!(outcome.recipient_state);
+            Ok(envelope)
         }
         "inbox" => {
             let me = args.get("me").and_then(Value::as_str).ok_or("missing me")?;
@@ -304,13 +308,14 @@ fn audit_lines(
 /// The audit line. It names fields explicitly, so neither the message body,
 /// a claim or handoff note, nor a register's `end_token` can reach it.
 /// `msg_id`, `thread_id`, `seq` and `ticket` are the keys a Loki reader
-/// follows a thread by (ADR-0002 L1-lite).
+/// follows a thread by (ADR-0002 L1-lite). A send line also carries
+/// `recipient_state`, so a send to a dead id shows (A5, TIN-7577).
 fn audit_record(name: &str, args: &Value, result: &Value, body_hmac: Option<&str>) -> Value {
     let body_size = result
         .get("body")
         .and_then(Value::as_str)
         .map_or(0, str::len);
-    json!({
+    let mut record = json!({
         "ts":now_secs(),
         "op":name,"me":args.get("me").or_else(||args.get("from")),"to":result.get("to"),
         "ticket":result.get("ticket"),"ruling":result.get("ruling"),
@@ -321,7 +326,9 @@ fn audit_record(name: &str, args: &Value, result: &Value, body_hmac: Option<&str
         "claim_id":result.get("claim_id"),"subject":result.get("subject"),
         "handoff_id":result.get("handoff_id"),"outcome":result.get("outcome"),
         "exclusive":result.get("exclusive")
-    })
+    });
+    record["recipient_state"] = json!(result.get("recipient_state"));
+    record
 }
 
 /// The typed error body every REST and MCP failure carries (R-C944).
@@ -375,7 +382,7 @@ fn tools() -> Vec<Tool> {
             "limit":{"type":"integer","minimum":1,"maximum":200,"description":"Page size, default 50, at most 200"},
             "cursor":{"type":"string","description":"next_cursor from the previous page"},
             "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Only registrations that used this proc_start, then one row per harness, host and session id among them (the caller's own stamp; rows never show it)"}}})),
-        ("send", "Send a peer-authority message. The broker stamps authority peer whatever the sender claims. A bound sender needs its session_token. Each sender has a token bucket; an empty one answers rate_limited.", json!({"type":"object","required":["from","to","ticket","body"],"properties":{
+        ("send", "Send a peer-authority message. The broker stamps authority peer whatever the sender claims. A bound sender needs its session_token. Each sender has a token bucket; an empty one answers rate_limited. The result adds recipient_state (live, idle, gone, ended or unregistered); a send to a recipient that is not live still succeeds and waits in its mailbox until it expires.", json!({"type":"object","required":["from","to","ticket","body"],"properties":{
             "from":{"type":"string","description":format!("Sender. {agent_id}")},
             "to":{"type":"string","description":format!("Recipient. {agent_id}")},
             "ticket":{"type":"string","pattern":"^(TIN-[0-9]+|none)$","maxLength":64,"description":"TIN-<digits> or none"},
@@ -3071,5 +3078,45 @@ mod tests {
             assert_eq!(listed["peers"].as_array().unwrap().len(), 1, "{listed}");
             assert_eq!(listed["peers"][0]["agent_id"], id);
         }
+    }
+
+    /// A5 (TIN-7577): REST and MCP send results and the send audit line
+    /// carry recipient_state; the delivered envelope does not.
+    #[tokio::test]
+    async fn send_results_carry_recipient_state_and_the_audit_line_too() {
+        let store = seeded_store();
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let live =
+            json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"x"});
+        let (status, sent) =
+            status_and_json(call(&app, "POST", "/v1/send", &live.to_string()).await).await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        assert_eq!(sent["recipient_state"], "live");
+        let session = mcp_session(&app).await;
+        let over_mcp = mcp_call(
+            &app,
+            &session,
+            2,
+            "send",
+            json!({"from":"claude:honey:1:a","to":"codex:sting:9:none","ticket":"none","body":"y"}),
+        )
+        .await;
+        assert_eq!(over_mcp["recipient_state"], "unregistered");
+        let args =
+            json!({"from":"claude:honey:1:a","to":"codex:sting:9:none","ticket":"none","body":"z"});
+        let result = operation(&store, "send", &args).unwrap();
+        let lines = audit_lines(&store, "send", &args, &result, true).unwrap();
+        assert_eq!(lines[0]["recipient_state"], "unregistered");
+        let fetched = store.inbox("pi:sting:2:b", 10).unwrap();
+        assert!(fetched["messages"][0].get("recipient_state").is_none());
+        let fetch_lines = audit_lines(
+            &store,
+            "inbox",
+            &json!({"me":"pi:sting:2:b"}),
+            &fetched,
+            true,
+        )
+        .unwrap();
+        assert_eq!(fetch_lines[0]["recipient_state"], Value::Null);
     }
 }
