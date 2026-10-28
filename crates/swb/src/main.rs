@@ -31,8 +31,9 @@ commands:
   inbox [--after ULID]      fetch one unacknowledged message for SWB_AGENT_ID;
                             --after reads the one that arrived after that msg_id
   send <to-agent-id> <ticket> [--ruling ID] [--operator-directed] [--in-reply-to ULID]
-       [--thread ULID] [--msg-id ULID]
-                            send a peer message; the body is read from stdin
+       [--thread ULID] [--msg-id ULID] [--no-ack]
+                            send a peer message; the body is read from stdin;
+                            --in-reply-to also acknowledges that message unless --no-ack
   ack <msg_id>              acknowledge a message for SWB_AGENT_ID
   peers [--all] [--host HOST] [--limit N] [--cursor AGENT_ID]
                             list live sessions (--all adds idle, gone and ended)
@@ -695,6 +696,8 @@ struct SendArgs {
     in_reply_to: Option<String>,
     thread_id: Option<String>,
     msg_id: Option<String>,
+    /// Leave the `--in-reply-to` message unacknowledged (A3, TIN-7577).
+    no_ack: bool,
 }
 
 fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
@@ -713,6 +716,7 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
             "--thread" => out.thread_id = Some(value("--thread")?),
             "--msg-id" => out.msg_id = Some(value("--msg-id")?),
             "--operator-directed" => out.operator_directed = true,
+            "--no-ack" => out.no_ack = true,
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ => positional.push(arg.clone()),
         }
@@ -772,10 +776,45 @@ fn read_body(input: impl Read) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "body is not UTF-8".into())
 }
 
+/// Acknowledge `msg_id` after a reply to it was sent: the msg_id, or
+/// `not acknowledged: <reason>`. The reply is already committed, so a
+/// failed ack is reported, never raised. The channel `reply` tool, its full
+/// `send` and `swb send --in-reply-to` all use it (A3, TIN-7577).
+fn ack_after_reply(lookup: Lookup, me: &str, msg_id: &str) -> Value {
+    match call_as(lookup, me, "/v1/ack", json!({"me": me, "msg_id": msg_id})) {
+        Ok(_) => json!(msg_id),
+        Err(e) => json!(format!("not acknowledged: {e}")),
+    }
+}
+
+/// `swb send`. With `--in-reply-to` and without `--no-ack` it also
+/// acknowledges the original and reports the result in `acked`, as the
+/// channel `reply` tool does (A3, TIN-7577).
 fn send_cmd(lookup: Lookup, args: &SendArgs, body: &str) -> Result<Value, String> {
     let me = me_from(lookup)?;
     let payload = send_payload(&me, args, body)?;
-    call_as(lookup, &me, "/v1/send", payload)
+    let mut sent = call_as(lookup, &me, "/v1/send", payload)?;
+    if let Some(original) = args.in_reply_to.as_deref().filter(|_| !args.no_ack) {
+        let acked = ack_after_reply(lookup, &me, original);
+        if let Some(map) = sent.as_object_mut() {
+            map.insert("acked".into(), acked);
+        }
+    }
+    Ok(sent)
+}
+
+/// The stderr warnings for a committed send: an original message left
+/// unacknowledged.
+fn send_warnings(sent: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(note) = sent
+        .get("acked")
+        .and_then(Value::as_str)
+        .filter(|acked| acked.starts_with("not acknowledged"))
+    {
+        lines.push(format!("the original message is {note}"));
+    }
+    lines
 }
 
 fn ack_cmd(lookup: Lookup, msg_id: &str) -> Result<Value, String> {
@@ -1588,11 +1627,17 @@ fn main() -> ExitCode {
             let rest: Vec<String> = args.collect();
             match parse_send_args(&rest) {
                 Err(e) => usage_error("send", &e),
-                Ok(parsed) => print_result(
-                    "send",
-                    read_body(std::io::stdin().lock())
-                        .and_then(|body| send_cmd(&process_env, &parsed, &body)),
-                ),
+                Ok(parsed) => {
+                    let sent = read_body(std::io::stdin().lock())
+                        .and_then(|body| send_cmd(&process_env, &parsed, &body));
+                    // The send is committed; a warning never changes the exit code.
+                    if let Ok(sent) = &sent {
+                        for line in send_warnings(sent) {
+                            eprintln!("swb send: warning: {line}");
+                        }
+                    }
+                    print_result("send", sent)
+                }
             }
         }
         Some("ack") => match (args.next(), args.next()) {
@@ -2086,6 +2131,12 @@ mod tests {
         assert_eq!(parsed.ruling.as_deref(), Some("R-C275"));
         assert!(parsed.operator_directed);
         assert_eq!(parsed.thread_id.as_deref(), Some(ULID));
+        assert!(!parsed.no_ack);
+        assert!(
+            parse_send_args(&strings(&[PEER, "none", "--in-reply-to", ULID, "--no-ack"]))
+                .unwrap()
+                .no_ack
+        );
         assert_eq!(
             parse_send_args(&strings(&[PEER])).unwrap_err(),
             "expected <to-agent-id> <ticket>"
@@ -2182,6 +2233,77 @@ mod tests {
             send_cmd(&no_me, &args, "x").unwrap_err(),
             "SWB_AGENT_ID is required"
         );
+    }
+
+    const SENT: &str = r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9E","authority":"peer"}"#;
+
+    /// A3 (TIN-7577): `swb send --in-reply-to` acknowledges the original.
+    #[test]
+    fn send_in_reply_to_acknowledges_the_original() {
+        let (url, server) = mock(vec![
+            (200, "application/json", SENT),
+            (
+                200,
+                "application/json",
+                r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9C","state":"acked"}"#,
+            ),
+        ]);
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_AGENT_ID", ME)]);
+        let args = parse_send_args(&strings(&[PEER, "TIN-4655", "--in-reply-to", ULID])).unwrap();
+        let sent = send_cmd(&lookup, &args, "done").unwrap();
+        assert_eq!(sent["acked"], ULID);
+        assert!(send_warnings(&sent).is_empty());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("POST /v1/send HTTP/1.1"));
+        assert_eq!(request_json(&requests[0])["in_reply_to"], ULID);
+        assert!(requests[1].starts_with("POST /v1/ack HTTP/1.1"));
+        assert_eq!(
+            request_json(&requests[1]),
+            json!({"me": ME, "msg_id": ULID})
+        );
+    }
+
+    #[test]
+    fn send_without_reply_or_with_no_ack_makes_one_request() {
+        for words in [
+            &[PEER, "none"][..],
+            &[PEER, "none", "--in-reply-to", ULID, "--no-ack"][..],
+        ] {
+            let (url, server) = mock(vec![(200, "application/json", SENT)]);
+            let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_AGENT_ID", ME)]);
+            let args = parse_send_args(&strings(words)).unwrap();
+            let sent = send_cmd(&lookup, &args, "fyi").unwrap();
+            assert!(sent.get("acked").is_none(), "{words:?}");
+            assert_eq!(server.join().unwrap().len(), 1, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_ack_after_send_is_a_warning_not_an_error() {
+        let (url, server) = mock(vec![
+            (200, "application/json", SENT),
+            (
+                404,
+                "application/json",
+                r#"{"error":"message unavailable","code":"message_unavailable"}"#,
+            ),
+        ]);
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_AGENT_ID", ME)]);
+        let args = parse_send_args(&strings(&[PEER, "none", "--in-reply-to", ULID])).unwrap();
+        let sent = send_cmd(&lookup, &args, "late").unwrap();
+        assert_eq!(
+            sent["acked"],
+            "not acknowledged: broker HTTP 404: message unavailable"
+        );
+        assert_eq!(
+            send_warnings(&sent),
+            vec![
+                "the original message is not acknowledged: broker HTTP 404: message unavailable"
+                    .to_owned()
+            ]
+        );
+        server.join().unwrap();
     }
 
     #[test]

@@ -46,9 +46,9 @@
 //! broker that is down, slow or wrong only makes the poller retry quietly
 //! with backoff. Nothing here blocks or ends the harness.
 use super::{
-    Check, Identity, Lookup, MAX_BODY_BYTES, SendArgs, VERSION, call_as, call_with, need,
-    predicted_identity, send_payload, valid_agent_id, valid_note, valid_part, valid_subject,
-    valid_ulid,
+    Check, Identity, Lookup, MAX_BODY_BYTES, SendArgs, VERSION, ack_after_reply, call_as,
+    call_with, need, predicted_identity, send_payload, valid_agent_id, valid_note, valid_part,
+    valid_subject, valid_ulid,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -668,7 +668,8 @@ fn full_tools() -> Value {
                     "ticket": {"type": "string", "description": "TIN-<digits> or none (default none)"},
                     "thread_id": {"type": "string", "description": format!("{ulid} of the thread; defaults to a new thread")},
                     "in_reply_to": {"type": "string", "description": format!("{ulid} of the message answered")},
-                    "msg_id": {"type": "string", "description": format!("{ulid}. Optional idempotency key for a retry")}
+                    "msg_id": {"type": "string", "description": format!("{ulid}. Optional idempotency key for a retry")},
+                    "ack": {"type": "boolean", "description": "Acknowledge in_reply_to after sending (default true)"}
                 }
             }
         },
@@ -862,12 +863,22 @@ fn call_full_tool(lookup: Lookup, name: &str, args: &Value) -> Result<Value, Str
                 in_reply_to: text("in_reply_to")?,
                 thread_id: text("thread_id")?,
                 msg_id: text("msg_id")?,
+                no_ack: opt_bool(args, "ack")? == Some(false),
                 ..SendArgs::default()
             };
             let body = text("body")?.ok_or("send needs body")?;
             let me = pinned_me(lookup, args)?;
             let payload = send_payload(&me, &send, &body)?;
-            call_as(lookup, &me, "/v1/send", payload)
+            let mut sent = call_as(lookup, &me, "/v1/send", payload)?;
+            // A3 (TIN-7577): a send that answers a message acknowledges it,
+            // as reply does, unless ack is false.
+            if let Some(id) = send.in_reply_to.as_deref().filter(|_| !send.no_ack) {
+                let acked = ack_after_reply(lookup, &me, id);
+                if let Some(map) = sent.as_object_mut() {
+                    map.insert("acked".into(), acked);
+                }
+            }
+            Ok(sent)
         }
         "peers" => {
             let mut query = json!({});
@@ -1022,11 +1033,7 @@ pub(crate) fn call_tool(
             });
             let wants_ack = args.get("ack").and_then(Value::as_bool).unwrap_or(true);
             if let Some(id) = send.in_reply_to.filter(|_| wants_ack) {
-                let ack = json!({"me": me, "msg_id": id});
-                out["acked"] = match call_as(lookup, &me, "/v1/ack", ack) {
-                    Ok(_) => json!(id),
-                    Err(e) => json!(format!("not acknowledged: {e}")),
-                };
+                out["acked"] = ack_after_reply(lookup, &me, &id);
             }
             Ok(out)
         }
@@ -1056,12 +1063,13 @@ pub(crate) fn call_tool(
 }
 
 /// The message a failed ack or reply left unacknowledged, so the poller
-/// emits it again (A2, TIN-7577). An ack that failed, or a reply whose own
-/// ack did not go through, names it; a reply with `ack: false` never does.
+/// emits it again (A2, TIN-7577). An ack that failed, or a reply or full
+/// `send` whose own ack did not go through, names it; one with `ack: false`
+/// never does.
 fn unacked(name: &str, args: &Value, outcome: &Result<Value, String>) -> Option<String> {
     let key = match name {
         "ack" => "msg_id",
-        "reply" => "in_reply_to",
+        "reply" | "send" => "in_reply_to",
         _ => return None,
     };
     let id = args
@@ -2170,6 +2178,56 @@ mod tests {
         );
         assert_eq!(bodies[5], json!({"me": HERMES}));
         assert_eq!(bodies[6], json!({"me": HERMES, "all": true}));
+    }
+
+    /// A3 (TIN-7577): a full-mode send that answers a message acknowledges
+    /// it, as reply does, unless ack is false.
+    #[test]
+    fn full_send_with_in_reply_to_acknowledges() {
+        let json = "application/json";
+        let (url, server) = mock(vec![
+            (200, json, r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9E"}"#),
+            (200, json, r#"{"state":"acked"}"#),
+            (200, json, r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9F"}"#),
+        ]);
+        let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_AGENT_ID", HERMES)]);
+        let sent = full_call(
+            &lookup,
+            "send",
+            json!({"to": PEER, "body": "done", "in_reply_to": MSG}),
+        )
+        .unwrap();
+        assert_eq!(sent["acked"], MSG);
+        let quiet = full_call(
+            &lookup,
+            "send",
+            json!({"to": PEER, "body": "fyi", "in_reply_to": MSG, "ack": false}),
+        )
+        .unwrap();
+        assert!(quiet.get("acked").is_none());
+        let routes: Vec<String> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|r| r.lines().next().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                "POST /v1/send HTTP/1.1",
+                "POST /v1/ack HTTP/1.1",
+                "POST /v1/send HTTP/1.1"
+            ]
+        );
+        assert!(
+            full_call(
+                &lookup,
+                "send",
+                json!({"to": PEER, "body": "x", "ack": "no"})
+            )
+            .unwrap_err()
+            .contains("invalid ack")
+        );
     }
 
     #[test]
