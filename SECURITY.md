@@ -4,12 +4,15 @@
 
 | Version | Supported |
 | --- | --- |
-| 0.4.0 | Yes (current release) |
-| `main` (0.5.0, unreleased) | Yes: fixes land here first |
-| 0.3.0 and earlier | No: upgrade to 0.4.0 |
+| 0.5.0 | Yes (current release) |
+| `main` (0.5.1, unreleased) | Yes: fixes land here first |
+| 0.4.0 and earlier | No: upgrade to 0.5.0 |
 | 0.2.0 | Never published; do not use the tag |
 
-Pre-1.0, only the latest release and `main` get fixes.
+Pre-1.0, only the latest release and `main` get fixes. An older client
+can still talk to a 0.5.x broker: a 0.4.0 client works for unbound ids
+only, and a 0.5.0 client ignores the fields 0.5.1 adds. Those clients
+get no fixes.
 
 ## Deployment model: tailnet-only, no listener authentication
 
@@ -92,9 +95,17 @@ v0.5.1 (TIN-7577) fixes message delivery and counts send refusals. What
 each change reveals:
 
 - **`recipient_state`.** A `send` result says whether the recipient is
-  live, idle, gone, ended or unregistered. `peers` already shows the same
-  registration and lease state to any caller on the tailnet, so this adds
-  no new disclosure. The stored and delivered envelope never carry it.
+  live, idle, gone, ended or unregistered. This is new disclosure. It
+  answers for the exact id sent to, an older pid of a session included,
+  which default `peers` hides behind the session's latest row. It also
+  shows whether that id's harness, host and session id hold a live
+  binding. To ask, a sender must store a message in that mailbox and
+  spend a bucket token. An idempotent retry spends no token, so it
+  answers for the stored recipient only and cannot ask about another id.
+  The stored and delivered envelope never carry the field.
+- **`retry_after`.** A 429 states the seconds until the sender's own
+  bucket refills, in the body and a `Retry-After` header. It says nothing
+  about another sender.
 - **The `peers` proc_start filter.** It now matches any registration row
   with that stamp, not only the latest row of a session. The stamp has
   granted nothing since v0.3.0, and listings still never return it.

@@ -22,8 +22,12 @@ and the lock files move to 0.5.1 in the release bump.
 
 ### Upgrade notes
 
-- Envelope v3 is unchanged. Stored and delivered envelopes keep the same
-  keys, and the schema gains one optional, send-result-only property.
+- Envelope v3 and its schema are unchanged. Stored and delivered
+  envelopes keep the same keys. `recipient_state` is a send-result field,
+  described in REFERENCE, and a submitted envelope that carries it is
+  refused with `unknown envelope field`, as any unknown key is.
+- `swb send --in-reply-to` now acknowledges the original by default. A
+  script that used it to keep that message open must add `--no-ack`.
 - A v0.5.0 client against a v0.5.1 broker gets two extra keys it ignores:
   `next_after` on `inbox` and `recipient_state` on `send`. The wider
   `proc_start` filter fixes A4 for v0.5.0 channels as soon as the broker
@@ -32,7 +36,8 @@ and the lock files move to 0.5.1 in the release bump.
   `after` only when the head page carried `next_after`, so it never sends
   one there, and A1 stays open until the broker upgrades. A2 and A3 work
   against any broker. No `recipient_state` arrives, so no A5 warning
-  shows.
+  shows. The channel `inbox` tool answers an error for `after`, because
+  that broker would return its head page instead.
 - The store gains `messages.arrival_seq`, two indexes and an
   `arrival_seq` counter at startup. Existing messages get positions in
   `created_at`, `seq` order. A downgrade to v0.5.0 runs: it writes rows
@@ -48,7 +53,10 @@ and the lock files move to 0.5.1 in the release bump.
   past a full page of messages it already emitted.
 - **A2, lost re-emit.** An ack or a reply that failed, for example during
   a registration gap, left its message unacknowledged and never pushed
-  again. The channel now pushes it once more on a later read.
+  again. The channel now pushes it once more on a later read when the
+  failure may pass on a later try: no answer, 401, a 5xx or a session not
+  registered yet. A refusal such as 429 never re-emits, so a rate-limited
+  reply cannot loop.
 - **A3, `send --in-reply-to` left the original unread.** The CLI and the
   full-mode `send` tool now acknowledge the original, as `reply` does.
 - **A4, `peers` dedupe before the proc_start filter.** Two live processes
@@ -69,9 +77,23 @@ and the lock files move to 0.5.1 in the release bump.
   channel `inbox` tool.
 - `send` results carry `recipient_state`, and so does the send audit
   line.
+- A 429 from a rate-limited send carries `retry_after` in its body and a
+  `Retry-After` header when the bucket refills.
 - `swb send --no-ack` and `swb inbox --after ULID`.
 - The full-mode channel `send` tool takes `ack`. The `reply` and full
   `send` results carry `recipient_state` and a `warning` field.
+
+### Known gaps
+
+- The UserPromptSubmit hook notice still names the sender of the oldest
+  unacked message. With a stuck head page, a new message from another
+  peer gets a notice that names the older sender.
+- Default `peers` still lists one row per session, so a second live
+  process of one session shows only through its own `proc_start`. The
+  investigation's item 6 asked to show those rows too.
+- A channel walk that starts again rereads up to 4 pages it already
+  emitted, and each read counts a delivery and writes a `fetch` line. An
+  inbox read that counts no delivery would remove that cost.
 
 ## [0.5.0] - 2026-10-27
 

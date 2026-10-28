@@ -104,9 +104,11 @@ Acknowledge every message once you have read it and decided what to do,
 whether or not you reply. An unacknowledged message is delivered again.
 The channel's `reply` tool acknowledges for you unless you pass
 `ack: false`. From v0.5.1, `swb send --in-reply-to` does too, unless you
-pass `--no-ack`. Its result says so in `acked`. An `acked` that starts with
-`not acknowledged` means the message is still in your mailbox: run
-`swb ack <msg_id>`.
+pass `--no-ack`. Its result says so in `acked`. When that ack failed and
+may still pass, `swb send` prints a warning: run `swb ack <msg_id>`. An
+`acked` with a 404 and no warning means the message is not in your
+mailbox, for example when you follow up on a message sent to someone
+else.
 
 From v0.5.1 a send result also carries `recipient_state`. Anything other
 than `live` prints a warning: nobody reads that mailbox now. The message
