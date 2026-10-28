@@ -353,6 +353,16 @@ impl Seen {
         }
         true
     }
+
+    /// Forget an emitted id, so the next read that returns it emits it
+    /// again (A2, TIN-7577). The next tail walk starts over, because the
+    /// id may lie behind the stored tail.
+    fn forget(&mut self, id: &str) {
+        if self.ids.remove(id) {
+            self.order.retain(|held| held != id);
+            self.rescan = true;
+        }
+    }
 }
 
 pub(crate) struct Poll {
@@ -1045,14 +1055,51 @@ pub(crate) fn call_tool(
     }
 }
 
-/// Answers one JSON-RPC message from Claude Code. Notifications and
-/// responses get no answer; an unknown request gets method-not-found, which
-/// is also how a probe for a newer protocol revision is declined.
+/// The message a failed ack or reply left unacknowledged, so the poller
+/// emits it again (A2, TIN-7577). An ack that failed, or a reply whose own
+/// ack did not go through, names it; a reply with `ack: false` never does.
+fn unacked(name: &str, args: &Value, outcome: &Result<Value, String>) -> Option<String> {
+    let key = match name {
+        "ack" => "msg_id",
+        "reply" => "in_reply_to",
+        _ => return None,
+    };
+    let id = args
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|id| valid_ulid(id))?;
+    if name != "ack" && args.get("ack") == Some(&json!(false)) {
+        return None;
+    }
+    let failed = match outcome {
+        Err(_) => true,
+        Ok(result) => name != "ack" && result.get("acked").and_then(Value::as_str) != Some(id),
+    };
+    failed.then(|| id.to_owned())
+}
+
+/// [`handle_with`] without a poller to tell about failed acks.
+#[cfg(test)]
 pub(crate) fn handle(
     lookup: Lookup,
     mode: Mode,
     message: &Value,
     ready: &AtomicBool,
+) -> Option<Value> {
+    handle_with(lookup, mode, message, ready, &Mutex::new(Vec::new()))
+}
+
+/// Answers one JSON-RPC message from Claude Code. Notifications and
+/// responses get no answer; an unknown request gets method-not-found, which
+/// is also how a probe for a newer protocol revision is declined. Each
+/// message id a failed ack or reply left unacknowledged goes into `failed`,
+/// for the poller to emit again (A2, TIN-7577).
+pub(crate) fn handle_with(
+    lookup: Lookup,
+    mode: Mode,
+    message: &Value,
+    ready: &AtomicBool,
+    failed: &Mutex<Vec<String>>,
 ) -> Option<Value> {
     let method = message.get("method").and_then(Value::as_str)?;
     if method == "notifications/initialized" {
@@ -1071,7 +1118,14 @@ pub(crate) fn handle(
                 .unwrap_or("");
             let empty = json!({});
             let args = params.and_then(|p| p.get("arguments")).unwrap_or(&empty);
-            Ok(match call_tool(lookup, mode.tools, name, args) {
+            let outcome = call_tool(lookup, mode.tools, name, args);
+            if mode.tools.names().contains(&name)
+                && let Some(id) = unacked(name, args, &outcome)
+                && let Ok(mut list) = failed.lock()
+            {
+                list.push(id);
+            }
+            Ok(match outcome {
                 Ok(value) => json!({
                     "content": [{"type": "text", "text": value.to_string()}],
                     "isError": false,
@@ -1124,7 +1178,13 @@ fn pause(wait: Duration, stop: &AtomicBool) {
     }
 }
 
-fn poller<W: Write>(env: Env, out: Arc<Mutex<W>>, ready: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+fn poller<W: Write>(
+    env: Env,
+    out: Arc<Mutex<W>>,
+    ready: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    failed: Arc<Mutex<Vec<String>>>,
+) {
     let lookup = move |name: &str| env.get(name).cloned();
     let base = poll_interval(&lookup);
     let mut seen = Seen::default();
@@ -1134,6 +1194,13 @@ fn poller<W: Write>(env: Env, out: Arc<Mutex<W>>, ready: Arc<AtomicBool>, stop: 
         if !ready.load(Ordering::SeqCst) {
             pause(Duration::from_millis(200), &stop);
             continue;
+        }
+        // A2 (TIN-7577): a message whose ack or reply failed is emitted
+        // again on a later read, if the broker still lists it as unacked.
+        if let Ok(mut list) = failed.lock() {
+            for id in list.drain(..) {
+                seen.forget(&id);
+            }
         }
         let wait = match poll_once(&lookup, &mut seen) {
             Ok(poll) => {
@@ -1182,11 +1249,18 @@ pub(crate) fn run<R: BufRead, W: Write + Send + 'static>(
         move |name: &str| env.get(name).cloned()
     };
     let mode = Mode::for_session(set, &lookup);
+    let failed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     if mode.push {
-        let (env, out, ready, stop) = (env, out.clone(), ready.clone(), stop.clone());
+        let (env, out, ready, stop, failed) = (
+            env,
+            out.clone(),
+            ready.clone(),
+            stop.clone(),
+            failed.clone(),
+        );
         if let Err(e) = std::thread::Builder::new()
             .name("swb-channel-poller".into())
-            .spawn(move || poller(env, out, ready, stop))
+            .spawn(move || poller(env, out, ready, stop, failed))
         {
             eprintln!("swb channel: no poller thread ({e}); tools only");
         }
@@ -1197,7 +1271,7 @@ pub(crate) fn run<R: BufRead, W: Write + Send + 'static>(
             continue;
         }
         let answer = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => handle(&lookup, mode, &message, &ready),
+            Ok(message) => handle_with(&lookup, mode, &message, &ready, &failed),
             Err(_) => Some(json!({
                 "jsonrpc": "2.0",
                 "id": null,
@@ -1724,6 +1798,75 @@ mod tests {
         );
         assert!(requests[1].starts_with("POST /v1/ack HTTP/1.1"));
         assert_eq!(request_json(&requests[1]), json!({"me": ME, "msg_id": MSG}));
+    }
+
+    fn tool_call(
+        lookup: Lookup,
+        failed: &Mutex<Vec<String>>,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let ready = AtomicBool::new(true);
+        let message = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":name,"arguments":arguments}});
+        handle_with(lookup, CHANNEL, &message, &ready, failed).unwrap()
+    }
+
+    /// A2 (TIN-7577): a failed ack or reply leaves its message to be
+    /// emitted again; a successful one, or a reply with ack false, does not.
+    #[test]
+    fn a_failed_ack_or_reply_emits_the_message_again() {
+        let json = "application/json";
+        let unavailable = r#"{"error":"message unavailable","code":"message_unavailable"}"#;
+        let sent =
+            r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9E","thread_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9D"}"#;
+        // The ack answers 404.
+        let (url, server) = mock(vec![(404, json, unavailable)]);
+        let failed = Mutex::new(Vec::new());
+        let answer = tool_call(&me_at(&url), &failed, "ack", json!({"msg_id": MSG}));
+        assert_eq!(answer["result"]["isError"], true);
+        assert_eq!(*failed.lock().unwrap(), vec![MSG.to_owned()]);
+        server.join().unwrap();
+        // The reply is sent, and its ack fails.
+        let (url, server) = mock(vec![(200, json, sent), (404, json, unavailable)]);
+        let failed = Mutex::new(Vec::new());
+        let reply = json!({"to": PEER, "text": "on it", "in_reply_to": MSG});
+        let answer = tool_call(&me_at(&url), &failed, "reply", reply);
+        assert_eq!(answer["result"]["isError"], false);
+        assert_eq!(*failed.lock().unwrap(), vec![MSG.to_owned()]);
+        server.join().unwrap();
+        // A successful ack, a reply with ack false and an acknowledged reply
+        // record nothing.
+        let acked = r#"{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9C","state":"acked"}"#;
+        let (url, server) = mock(vec![
+            (200, json, acked),
+            (200, json, sent),
+            (200, json, sent),
+            (200, json, acked),
+        ]);
+        let lookup = me_at(&url);
+        let failed = Mutex::new(Vec::new());
+        tool_call(&lookup, &failed, "ack", json!({"msg_id": MSG}));
+        let quiet = json!({"to": PEER, "text": "noted", "in_reply_to": MSG, "ack": false});
+        tool_call(&lookup, &failed, "reply", quiet);
+        let reply = json!({"to": PEER, "text": "done", "in_reply_to": MSG});
+        tool_call(&lookup, &failed, "reply", reply);
+        assert!(failed.lock().unwrap().is_empty());
+        assert_eq!(server.join().unwrap().len(), 4);
+        // Once forgotten, the message is emitted on the next read, once.
+        let body = r#"{"messages":[{"msg_id":"01J9ZQ3Y8T6V2W4X5Y6Z7A8B9C","from":"codex:sting:42:t-1","ticket":"none","body":"hello"}]}"#;
+        let mut seen = Seen::default();
+        assert!(seen.insert(MSG));
+        seen.forget(MSG);
+        assert!(seen.rescan);
+        for expected in [1usize, 0] {
+            let (url, server) = mock(inbox_reply(body));
+            assert_eq!(
+                poll_once(&me_at(&url), &mut seen).unwrap().events.len(),
+                expected
+            );
+            server.join().unwrap();
+        }
     }
 
     #[test]
