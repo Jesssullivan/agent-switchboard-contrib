@@ -387,27 +387,39 @@ struct Binding {
 }
 /// A key's latest session row: agent id, nonce, bound, ended, last_seen.
 type BindingRow = (String, Option<Vec<u8>>, i64, i64, i64);
+/// The latest session row of `agent_id`'s delivery key (harness, host and
+/// session id), or `None` for a malformed id or a key with no row.
+fn latest_key_row(db: &Connection, agent_id: &str) -> StoreResult<Option<BindingRow>> {
+    let [harness, host, _, session] = match agent_id.splitn(4, ':').collect::<Vec<_>>()[..] {
+        [a, b, c, d] => [a, b, c, d],
+        _ => return Ok(None),
+    };
+    db.query_row(
+        "SELECT agent_id, token_nonce, bound, ended, last_seen FROM sessions
+         WHERE harness=?1 AND host=?2 AND session_id=?3
+         ORDER BY registered_seq DESC, agent_id DESC LIMIT 1",
+        params![harness, host, session],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )
+    .optional()
+    .map_err(sql_err)
+}
+/// Whether a key's latest row is a live binding: bound, not ended, with a
+/// token nonce, and seen within [`IDLE_MAX_AGE_SECONDS`]. The inbox gate and
+/// `recipient_state_of` share this one test, so a send never reports a
+/// binding the inbox does not honour (TIN-7577).
+fn is_live_binding(row: &BindingRow, now: i64) -> bool {
+    matches!(row, (_, Some(_), 1, 0, seen) if *seen >= now - IDLE_MAX_AGE_SECONDS)
+}
 /// Where mail to `recipient` stands (A5, TIN-7577). A live binding of its
 /// delivery key reads mail for every pid of that key, so the binding's own
 /// lease counts. Otherwise the recipient's own row decides, and an id with
 /// no row is `unregistered`. Read-only: it never marks a lapsed binding.
 fn recipient_state_of(db: &Connection, recipient: &str, now: i64) -> StoreResult<&'static str> {
-    if let [harness, host, _, session] = recipient.splitn(4, ':').collect::<Vec<_>>()[..] {
-        let latest: Option<(i64, i64, i64)> = db
-            .query_row(
-                "SELECT bound, ended, last_seen FROM sessions
-                 WHERE harness=?1 AND host=?2 AND session_id=?3
-                 ORDER BY registered_seq DESC, agent_id DESC LIMIT 1",
-                params![harness, host, session],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()
-            .map_err(sql_err)?;
-        if let Some((1, 0, seen)) = latest
-            && seen >= now - IDLE_MAX_AGE_SECONDS
-        {
-            return Ok(lease_state(seen, false, now));
-        }
+    if let Some(row) = latest_key_row(db, recipient)?
+        && is_live_binding(&row, now)
+    {
+        return Ok(lease_state(row.4, false, now));
     }
     let row: Option<(i64, i64)> = db
         .query_row(
@@ -603,7 +615,11 @@ impl Store {
             db.execute("ALTER TABLE messages ADD COLUMN arrival_seq INTEGER", [])
                 .map_err(sql_err)?;
         }
-        let base: i64 = db
+        // One transaction for the backfill and the counter, so a large store
+        // syncs once at startup, not once per row. A crash before the commit
+        // leaves every row unfilled, and the next start fills them again.
+        let fill = db.unchecked_transaction().map_err(sql_err)?;
+        let base: i64 = fill
             .query_row(
                 "SELECT MAX(COALESCE((SELECT MAX(arrival_seq) FROM messages),0),
                             COALESCE((SELECT value FROM counters WHERE name='arrival_seq'),0))",
@@ -611,7 +627,7 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(sql_err)?;
-        let unordered: Vec<String> = db
+        let unordered: Vec<String> = fill
             .prepare(
                 "SELECT msg_id FROM messages WHERE arrival_seq IS NULL ORDER BY created_at, seq, rowid",
             )
@@ -621,18 +637,19 @@ impl Store {
             })
             .map_err(sql_err)?;
         for (offset, msg_id) in (1i64..).zip(&unordered) {
-            db.execute(
+            fill.execute(
                 "UPDATE messages SET arrival_seq=?2 WHERE msg_id=?1",
                 params![msg_id, base + offset],
             )
             .map_err(sql_err)?;
         }
-        db.execute(
+        fill.execute(
             "INSERT INTO counters(name,value) VALUES('arrival_seq',?1)
              ON CONFLICT(name) DO UPDATE SET value=MAX(value, excluded.value)",
             [base + unordered.len() as i64],
         )
         .map_err(sql_err)?;
+        fill.commit().map_err(sql_err)?;
         db.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_inbox_arrival ON messages(recipient, state, arrival_seq);
              CREATE INDEX IF NOT EXISTS messages_key_arrival ON messages(recipient_key, state, arrival_seq);",
@@ -706,23 +723,10 @@ impl Store {
     /// can bring the binding or its old token back. Only a new `register`
     /// with `bind: true` binds the key again, under a new token.
     fn live_binding(db: &Connection, agent_id: &str, now: i64) -> StoreResult<Option<Binding>> {
-        let [harness, host, _, session] = match agent_id.splitn(4, ':').collect::<Vec<_>>()[..] {
-            [a, b, c, d] => [a, b, c, d],
-            _ => return Ok(None),
-        };
-        let row: Option<BindingRow> = db
-            .query_row(
-                "SELECT agent_id, token_nonce, bound, ended, last_seen FROM sessions
-                 WHERE harness=?1 AND host=?2 AND session_id=?3
-                 ORDER BY registered_seq DESC, agent_id DESC LIMIT 1",
-                params![harness, host, session],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()
-            .map_err(sql_err)?;
-        Ok(match row {
-            Some((agent_id, Some(nonce), 1, 0, seen)) if seen >= now - IDLE_MAX_AGE_SECONDS => {
-                Some(Binding { agent_id, nonce })
+        Ok(match latest_key_row(db, agent_id)? {
+            Some(row) if is_live_binding(&row, now) => {
+                let (agent_id, nonce, ..) = row;
+                nonce.map(|nonce| Binding { agent_id, nonce })
             }
             Some((agent_id, _, 1, _, _)) => {
                 db.execute("UPDATE sessions SET bound=0 WHERE agent_id=?1", [&agent_id])
@@ -1217,15 +1221,15 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
         Self::gate(&tx, sender, session_token, now)?;
-        let old: Option<(String, String, String)> = tx
+        let old: Option<(String, String, String, String)> = tx
             .query_row(
-                "SELECT sender,body,envelope FROM messages WHERE msg_id=?1",
+                "SELECT sender,body,envelope,recipient FROM messages WHERE msg_id=?1",
                 [&msg_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .map_err(sql_err)?;
-        if let Some((old_sender, old_body, envelope)) = old {
+        if let Some((old_sender, old_body, envelope, old_recipient)) = old {
             // SWB-R46: disclose neither the stored receipt nor its metadata on conflict.
             if old_sender != sender || old_body != body {
                 return Err(StoreError::new(ErrorKind::Conflict, "msg_id conflict"));
@@ -1233,7 +1237,10 @@ impl Store {
             let envelope = serde_json::from_str(&envelope)
                 .map_err(|e| StoreError::new(ErrorKind::Internal, e.to_string()))?;
             touch(&tx, sender, now)?;
-            let recipient_state = recipient_state_of(&tx, recipient, now)?;
+            // The stored recipient, not this request's `to`: a replay answers
+            // for the envelope it returns, so it cannot probe another id
+            // without spending a bucket token (TIN-7577).
+            let recipient_state = recipient_state_of(&tx, &old_recipient, now)?;
             tx.commit().map_err(sql_err)?;
             return Ok(SendOutcome {
                 envelope,
@@ -2192,7 +2199,7 @@ mod tests {
             refill_per_minute: 6,
         })
         .unwrap();
-        for sender in ["claude:honey:1:a", "codex:sting:2:b"] {
+        for sender in ["claude:host-a:1:a", "codex:host-b:2:b"] {
             s.admit_send(sender).unwrap();
             let refused = s.admit_send(sender).unwrap_err();
             assert_eq!(refused.kind, ErrorKind::RateLimited);
@@ -2215,7 +2222,10 @@ mod tests {
             text.matches("swb_send_rate_limited_total{").count(),
             HARNESS_KINDS.len()
         );
-        assert!(!text.contains("honey") && !text.contains("sting"), "{text}");
+        assert!(
+            !text.contains("host-a") && !text.contains("host-b"),
+            "{text}"
+        );
         // Other errors carry no retry_after.
         assert_eq!(StoreError::new(ErrorKind::Invalid, "x").retry_after, None);
     }
@@ -2228,7 +2238,7 @@ mod tests {
             refill_per_minute: 0,
         })
         .unwrap();
-        let me = "pi:sting:2:b";
+        let me = "pi:host-b:2:b";
         s.admit_send(me).unwrap();
         let refused = s.admit_send(me).unwrap_err();
         assert_eq!(refused, "rate limited");
@@ -2313,12 +2323,12 @@ mod tests {
     fn inbox_pages_past_a_full_page_with_next_after() {
         let (s, _clock) = clocked();
         no_send_limit(&s);
-        let to = "pi:sting:2:b";
+        let to = "pi:host-b:2:b";
         // The msg_ids fall as the sends go on, and every send lands in one
         // second, so neither msg_id nor created_at gives the send order.
         let ids: Vec<String> = (0..20u128).map(|n| ulid_of(1000 - n)).collect();
         for (n, id) in ids.iter().enumerate() {
-            s.send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none",
+            s.send(&json!({"from":"claude:host-a:1:a","to":to,"ticket":"none",
                 "body":format!("m{n}"),"msg_id":id}))
                 .unwrap();
         }
@@ -2341,10 +2351,10 @@ mod tests {
     fn a_send_after_the_cursor_is_never_skipped() {
         let (s, _clock) = clocked();
         no_send_limit(&s);
-        let to = "pi:sting:2:b";
+        let to = "pi:host-b:2:b";
         let send = |id: &str| {
             s.send(
-                &json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"x","msg_id":id}),
+                &json!({"from":"claude:host-a:1:a","to":to,"ticket":"none","body":"x","msg_id":id}),
             )
             .unwrap();
         };
@@ -2362,9 +2372,9 @@ mod tests {
     #[test]
     fn after_must_name_a_message_of_this_mailbox() {
         let s = Store::memory().unwrap();
-        let (a, b) = ("pi:sting:2:b", "codex:sting:3:c");
+        let (a, b) = ("pi:host-b:2:b", "codex:host-b:3:c");
         let sent = |to: &str| {
-            s.send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"x"}))
+            s.send(&json!({"from":"claude:host-a:1:a","to":to,"ticket":"none","body":"x"}))
                 .unwrap()
                 .envelope["msg_id"]
                 .as_str()
@@ -2394,10 +2404,10 @@ mod tests {
     #[test]
     fn a_bound_mailbox_pages_by_delivery_key() {
         let s = Store::memory().unwrap();
-        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let first = bind(&s, "hermes", "host-b", 100, "svc", None).unwrap();
         let old = first["agent_id"].as_str().unwrap().to_owned();
         let send = |body: &str| {
-            s.send(&json!({"from":"claude:honey:1:a","to":old,"ticket":"none","body":body}))
+            s.send(&json!({"from":"claude:host-a:1:a","to":old,"ticket":"none","body":body}))
                 .unwrap()
                 .envelope["msg_id"]
                 .as_str()
@@ -2406,7 +2416,7 @@ mod tests {
         };
         let cursor = send("one");
         send("two");
-        let second = bind(&s, "hermes", "sting", 200, "svc", Some(&token_of(&first))).unwrap();
+        let second = bind(&s, "hermes", "host-b", 200, "svc", Some(&token_of(&first))).unwrap();
         let new = second["agent_id"].as_str().unwrap();
         let token = token_of(&second);
         let page = s
@@ -2430,7 +2440,7 @@ mod tests {
         {
             let s = Store::open(&path).unwrap();
             let send = |body: &str| {
-                s.send(&json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":body}))
+                s.send(&json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none","body":body}))
                     .unwrap()
                     .envelope["msg_id"]
                     .as_str()
@@ -2466,7 +2476,7 @@ mod tests {
         assert_eq!(counter, 2);
         drop(db);
         let third = s
-            .send(&json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"three"}))
+            .send(&json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none","body":"three"}))
             .unwrap();
         let position: i64 =
             s.0.lock()
@@ -2628,8 +2638,8 @@ mod tests {
     #[test]
     fn peers_filters_proc_start_before_it_keeps_one_row_per_session() {
         let s = Store::memory().unwrap();
-        reg(&s, "claude", "sting", 1, "shared", "p1");
-        reg(&s, "claude", "sting", 2, "shared", "p2");
+        reg(&s, "claude", "host-b", 1, "shared", "p1");
+        reg(&s, "claude", "host-b", 2, "shared", "p2");
         let ids = |proc_start: Option<&str>| -> Vec<String> {
             let page = s
                 .peers(&PeersQuery {
@@ -2644,15 +2654,15 @@ mod tests {
                 .map(|p| p["agent_id"].as_str().unwrap().to_owned())
                 .collect()
         };
-        assert_eq!(ids(Some("p1")), vec!["claude:sting:1:shared"]);
-        assert_eq!(ids(Some("p2")), vec!["claude:sting:2:shared"]);
-        assert_eq!(ids(None), vec!["claude:sting:2:shared"]);
+        assert_eq!(ids(Some("p1")), vec!["claude:host-b:1:shared"]);
+        assert_eq!(ids(Some("p2")), vec!["claude:host-b:2:shared"]);
+        assert_eq!(ids(None), vec!["claude:host-b:2:shared"]);
         // pid 1 registers again: it is now the latest, and pid 2 still
         // finds its own row.
-        reg(&s, "claude", "sting", 1, "shared", "p1");
-        assert_eq!(ids(Some("p2")), vec!["claude:sting:2:shared"]);
-        assert_eq!(ids(Some("p1")), vec!["claude:sting:1:shared"]);
-        assert_eq!(ids(None), vec!["claude:sting:1:shared"]);
+        reg(&s, "claude", "host-b", 1, "shared", "p1");
+        assert_eq!(ids(Some("p2")), vec!["claude:host-b:2:shared"]);
+        assert_eq!(ids(Some("p1")), vec!["claude:host-b:1:shared"]);
+        assert_eq!(ids(None), vec!["claude:host-b:1:shared"]);
         assert!(ids(Some("p3")).is_empty());
     }
 
@@ -2661,20 +2671,20 @@ mod tests {
     #[test]
     fn send_reports_the_recipient_state() {
         let (s, clock) = clocked();
-        let to = "pi:sting:2:b";
+        let to = "pi:host-b:2:b";
         let send = |body: &str| {
-            s.send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":body}))
+            s.send(&json!({"from":"claude:host-a:1:a","to":to,"ticket":"none","body":body}))
                 .unwrap()
         };
         assert_eq!(send("before").recipient_state, "unregistered");
-        let row = reg(&s, "pi", "sting", 2, "b", "p");
+        let row = reg(&s, "pi", "host-b", 2, "b", "p");
         assert_eq!(send("live").recipient_state, "live");
         clock.advance(901);
         assert_eq!(send("idle").recipient_state, "idle");
         clock.advance(20_700);
         assert_eq!(send("gone").recipient_state, "gone");
         s.end(to, row["end_token"].as_str().unwrap()).unwrap();
-        let msg = json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"ended",
+        let msg = json!({"from":"claude:host-a:1:a","to":to,"ticket":"none","body":"ended",
             "msg_id":Ulid::new().to_string()});
         let first = s.send(&msg).unwrap();
         assert!(first.created);
@@ -2684,6 +2694,20 @@ mod tests {
         assert!(!replay.created);
         assert_eq!(replay.recipient_state, "ended");
         assert!(replay.envelope.get("recipient_state").is_none());
+        // A replay that names another `to` answers for the stored
+        // recipient, not for the id it names.
+        reg(&s, "codex", "host-b", 3, "c", "p");
+        let mut elsewhere = msg.clone();
+        elsewhere["to"] = json!("codex:host-b:3:c");
+        let replay = s.send(&elsewhere).unwrap();
+        assert!(!replay.created);
+        assert_eq!(replay.envelope["to"], to);
+        assert_eq!(replay.recipient_state, "ended");
+        // A submitted envelope never carries recipient_state.
+        let mut forged = msg.clone();
+        forged["msg_id"] = json!(Ulid::new().to_string());
+        forged["recipient_state"] = json!("live");
+        assert_eq!(s.send(&forged).unwrap_err(), "unknown envelope field");
         let read = s.inbox(to, 10).unwrap();
         let messages = read["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 5);
@@ -2693,23 +2717,33 @@ mod tests {
     #[test]
     fn a_live_binding_makes_mail_to_an_old_pid_live() {
         let (s, clock) = clocked();
-        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let first = bind(&s, "hermes", "host-b", 100, "svc", None).unwrap();
         let old = first["agent_id"].as_str().unwrap().to_owned();
         // The old pid goes quiet; the restarted service binds again.
         clock.advance(1000);
-        bind(&s, "hermes", "sting", 200, "svc", Some(&token_of(&first))).unwrap();
+        bind(&s, "hermes", "host-b", 200, "svc", Some(&token_of(&first))).unwrap();
         let state = |to: &str| {
-            s.send(&json!({"from":"claude:honey:1:a","to":to,"ticket":"none","body":"x"}))
+            s.send(&json!({"from":"claude:host-a:1:a","to":to,"ticket":"none","body":"x"}))
                 .unwrap()
                 .recipient_state
         };
         assert_eq!(state(&old), "live");
+        // A bound row without a token nonce is no binding to the inbox gate,
+        // so the old pid's own row decides.
+        s.0.lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET token_nonce=NULL WHERE agent_id!=?1 AND harness='hermes'",
+                [&old],
+            )
+            .unwrap();
+        assert_eq!(state(&old), "idle");
         // An unbound session that went quiet stays gone, and another pid
         // of it with no row is unregistered.
-        reg(&s, "pi", "sting", 2, "b", "p");
+        reg(&s, "pi", "host-b", 2, "b", "p");
         clock.advance(21_601);
-        assert_eq!(state("pi:sting:2:b"), "gone");
-        assert_eq!(state("pi:sting:3:b"), "unregistered");
+        assert_eq!(state("pi:host-b:2:b"), "gone");
+        assert_eq!(state("pi:host-b:3:b"), "unregistered");
     }
 
     #[test]
