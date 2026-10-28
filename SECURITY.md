@@ -86,6 +86,29 @@ So:
   it is not Host-guarded.
 - Never put a secret in a message body.
 
+### Delivery fixes and refusal counters (v0.5.1, unreleased)
+
+v0.5.1 (TIN-7577) fixes message delivery and counts send refusals. What
+each change reveals:
+
+- **`recipient_state`.** A `send` result says whether the recipient is
+  live, idle, gone, ended or unregistered. `peers` already shows the same
+  registration and lease state to any caller on the tailnet, so this adds
+  no new disclosure. The stored and delivered envelope never carry it.
+- **The `peers` proc_start filter.** It now matches any registration row
+  with that stamp, not only the latest row of a session. The stamp has
+  granted nothing since v0.3.0, and listings still never return it.
+- **`inbox` `after`.** A cursor resolves only against the caller's own
+  mailbox, by its delivery key when the id is bound. Another mailbox's id
+  answers `unknown after`, the same answer as an id that never existed,
+  so `after` cannot test whether an id exists outside the mailbox the
+  caller reads.
+- **Metrics.** The new series carry no identity. Their only label is the
+  harness kind, one of 8 fixed values. The metrics listener is still not
+  Host-guarded, as before.
+- **`send_refused` line.** It carries the harness kind, `retry_after` and
+  the route, never an agent id or a body.
+
 ## Residuals fixed in v0.3.0
 
 These applied to v0.2.2. v0.3.0 fixed both (R-C944) and shipped the fixes
