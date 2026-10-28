@@ -22,7 +22,8 @@ and the lock files move to 0.5.1 in the release bump.
 
 ### Upgrade notes
 
-- Envelope v3 and its schema are unchanged. Stored and delivered
+- Envelope v3 is unchanged. Its schema changes only the `body`
+  description, which now says newline and tab are kept. Stored and delivered
   envelopes keep the same keys. `recipient_state` is a send-result field,
   described in REFERENCE, and a submitted envelope that carries it is
   refused with `unknown envelope field`, as any unknown key is.
@@ -44,6 +45,12 @@ and the lock files move to 0.5.1 in the release bump.
   without a position, and the next v0.5.1 start fills them in.
 - An inbox now returns mail in arrival order. That matches the old
   `created_at` order unless the broker's clock stepped back.
+- A message body keeps its newlines and tabs. A reader that split
+  `swb inbox` or REST output on raw line breaks is unaffected, because
+  that output is JSON and escapes them. `swb send` drops one trailing
+  line break from stdin, so a body sent with `printf '%s\n'` is stored
+  as before. A retry with `--msg-id` of a message a v0.5.0 broker stored
+  without its newlines is still a replay.
 
 ### Fixed
 
@@ -64,6 +71,14 @@ and the lock files move to 0.5.1 in the release bump.
 - **A5, send to a dead recipient.** A send now reports `recipient_state`,
   and the clients warn when the recipient is not live. SPR-80 rules a
   warning: the send still succeeds.
+- **Bodies lost their line breaks** (TIN-7577 comment `e2d6b6f5`). The
+  store removed every control character from a body, newline and tab
+  included, although the channel frame keeps both. The store now keeps
+  newline and tab. It removes every carriage return, so CRLF becomes LF
+  and a lone CR goes, and every other control character, as before. The
+  16 KiB limit counts the cleaned body. CLI and REST output stay one JSON
+  line per result, and the channel header stays the first paragraph of
+  its frame, so a body line cannot pass for a header or another message.
 
 ### Added
 

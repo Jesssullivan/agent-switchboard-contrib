@@ -104,7 +104,7 @@ a POST with a JSON body (`Content-Type: application/json`).
 | `POST /v1/end` | `{me, end_token, session_token?}` | any other end token answers `{"state":"unknown"}` and ends nothing |
 | `POST /v1/peers` | `{me?, all?, host?, limit?, cursor?, proc_start?}` | `me` renews that session's lease; `proc_start` keeps only registrations that used it, then one row per session among them (v0.5.1) |
 | `GET /v1/peers` | `?all=&host=&limit=&cursor=` | passive listing; changes nothing |
-| `POST /v1/send` | `{from, to, ticket, body, …, session_token?}` (envelope v3) | `ticket` is `TIN-<digits>` or `none`; a body is at most 16 KiB; an empty sender bucket answers 429; an invalid send or an idempotent retry spends no bucket token; the result adds `recipient_state` (v0.5.1); a 429 carries `retry_after` and a `Retry-After` header when the bucket refills (v0.5.1) |
+| `POST /v1/send` | `{from, to, ticket, body, …, session_token?}` (envelope v3) | `ticket` is `TIN-<digits>` or `none`; a body is at most 16 KiB and keeps newline and tab, while CR and other control characters are removed (v0.5.1); an empty sender bucket answers 429; an invalid send or an idempotent retry spends no bucket token; the result adds `recipient_state` (v0.5.1); a 429 carries `retry_after` and a `Retry-After` header when the bucket refills (v0.5.1) |
 | `POST /v1/inbox` | `{me, limit, wait_seconds, after?, session_token?}` | long-poll; oldest first in arrival order; a full page carries `next_after` (v0.5.1) |
 | `POST /v1/ack` | `{me, msg_id, session_token?}` | |
 | `POST /v1/heartbeat` | `{me}` | renews the lease only |
@@ -274,6 +274,11 @@ makes no broker call), `inbox [--after ULID]`,
   0; `--version`, `-V` and `version` exit 0. An unknown verb exits 2.
 - `peers` never passes `me`, so it refreshes no lease; nor does `claims`
   without `--mine`.
+- `send` reads the body from stdin and drops one trailing LF or CRLF, so
+  `printf '%s\n' "…" | swb send` stores the text without it. Other line
+  breaks and tabs reach the recipient (v0.5.1). `inbox` and `thread`
+  print one JSON line, so a body's line breaks appear as `\n` escapes and
+  never start a new output line.
 - Hooks save the end token on every successful register, under
   `$SWB_STATE_DIR/sessions/`; SessionEnd spends it and deletes the file.
   The CLI never prints the token: `whoami --register` prints

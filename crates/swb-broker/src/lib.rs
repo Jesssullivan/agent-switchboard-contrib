@@ -441,7 +441,7 @@ fn tools() -> Vec<Tool> {
             "from":{"type":"string","description":format!("Sender. {agent_id}")},
             "to":{"type":"string","description":format!("Recipient. {agent_id}")},
             "ticket":{"type":"string","pattern":"^(TIN-[0-9]+|none)$","maxLength":64,"description":"TIN-<digits> or none"},
-            "body":{"type":"string","maxLength":16384,"description":"Message text, at most 16 KiB; control characters are removed"},
+            "body":{"type":"string","maxLength":16384,"description":"Message text, at most 16 KiB. Newline and tab are kept; CR and other control characters are removed"},
             "msg_id":{"type":"string","description":format!("{ULID_DESC}. Optional idempotency key; a retry with the same sender and body returns the stored envelope")},
             "thread_id":{"type":"string","description":format!("{ULID_DESC}. Defaults to msg_id")},
             "in_reply_to":{"type":"string","description":format!("{ULID_DESC} of the message answered")},

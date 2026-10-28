@@ -316,8 +316,21 @@ fn valid_rfc3339_shape(s: &str) -> bool {
             && suffix[4].is_ascii_digit()
             && suffix[5].is_ascii_digit())
 }
+/// A single-line field with every control character removed. v0.5.0 and
+/// older stored message bodies this way; a replay compares against it so a
+/// stored body keeps matching across the upgrade (TIN-7577).
 fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
+}
+/// A message body as the store keeps it (TIN-7577). Newline and tab stay,
+/// so a multi-line body keeps its lines. Every carriage return goes: CRLF
+/// becomes LF and a lone CR is dropped, so a CR cannot move a terminal's
+/// cursor back over a line it already printed. Every other control
+/// character goes too, as `clean` drops them.
+fn clean_body(s: &str) -> String {
+    s.chars()
+        .filter(|&c| matches!(c, '\n' | '\t') || !c.is_control())
+        .collect()
 }
 fn sql_err(e: rusqlite::Error) -> StoreError {
     StoreError::new(ErrorKind::Internal, e.to_string())
@@ -1081,12 +1094,11 @@ impl Store {
         if !valid_agent_id(sender) || !valid_agent_id(recipient) {
             return Err("invalid agent id".into());
         }
-        let body = clean(
-            input
-                .get("body")
-                .and_then(Value::as_str)
-                .ok_or("missing body")?,
-        );
+        let raw_body = input
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or("missing body")?;
+        let body = clean_body(raw_body);
         if body.len() > 16384 {
             return Err("body exceeds 16 KiB".into());
         }
@@ -1231,7 +1243,9 @@ impl Store {
             .map_err(sql_err)?;
         if let Some((old_sender, old_body, envelope, old_recipient)) = old {
             // SWB-R46: disclose neither the stored receipt nor its metadata on conflict.
-            if old_sender != sender || old_body != body {
+            // A message stored by v0.5.0 or older kept no newline or tab, so
+            // a retry of it across the upgrade compares in that form too.
+            if old_sender != sender || (old_body != body && old_body != clean(raw_body)) {
                 return Err(StoreError::new(ErrorKind::Conflict, "msg_id conflict"));
             }
             let envelope = serde_json::from_str(&envelope)
@@ -2712,6 +2726,81 @@ mod tests {
         let messages = read["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 5);
         assert!(messages.iter().all(|m| m.get("recipient_state").is_none()));
+    }
+
+    /// TIN-7577: a body keeps its newlines and tabs through send, inbox
+    /// and thread. CRLF becomes LF; a lone CR and every other control
+    /// character are dropped.
+    #[test]
+    fn a_body_keeps_its_lines_through_the_store() {
+        let s = Store::memory().unwrap();
+        let (from, to) = ("claude:host-a:1:a", "pi:host-b:2:b");
+        // `thread` answers a registered reader only.
+        reg(&s, "pi", "host-b", 2, "b", "p");
+        let raw = "line one\r\n\tindented\nlast\rx\u{1b}[2J\u{7}\u{85}\0end\n";
+        let want = "line one\n\tindented\nlastx[2Jend\n";
+        let sent = s
+            .send(&json!({"from":from,"to":to,"ticket":"none","body":raw}))
+            .unwrap();
+        assert!(sent.created);
+        assert_eq!(sent.envelope["body"], want);
+        let stored: String =
+            s.0.lock()
+                .unwrap()
+                .query_row("SELECT body FROM messages", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(stored, want);
+        let read = s.inbox(to, 10).unwrap();
+        assert_eq!(read["messages"][0]["body"], want);
+        let thread_id = sent.envelope["thread_id"].as_str().unwrap();
+        let thread = s.thread(to, thread_id, None, None).unwrap();
+        assert_eq!(thread["messages"][0]["body"], want);
+        // A body of only line breaks and tabs is kept as sent.
+        let blank = s
+            .send(&json!({"from":from,"to":to,"ticket":"none","body":"\n\t\n"}))
+            .unwrap();
+        assert_eq!(blank.envelope["body"], "\n\t\n");
+        // The 16 KiB limit counts the cleaned body: dropped CRs do not count.
+        let long = format!("{}{}", "a".repeat(16384), "\r".repeat(10));
+        let kept = s
+            .send(&json!({"from":from,"to":to,"ticket":"none","body":long}))
+            .unwrap();
+        assert_eq!(kept.envelope["body"].as_str().unwrap().len(), 16384);
+        let over = format!("{}\n", "a".repeat(16384));
+        assert_eq!(
+            s.send(&json!({"from":from,"to":to,"ticket":"none","body":over}))
+                .unwrap_err(),
+            "body exceeds 16 KiB"
+        );
+    }
+
+    /// TIN-7577: a retry of a message stored by v0.5.0 or older, which
+    /// dropped newlines, is still a replay after the upgrade. Any other
+    /// body under that msg_id is still a conflict (SWB-R46).
+    #[test]
+    fn a_retry_of_a_message_stored_without_newlines_is_a_replay() {
+        let s = Store::memory().unwrap();
+        let msg_id = Ulid::new().to_string();
+        let msg = json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none",
+            "body":"one\ntwo","msg_id":msg_id});
+        assert!(s.send(&msg).unwrap().created);
+        s.0.lock()
+            .unwrap()
+            .execute("UPDATE messages SET body='onetwo'", [])
+            .unwrap();
+        let replay = s.send(&msg).unwrap();
+        assert!(!replay.created);
+        let mut other = msg.clone();
+        other["body"] = json!("one\nthree");
+        assert_eq!(s.send(&other).unwrap_err().kind, ErrorKind::Conflict);
+        // A message stored with its newline does not match the flat form.
+        let kept = Ulid::new().to_string();
+        let mut multi = msg.clone();
+        multi["msg_id"] = json!(kept);
+        assert!(s.send(&multi).unwrap().created);
+        let mut flat = multi.clone();
+        flat["body"] = json!("onetwo");
+        assert_eq!(s.send(&flat).unwrap_err().kind, ErrorKind::Conflict);
     }
 
     #[test]
