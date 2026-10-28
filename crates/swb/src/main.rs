@@ -787,6 +787,27 @@ fn ack_after_reply(lookup: Lookup, me: &str, msg_id: &str) -> Value {
     }
 }
 
+/// Whether a failed broker call may pass when tried again: no answer (a
+/// connect error, a timeout or a broken response), a 401 while a new
+/// registration rotates the session token, a 5xx, or a session that has
+/// not registered yet. Any other broker refusal, such as 400, 403, 404, 409
+/// or 429, and a local validation error fail the same way again
+/// (TIN-7577).
+fn retryable_failure(error: &str) -> bool {
+    if let Some(rest) = error.strip_prefix("broker HTTP ") {
+        return rest
+            .get(..3)
+            .and_then(|code| code.parse::<u16>().ok())
+            .is_some_and(|status| status == 401 || status >= 500);
+    }
+    error.contains("not registered")
+        || error == "broker deadline exceeded"
+        || error == "broker has no address"
+        || error == "invalid HTTP response"
+        || error.contains("os error")
+        || error.starts_with("failed to lookup address")
+}
+
 /// `swb send`. With `--in-reply-to` and without `--no-ack` it also
 /// acknowledges the original and reports the result in `acked`, as the
 /// channel `reply` tool does (A3, TIN-7577).
@@ -826,15 +847,20 @@ fn recipient_warning(sent: &Value) -> Option<String> {
 }
 
 /// The stderr warnings for a committed send: a recipient nobody reads now,
-/// and an original message left unacknowledged.
+/// and an original message an ack may still reach. An ack the broker
+/// refused, such as 404 for a message that is not in this mailbox (a
+/// follow-up to someone else's message, or one already acknowledged),
+/// shows only in `acked` (TIN-7577).
 fn send_warnings(sent: &Value) -> Vec<String> {
     let mut lines: Vec<String> = recipient_warning(sent).into_iter().collect();
-    if let Some(note) = sent
-        .get("acked")
-        .and_then(Value::as_str)
-        .filter(|acked| acked.starts_with("not acknowledged"))
+    if let Some(acked) = sent.get("acked").and_then(Value::as_str)
+        && acked
+            .strip_prefix("not acknowledged: ")
+            .is_some_and(retryable_failure)
     {
-        lines.push(format!("the original message is {note}"));
+        lines.push(format!(
+            "the original message is {acked}; run `swb ack` for it"
+        ));
     }
     lines
 }
@@ -2088,10 +2114,29 @@ mod tests {
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        // A client that makes fewer requests than expected fails the test
+        // after 5 seconds instead of hanging it.
+        listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
             let mut seen = Vec::new();
+            let total = replies.len();
             for (status, content_type, body) in replies {
-                let (mut stream, _) = listener.accept().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "request {} of {total} never came",
+                                seen.len() + 1
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("accept: {e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -2301,6 +2346,10 @@ mod tests {
         }
     }
 
+    /// A3 (TIN-7577): a failed ack after a committed send is reported in
+    /// `acked`, never as an error. It warns only when an ack may still
+    /// reach the message: a 404 for a follow-up to someone else's message
+    /// stays quiet.
     #[test]
     fn a_failed_ack_after_send_is_a_warning_not_an_error() {
         let (url, server) = mock(vec![
@@ -2310,6 +2359,12 @@ mod tests {
                 "application/json",
                 r#"{"error":"message unavailable","code":"message_unavailable"}"#,
             ),
+            (200, "application/json", SENT),
+            (
+                503,
+                "application/json",
+                r#"{"error":"store unavailable","code":"internal"}"#,
+            ),
         ]);
         let lookup = lookup_of(&[("SWB_BROKER_URL", &url), ("SWB_AGENT_ID", ME)]);
         let args = parse_send_args(&strings(&[PEER, "none", "--in-reply-to", ULID])).unwrap();
@@ -2318,14 +2373,47 @@ mod tests {
             sent["acked"],
             "not acknowledged: broker HTTP 404: message unavailable"
         );
+        assert!(send_warnings(&sent).is_empty());
+        let sent = send_cmd(&lookup, &args, "again").unwrap();
+        assert_eq!(
+            sent["acked"],
+            "not acknowledged: broker HTTP 503: store unavailable"
+        );
         assert_eq!(
             send_warnings(&sent),
             vec![
-                "the original message is not acknowledged: broker HTTP 404: message unavailable"
+                "the original message is not acknowledged: broker HTTP 503: store unavailable; \
+                 run `swb ack` for it"
                     .to_owned()
             ]
         );
-        server.join().unwrap();
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn only_failures_that_may_pass_again_are_retryable() {
+        for error in [
+            "broker HTTP 401: invalid session token",
+            "broker HTTP 401",
+            "broker HTTP 500: broker unavailable",
+            "broker HTTP 503: store unavailable",
+            "broker deadline exceeded",
+            "Connection refused (os error 111)",
+            "this session is not registered with the broker yet",
+        ] {
+            assert!(retryable_failure(error), "{error}");
+        }
+        for error in [
+            "broker HTTP 400: unknown after",
+            "broker HTTP 403: operator_directed denied",
+            "broker HTTP 404: message unavailable",
+            "broker HTTP 409: msg_id conflict",
+            "broker HTTP 429: rate limited; retry in 10 s",
+            "reply needs text",
+            "invalid after (a ULID)",
+        ] {
+            assert!(!retryable_failure(error), "{error}");
+        }
     }
 
     /// A5 (TIN-7577): a send to a recipient nobody reads now warns, once.
@@ -2356,7 +2444,8 @@ mod tests {
         let hostile =
             recipient_warning(&json!({"to": "x\n<b>y", "recipient_state": "ended"})).unwrap();
         assert!(hostile.starts_with("xby has ended"), "{hostile}");
-        let both = json!({"to": PEER, "recipient_state": "gone", "acked": "not acknowledged: x"});
+        let both = json!({"to": PEER, "recipient_state": "gone",
+            "acked": "not acknowledged: broker deadline exceeded"});
         assert_eq!(send_warnings(&both).len(), 2);
     }
 
