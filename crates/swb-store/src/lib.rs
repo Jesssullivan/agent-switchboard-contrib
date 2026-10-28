@@ -224,8 +224,9 @@ pub struct PeersQuery<'a> {
     pub limit: Option<u32>,
     /// The `next_cursor` of the previous page.
     pub cursor: Option<&'a str>,
-    /// Only sessions whose latest registration used this `proc_start`. The
-    /// caller supplies it; listings still never return it.
+    /// Only registrations that used this `proc_start`, then one row per
+    /// harness, host and session id among them (A4, TIN-7577). The caller
+    /// supplies it; listings still never return it.
     pub proc_start: Option<&'a str>,
 }
 
@@ -958,15 +959,17 @@ impl Store {
         }
         let mut stmt = db
             .prepare(
+                // A4 (TIN-7577): the proc_start filter runs before the
+                // one-row-per-session dedupe, so two live processes of one
+                // session each find their own row.
                 "WITH latest AS (
-                   SELECT agent_id,harness,host,proc_start,last_seen,ended,bound,
+                   SELECT agent_id,harness,host,last_seen,ended,bound,
                      ROW_NUMBER() OVER (PARTITION BY harness,host,COALESCE(session_id,agent_id)
                                         ORDER BY registered_seq DESC, agent_id DESC) AS pos
-                   FROM sessions)
+                   FROM sessions WHERE (?7 IS NULL OR proc_start=?7))
                  SELECT agent_id,harness,host,last_seen,ended,bound FROM latest
                  WHERE pos=1 AND (?1 IS NULL OR host=?1) AND (?2 IS NULL OR agent_id>?2)
                    AND (?3 OR (ended=0 AND last_seen>=?4-?5))
-                   AND (?7 IS NULL OR proc_start=?7)
                  ORDER BY agent_id LIMIT ?6",
             )
             .map_err(sql_err)?;
@@ -2479,6 +2482,39 @@ mod tests {
             .unwrap_err(),
             "invalid host"
         );
+    }
+
+    /// A4 (TIN-7577): two live processes of one session each find their
+    /// own row by proc_start; without a filter the latest one wins.
+    #[test]
+    fn peers_filters_proc_start_before_it_keeps_one_row_per_session() {
+        let s = Store::memory().unwrap();
+        reg(&s, "claude", "sting", 1, "shared", "p1");
+        reg(&s, "claude", "sting", 2, "shared", "p2");
+        let ids = |proc_start: Option<&str>| -> Vec<String> {
+            let page = s
+                .peers(&PeersQuery {
+                    proc_start,
+                    ..PeersQuery::default()
+                })
+                .unwrap();
+            page["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["agent_id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(ids(Some("p1")), vec!["claude:sting:1:shared"]);
+        assert_eq!(ids(Some("p2")), vec!["claude:sting:2:shared"]);
+        assert_eq!(ids(None), vec!["claude:sting:2:shared"]);
+        // pid 1 registers again: it is now the latest, and pid 2 still
+        // finds its own row.
+        reg(&s, "claude", "sting", 1, "shared", "p1");
+        assert_eq!(ids(Some("p2")), vec!["claude:sting:2:shared"]);
+        assert_eq!(ids(Some("p1")), vec!["claude:sting:1:shared"]);
+        assert_eq!(ids(None), vec!["claude:sting:1:shared"]);
+        assert!(ids(Some("p3")).is_empty());
     }
 
     #[test]

@@ -374,7 +374,7 @@ fn tools() -> Vec<Tool> {
             "host":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"Only sessions on this host"},
             "limit":{"type":"integer","minimum":1,"maximum":200,"description":"Page size, default 50, at most 200"},
             "cursor":{"type":"string","description":"next_cursor from the previous page"},
-            "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Only sessions whose latest registration used this proc_start (the caller's own stamp; rows never show it)"}}})),
+            "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Only registrations that used this proc_start, then one row per harness, host and session id among them (the caller's own stamp; rows never show it)"}}})),
         ("send", "Send a peer-authority message. The broker stamps authority peer whatever the sender claims. A bound sender needs its session_token. Each sender has a token bucket; an empty one answers rate_limited.", json!({"type":"object","required":["from","to","ticket","body"],"properties":{
             "from":{"type":"string","description":format!("Sender. {agent_id}")},
             "to":{"type":"string","description":format!("Recipient. {agent_id}")},
@@ -3047,5 +3047,29 @@ mod tests {
         assert_eq!(paged["next_after"], ids[2].as_str());
         let refused = mcp_result(&app, &session, 3, "inbox", json!({"me":me,"after":"nope"})).await;
         assert_eq!(refused["isError"], true, "{refused}");
+    }
+
+    /// A4 (TIN-7577): each live process of one session finds its own row.
+    #[tokio::test]
+    async fn peers_proc_start_finds_each_live_process_of_one_session() {
+        let store = Arc::new(Store::memory().unwrap());
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        for (pid, start) in [(1, "p1"), (2, "p2")] {
+            store
+                .register(&json!({"harness":"claude","host":"sting","pid":pid,
+                    "session_id":"shared","proc_start":start}))
+                .unwrap();
+        }
+        for (start, id) in [
+            ("p1", "claude:sting:1:shared"),
+            ("p2", "claude:sting:2:shared"),
+        ] {
+            let query = json!({"all":true,"host":"sting","proc_start":start});
+            let (status, listed) =
+                status_and_json(call(&app, "POST", "/v1/peers", &query.to_string()).await).await;
+            assert_eq!(status, StatusCode::OK, "{listed}");
+            assert_eq!(listed["peers"].as_array().unwrap().len(), 1, "{listed}");
+            assert_eq!(listed["peers"][0]["agent_id"], id);
+        }
     }
 }
