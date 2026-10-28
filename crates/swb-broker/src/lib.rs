@@ -104,18 +104,16 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Take the caller's session token out of the arguments and run the
-/// operation with it. The store checks it, for `send` (by `from`), `inbox`,
-/// `ack`, `claim`, `release`, `handoff` and `end` (by `me`), inside the
-/// operation's own transaction (ADR-0003, SWB-R66), and `register` checks
-/// its own. `peers`, `claims`, `heartbeat` and `thread` take none.
+/// [`operation_via`] on the REST route, for tests.
+#[cfg(test)]
 fn operation(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError> {
     operation_via(store, name, args, "rest")
 }
 
-/// [`operation`] for a named route (`rest` or `mcp`). A send refused for
-/// its rate limit writes one `send_refused` line (TIN-7577), so a 429
-/// leaves a trace although no audit line follows a failed operation.
+/// One operation for a named route: `rest` from the REST handlers, `mcp`
+/// from the MCP server. A send refused for its rate limit writes one
+/// `send_refused` line (TIN-7577), so a 429 leaves a trace although no
+/// audit line follows a failed operation.
 fn operation_via(
     store: &Store,
     name: &str,
@@ -158,6 +156,11 @@ fn refusal_record(
     }))
 }
 
+/// Take the caller's session token out of the arguments and run the
+/// operation with it. The store checks it, for `send` (by `from`), `inbox`,
+/// `ack`, `claim`, `release`, `handoff` and `end` (by `me`), inside the
+/// operation's own transaction (ADR-0003, SWB-R66), and `register` checks
+/// its own. `peers`, `claims`, `heartbeat` and `thread` take none.
 fn operation_inner(store: &Store, name: &str, args: &Value) -> Result<Value, StoreError> {
     let token = match args.get("session_token") {
         None | Some(Value::Null) => None,
@@ -376,7 +379,10 @@ fn audit_record(name: &str, args: &Value, result: &Value, body_hmac: Option<&str
         "handoff_id":result.get("handoff_id"),"outcome":result.get("outcome"),
         "exclusive":result.get("exclusive")
     });
-    record["recipient_state"] = json!(result.get("recipient_state"));
+    // Only a send result carries it, so other lines keep their keys.
+    if let Some(state) = result.get("recipient_state") {
+        record["recipient_state"] = state.clone();
+    }
     record
 }
 
@@ -539,7 +545,7 @@ impl ServerHandler for BrokerMcp {
         {
             Ok(Ok(value)) => Ok(CallToolResult::structured(value).into()),
             Ok(Err(error)) => Ok(CallToolResult::error(vec![ContentBlock::text(
-                error_body(error.code(), &error.message).to_string(),
+                store_error_body(&error).to_string(),
             )])
             .into()),
             Err(error) => Err(McpError::internal_error(error.to_string(), None)),
@@ -551,10 +557,33 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(error_body(code, message))).into_response()
 }
 
+/// The typed error body for a failed operation. A rate-limited send adds
+/// `retry_after` in seconds when its bucket refills (TIN-7577); a client
+/// that reads only `error` and `code` sees the v0.5.0 body.
+fn store_error_body(error: &StoreError) -> Value {
+    let mut body = error_body(error.code(), &error.message);
+    if let Some(seconds) = error.retry_after {
+        body["retry_after"] = json!(seconds);
+    }
+    body
+}
+
+/// The REST answer for a failed operation. A rate-limited send also
+/// carries a `Retry-After` header when its bucket refills (TIN-7577).
+fn store_error_response(error: &StoreError) -> Response {
+    let mut response = (status_of(error.kind), Json(store_error_body(error))).into_response();
+    if let Some(seconds) = error.retry_after {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+    }
+    response
+}
+
 async fn run_operation(store: Arc<Store>, name: &'static str, args: Value) -> Response {
-    match tokio::task::spawn_blocking(move || operation(&store, name, &args)).await {
+    match tokio::task::spawn_blocking(move || operation_via(&store, name, &args, "rest")).await {
         Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
-        Ok(Err(error)) => error_response(status_of(error.kind), error.code(), &error.message),
+        Ok(Err(error)) => store_error_response(&error),
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
@@ -3058,16 +3087,27 @@ mod tests {
         );
     }
 
+    /// A store with `pi:host-b:2:b` registered and live.
+    fn store_with_recipient() -> Arc<Store> {
+        let store = Arc::new(Store::memory().unwrap());
+        store
+            .register(
+                &json!({"harness":"pi","host":"host-b","pid":2,"session_id":"b","proc_start":"2"}),
+            )
+            .unwrap();
+        store
+    }
+
     /// A1 (TIN-7577): REST and MCP page an inbox with `after`.
     #[tokio::test]
     async fn inbox_over_rest_and_mcp_pages_with_after() {
-        let store = seeded_store();
+        let store = store_with_recipient();
         let app = router(Arc::clone(&store), vec!["localhost".into()]);
-        let me = "pi:sting:2:b";
+        let me = "pi:host-b:2:b";
         let mut ids = Vec::new();
         for body in ["one", "two", "three"] {
             let sent = store
-                .send(&json!({"from":"claude:honey:1:a","to":me,"ticket":"none","body":body}))
+                .send(&json!({"from":"claude:host-a:1:a","to":me,"ticket":"none","body":body}))
                 .unwrap();
             ids.push(sent.envelope["msg_id"].as_str().unwrap().to_owned());
         }
@@ -3113,15 +3153,15 @@ mod tests {
         let app = router(Arc::clone(&store), vec!["localhost".into()]);
         for (pid, start) in [(1, "p1"), (2, "p2")] {
             store
-                .register(&json!({"harness":"claude","host":"sting","pid":pid,
+                .register(&json!({"harness":"claude","host":"host-b","pid":pid,
                     "session_id":"shared","proc_start":start}))
                 .unwrap();
         }
         for (start, id) in [
-            ("p1", "claude:sting:1:shared"),
-            ("p2", "claude:sting:2:shared"),
+            ("p1", "claude:host-b:1:shared"),
+            ("p2", "claude:host-b:2:shared"),
         ] {
-            let query = json!({"all":true,"host":"sting","proc_start":start});
+            let query = json!({"all":true,"host":"host-b","proc_start":start});
             let (status, listed) =
                 status_and_json(call(&app, "POST", "/v1/peers", &query.to_string()).await).await;
             assert_eq!(status, StatusCode::OK, "{listed}");
@@ -3134,10 +3174,10 @@ mod tests {
     /// carry recipient_state; the delivered envelope does not.
     #[tokio::test]
     async fn send_results_carry_recipient_state_and_the_audit_line_too() {
-        let store = seeded_store();
+        let store = store_with_recipient();
         let app = router(Arc::clone(&store), vec!["localhost".into()]);
         let live =
-            json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none","body":"x"});
+            json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none","body":"x"});
         let (status, sent) =
             status_and_json(call(&app, "POST", "/v1/send", &live.to_string()).await).await;
         assert_eq!(status, StatusCode::OK, "{sent}");
@@ -3148,26 +3188,80 @@ mod tests {
             &session,
             2,
             "send",
-            json!({"from":"claude:honey:1:a","to":"codex:sting:9:none","ticket":"none","body":"y"}),
+            json!({"from":"claude:host-a:1:a","to":"codex:host-b:9:none","ticket":"none","body":"y"}),
         )
         .await;
         assert_eq!(over_mcp["recipient_state"], "unregistered");
-        let args =
-            json!({"from":"claude:honey:1:a","to":"codex:sting:9:none","ticket":"none","body":"z"});
+        let args = json!({"from":"claude:host-a:1:a","to":"codex:host-b:9:none","ticket":"none","body":"z"});
         let result = operation(&store, "send", &args).unwrap();
         let lines = audit_lines(&store, "send", &args, &result, true).unwrap();
         assert_eq!(lines[0]["recipient_state"], "unregistered");
-        let fetched = store.inbox("pi:sting:2:b", 10).unwrap();
+        let fetched = store.inbox("pi:host-b:2:b", 10).unwrap();
         assert!(fetched["messages"][0].get("recipient_state").is_none());
         let fetch_lines = audit_lines(
             &store,
             "inbox",
-            &json!({"me":"pi:sting:2:b"}),
+            &json!({"me":"pi:host-b:2:b"}),
             &fetched,
             true,
         )
         .unwrap();
-        assert_eq!(fetch_lines[0]["recipient_state"], Value::Null);
+        assert!(
+            fetch_lines[0].get("recipient_state").is_none(),
+            "{}",
+            fetch_lines[0]
+        );
+    }
+
+    /// TIN-7577: a REST 429 carries `Retry-After` and `retry_after` when the
+    /// bucket refills; a bucket that never refills carries neither, and
+    /// other errors keep the v0.5.0 body.
+    #[tokio::test]
+    async fn a_rate_limited_send_carries_retry_after() {
+        let store = Arc::new(Store::memory().unwrap());
+        store
+            .set_send_limit(SendLimit {
+                burst: 1,
+                refill_per_minute: 6,
+            })
+            .unwrap();
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let send = |from: &str| {
+            json!({"from":from,"to":"pi:host-b:2:b","ticket":"none","body":"x"}).to_string()
+        };
+        let (status, _) =
+            status_and_json(call(&app, "POST", "/v1/send", &send("claude:host-a:1:a")).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let refused = call(&app, "POST", "/v1/send", &send("claude:host-a:1:a")).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let header_seconds: u64 = refused
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| text.parse().ok())
+            .unwrap();
+        assert!((1..=10).contains(&header_seconds), "{header_seconds}");
+        let body = json_of(refused).await;
+        assert_eq!(body["code"], "rate_limited");
+        assert_eq!(body["retry_after"].as_u64(), Some(header_seconds));
+        store
+            .set_send_limit(SendLimit {
+                burst: 1,
+                refill_per_minute: 0,
+            })
+            .unwrap();
+        let (status, _) =
+            status_and_json(call(&app, "POST", "/v1/send", &send("codex:host-a:3:c")).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let refused = call(&app, "POST", "/v1/send", &send("codex:host-a:3:c")).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(refused.headers().get(header::RETRY_AFTER).is_none());
+        let body = json_of(refused).await;
+        assert!(body.get("retry_after").is_none(), "{body}");
+        assert_eq!(
+            store_error_body(&StoreError::new(ErrorKind::Invalid, "invalid ticket")),
+            json!({"error":"invalid ticket","code":"invalid_argument"})
+        );
     }
 
     /// TIN-7577: a send the rate limit refuses yields one line with the
@@ -3181,7 +3275,7 @@ mod tests {
                 refill_per_minute: 6,
             })
             .unwrap();
-        let args = json!({"from":"claude:honey:1:a","to":"pi:sting:2:b","ticket":"none",
+        let args = json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none",
             "body":"body sentinel"});
         operation(&store, "send", &args).unwrap();
         let error = operation(&store, "send", &args).unwrap_err();
@@ -3197,7 +3291,7 @@ mod tests {
         );
         assert!(line["ts"].is_u64());
         let text = line.to_string();
-        for leak in ["claude:honey", "pi:sting", "sentinel", "honey"] {
+        for leak in ["claude:host-a", "pi:host-b", "sentinel", "host-a"] {
             assert!(!text.contains(leak), "{leak} in {text}");
         }
         // A forged from with an unknown kind gives a null harness.
@@ -3223,7 +3317,8 @@ mod tests {
                 refill_per_minute: 6,
             })
             .unwrap();
-        let args = json!({"from":"codex:sting:9:x","to":"pi:sting:2:b","ticket":"none","body":"x"});
+        let args =
+            json!({"from":"codex:host-b:9:x","to":"pi:host-b:2:b","ticket":"none","body":"x"});
         operation(&store, "send", &args).unwrap();
         assert_eq!(
             operation(&store, "send", &args).unwrap_err().kind,
@@ -3250,6 +3345,6 @@ mod tests {
         ] {
             assert!(text.contains(line), "{line:?} not in {text}");
         }
-        assert!(!text.contains("codex:sting"), "{text}");
+        assert!(!text.contains("codex:host-b"), "{text}");
     }
 }
