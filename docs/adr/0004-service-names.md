@@ -5,8 +5,11 @@
 - **Date:** 2026-10-30, drafted against `main` at `eada83a`.
 - **Linear:** TIN-7788, under TIN-4655.
 - **Depends on:** opt-in sender binding ([ADR-0003](0003-sender-binding.md),
-  SWB-R66 to SWB-R68) and the claim rules SWB-R16, SWB-R60 and SWB-R61 in
-  [ADR-0001](0001-agent-switchboard.md).
+  SWB-R66 to SWB-R68), the binding lapse rules of SWB-R69 and the claim
+  rules SWB-R16, SWB-R60 and SWB-R61 in
+  [ADR-0001](0001-agent-switchboard.md). SWB-R69 sets the 6-hour idle
+  lapse and the permanent lapse, and it requires the current token to
+  re-register a live bound id.
 
 Line references below are to `eada83a`.
 
@@ -22,7 +25,7 @@ What the broker offers today:
 
 - **Send takes only agent ids.** The store refuses any `from` or `to` that
   is not `harness:host:pid:session_id`
-  (`crates/swb-store/src/lib.rs:260-269`, checked in `send_as` at
+  (`crates/swb-store/src/lib.rs:260-270`, checked in `send_as` at
   `crates/swb-store/src/lib.rs:960-965`). The CLI checks the same shape
   before it calls the broker (`crates/swb/src/main.rs:32`, `:624-631` and
   `:697-700`). Send does not check that the recipient is registered. It
@@ -35,6 +38,16 @@ What the broker offers today:
   `crates/swb-store/src/lib.rs:338-346`). The key still carries the harness
   and the host. A role that moves to another host or harness gets a new
   key, and the producer must know both parts in advance.
+- **A lapse unbinds a row and keeps its claims.** A re-register of a key
+  marks every earlier pid's row unbound
+  (`crates/swb-store/src/lib.rs:793-797`). An idle or ended binding is
+  marked unbound the same way (`crates/swb-store/src/lib.rs:355` and
+  `:626`). None of these touch claims. Only `end` releases them
+  (`crates/swb-store/src/lib.rs:860-864`,
+  `crates/swb-store/src/claims.rs:241`). Claims are held by the full agent
+  id, pid included. The binding check `gate` returns false for an unbound
+  id, which is then self-asserted (`crates/swb-store/src/lib.rs:666-689`,
+  SWB-R05).
 - **Claims are advisory subject locks.** They record who works on a
   subject and never route mail (`docs/REFERENCE.md:151-156`, SWB-R16). Any
   session may record a non-exclusive claim on any subject, and an orphaned
@@ -76,34 +89,72 @@ pid that never reads again.
 
    A send to a name that is not configured answers 400 `unknown_service`,
    so a typo fails at once.
-3. **Holding a name is an exclusive claim on the subject `svc:<name>`.**
-   It reuses `claim`, `release`, `handoff` and `claims`, with these extra
-   rules inside the `svc:` subject namespace only:
-   - The claimant must have a live binding (ADR-0003), match one of the
-     name's `holders` patterns and present `service_secret`. A claim that
-     fails any of these answers 403 `service_unauthorized` and records
-     nothing.
-   - The claim is always exclusive. A non-exclusive request is refused the
-     same way, so no session can block a name with an advisory claim.
-   - A second claimant gets the existing refusal with `held_by` (SWB-R60).
-     There is no forced takeover.
-   - The lease is `lease_minutes`, not `lease_hours`. Only the holder's
-     repeat claim, which carries its session token, renews it (SWB-R60
-     renewal). `heartbeat` takes no token, so it does not renew a name.
-     The client renews at half the lease.
-   - The name is free when its claim expires, is released, is handed off,
-     or its holder's session ends or its binding lapses. `end` already
-     releases every claim (SWB-R60).
+3. **Holding a name is an exclusive claim on the subject `svc:<name>`,
+   held by a bound delivery key.** It reuses `claim`, `release`, `handoff`
+   and `claims`, with these extra rules inside the `svc:` subject
+   namespace only:
+   - **Authorized claim.** In the claim's transaction the claimant must
+     pass the binding check with its session token, so `gate` returns
+     true. It must also match one of the name's `holders` patterns and
+     present `service_secret`. A claim that fails any of these answers 403
+     `service_unauthorized` and records nothing. The claim row records the
+     `secret_sha256` it was authorized under.
+   - **The holder is the key.** Inside `svc:` a claim belongs to the
+     delivery key `harness:host:session_id` of its agent id, not to the
+     pid. SWB-R61 then reads per key: a key holds at most one active claim
+     per name.
+   - **Live and inert claims.** An active `svc:` claim is live while the
+     binding it was authorized under is still the key's live binding, the
+     key still matches a `holders` pattern and the recorded hash equals the
+     configured `secret_sha256`. A re-register that presents the current
+     token continues a binding. A lapse ends it for good (SWB-R69), so a
+     later fresh bind of the key does not revive the claim. Any other
+     active `svc:` claim is inert. An inert claim stays recorded and is
+     never revoked. It routes no mail and does not count against an
+     authorized claim, so it is left out of `held_by`.
+   - **Restart keeps the name.** A restart re-registers the key under a
+     new pid with the current token (SWB-R69), so the claim stays live.
+     The new pid reads the name's mail at once (Decision 4). Its next
+     claim renews the key's claim: the same `claim_id`, the holder column
+     set to the new agent id and the expiry extended. The audit line names
+     the earlier agent id. ADR-0003 already treats the earlier pid as the
+     same session, so this is a renewal, not an act on another session's
+     claim.
+   - **Exclusive.** A non-exclusive request is refused with 403, so no
+     session can block a name with an advisory claim. An authorized
+     request while another key holds a live claim gets the existing
+     refusal with `held_by` (SWB-R60). There is no forced takeover. If a
+     config change makes two claims live, the claim recorded later routes,
+     and the other key's renewal is refused with `held_by`.
+   - **Lease.** The lease is `lease_minutes`, not `lease_hours`. Only the
+     holder's repeat claim, which carries its session token, renews it
+     (SWB-R60 renewal). `heartbeat` takes no token, so it does not renew a
+     name. The client renews at half the lease.
+   - **Release and handoff.** `release` and `handoff` of a `svc:` claim
+     also need `gate` to return true for a caller with the claim's key.
+     An unbound or superseded agent id cannot release or offer a name.
+   - **When the name is free.** A name has no holder while it has no live
+     claim. That happens when its claim expires, is released or is handed
+     off, when its holder's session ends, or when its key's binding lapses.
+     `end` releases the claims recorded under the ending agent id
+     (SWB-R60). A lapse releases nothing: the claim turns inert, and a new
+     authorized claim can be recorded at once.
    - The client reads the secret from
      `$SWB_STATE_DIR/services/<name>.secret`, mode 0600, before each claim.
      The broker stores only the hash. The secret is never logged, printed
      or put on a command line.
 4. **Resolution happens at delivery time.** A send to `svc:<name>` stores
    the message with `to` and the delivery key both set to `svc:<name>`. It
-   is not tied to any session. `inbox` for a session reads its own mail and
-   the mail of every name it holds right now. `ack` of a name's message
-   succeeds only for the current holder. Any other session gets 409
-   `not_service_holder`, and the message stays unacked.
+   is not tied to any session. A caller holds a name only when two checks
+   pass in the same transaction as the read or the ack: the name's routing
+   claim is live and has the caller's key, and `gate` returns true for the
+   caller with its session token. `inbox` then reads the caller's own mail
+   and the mail of every name it holds. `ack` of a name's message succeeds
+   only for a caller that holds the name. Any other caller gets 409
+   `not_service_holder`, and the message stays unacked. An unbound caller
+   never holds a name, so a self-asserted agent id of an earlier holder
+   cannot read, ack or release the name's mail. This is routing, not
+   revocation, so it fits Decision 7.
 5. **Mail waits while a name is unheld.** A message to a configured name
    with no holder is stored and kept until its normal expiry (72 hours by
    default, 14 days at most, SWB-R09). The next holder reads it. The send
@@ -120,9 +171,12 @@ pid that never reads again.
    not see it again. A refused acceptance leaves the offer open (SWB-R61).
 7. **Config changes route, they do not revoke.** No broker path acts on
    another session's claim (AGENTS.md, Product boundary). When the file
-   drops a holder pattern, the existing claim stays recorded. The broker
+   drops a holder pattern or changes a name's `secret_sha256`, the
+   existing claim stays recorded and turns inert (Decision 3). The broker
    stops routing the name to it at the next `inbox` and refuses its acks
-   for the name. Changing the file needs a broker restart.
+   for the name. A newly authorized holder can claim the name at once,
+   with no wait for the old lease. Changing the file needs a broker
+   restart.
 8. **Telemetry.** Names are low cardinality, because only configured names
    exist. The attributes use the `swb.` prefix so nobody reads them as the
    OTel `service.name`.
@@ -131,8 +185,8 @@ pid that never reads again.
    | --- | --- |
    | `swb.send` span | `swb.to` = `svc:<name>`, `swb.to_service` = `<name>`, `swb.to_harness` and `swb.to_host` empty, `swb.service_held` |
    | `swb.fetch` and `swb.ack` spans | `swb.service`, `swb.service_holder` (the resolved agent id), `swb.service_claim_id` |
-   | `swb.claim`, `swb.release` and `swb.handoff` spans | unchanged. The subject is `svc:<name>` |
-   | Audit lines | `fetch` and `ack` add `service`, `holder` and `claim_id` |
+   | `swb.claim`, `swb.release` and `swb.handoff` spans | The subject is `svc:<name>`. A renewal under a new pid adds `swb.adopted_from` |
+   | Audit lines | `fetch` and `ack` add `service`, `holder` and `claim_id`. A claim renewed under a new pid adds `adopted_from` |
    | Metrics | `swb_service_held{service}` (0 or 1) and `swb_service_pending_messages{service}` |
 
    Spans and lines are projections. Truth stays in `claims` and `inbox`
@@ -145,10 +199,13 @@ pid that never reads again.
 | Name not configured | Send refused, nothing stored | 400 `unknown_service` |
 | No holder | Mail stored and kept until it expires | `service_held: false`, and `swb_service_held` reads 0 |
 | Contested claim | The second claimant is refused with `held_by`. The holder keeps the name | Nothing changes |
-| Holder crash | The name stays held until its lease ends, at most `lease_minutes`. Mail waits, then goes to the next holder | Delivery is delayed, and fetched but unacked mail arrives again |
+| Holder crash | The binding stays live, so the name stays held until its lease ends, at most `lease_minutes`. Mail waits, then goes to the next holder | Delivery is delayed, and fetched but unacked mail arrives again |
+| Holder restarts under the same bound key | The new pid re-registers with the current token (SWB-R69). The claim stays live, the new pid reads the name's mail at once and its next claim renews the claim under its own agent id | Nothing, except that fetched but unacked mail arrives again |
 | Lease expiry with a live holder | The name is free. The old holder's next ack of a name message gets 409 and its next inbox no longer returns name mail | At-least-once delivery, possibly a duplicate |
-| Binding lapse or `end` | The claim is released, as for any claim | As for a crash, without the lease wait |
-| Holder dropped from config | Routing stops at once and the claim stays recorded | As for no holder |
+| Binding lapse | The claim is not released. It turns inert at once and routes nothing. A new authorized claim is recorded with no lease wait | As for no holder until the next holder claims |
+| `end` | The claims recorded under the ending agent id are released (SWB-R60) | As for no holder until the next holder claims |
+| Holder dropped from config, or secret rotated | Routing stops at once. The claim stays recorded and inert. A newly authorized holder claims at once | As for no holder until the next holder claims |
+| A `svc:` claim recorded before the upgrade | Inert. It never routes and never blocks the name | Nothing |
 | Broker restart | Claims and mail are in the store. Leases keep their wall-clock expiry | Nothing, if the holder renews in time |
 
 ## Security
@@ -156,9 +213,11 @@ pid that never reads again.
 | Threat | Control | Residual risk |
 | --- | --- | --- |
 | A session sends as the name | `from` must be an agent id. A bound sender needs its token (SWB-R66) | An unbound sender can still claim any unbound id, as today (SWB-R05) |
-| A hostile session claims the name | It must match `holders`, be bound and present the secret | Anyone who reads the secret file and can bind a matching key can hold the name. Rotate by changing the hash and restarting |
-| A hostile session blocks the name | Advisory and unauthorized claims on `svc:` subjects are refused | A claim on a `svc:` subject recorded before the upgrade blocks until it expires (Migration) |
-| A stale holder acks mail it no longer owns | Ack checks the current holder | None beyond a duplicate delivery |
+| A hostile session claims the name | It must match `holders`, be bound and present the secret | Anyone who reads the secret file and can bind a matching key can hold the name. Rotate by changing the hash and restarting. Claims under the old hash turn inert at once |
+| A session acts as an earlier holder | Name mail routes, acks and releases only for a caller whose key holds the live claim and whose token passes `gate` in the same transaction. A lapsed binding never revives a claim (SWB-R69) | None for name mail. Other mail of an unbound id stays self-asserted (SWB-R05) |
+| A hostile session blocks the name | Advisory and unauthorized claims on `svc:` subjects are refused. Inert claims, those from before the upgrade included, do not count against an authorized claim | An authorized holder that stops serving but keeps renewing holds the name until the operator drops its pattern or rotates the secret |
+| A stale holder acks mail it no longer owns | Ack checks the current holder and its token | None beyond a duplicate delivery |
+| A client learns which names exist | None. `unknown_service` and `service_held` tell any network client which names are configured and whether each is held | Names and their held state are visible inside the network ACL. Names must not carry private details. Open ruling 6 decides whether only bound senders see `service_held` |
 | Replay of a send | SWB-R46 makes a repeated `msg_id` idempotent or a conflict | None |
 | Replay of a claim or handoff | Each claim needs the current session token, which every register rotates. A handoff offer is accepted once and closes on release or `end` | A stolen live token works until it rotates, as in ADR-0003 |
 | Flood to a name | The per-sender bucket (ADR-0003 Decision 3) applies to sends to a name | A flood that rotates unbound ids is bounded by the network ACL only |
@@ -201,32 +260,35 @@ pattern narrows who may present it.
   upgrade before a name is configured.
 - **Existing `svc:` claims.** The claim subject charset already allows
   `svc:`. The broker does not touch a claim recorded before the upgrade.
-  It keeps advisory semantics until it ends, and it blocks the name while
-  it is active. Before configuring a name, check
-  `swb claims --subject svc:<name>`.
+  It has no recorded hash, so it is inert: it keeps advisory semantics
+  until it ends, routes nothing and does not block the name.
+  `swb claims --subject svc:<name>` still lists it.
 - **Schema.** `schemas/envelope-v3.schema.json` gains a `service_address`
   definition, and `to` becomes either an agent id or a service address.
   ADR-0001 marks the schema a draft, so this follows the ADR-0003
   precedent of no version change. A validator pinned to the older copy
   rejects the new address.
 - **Spec.** `spec/dhall/Broker.dhall` gains the `svc:` claim rules after
-  the ruling. QuickCheck properties to add: at most one holder per name,
-  no ack by a non-holder and no message lost while a name is unheld
-  before it expires.
+  the ruling. QuickCheck properties to add: at most one routing holder
+  per name, no read or ack by a caller that fails `gate`, an inert claim
+  never routes or blocks, a restart under the same key keeps the name and
+  no message is lost while a name is unheld before it expires.
 - **Docs.** `docs/REFERENCE.md` gains a Service names section, and
   SECURITY.md describes the secret file.
 
 ## Consequences
 
 - SWB-R16 gains an exception inside the `svc:` namespace. There a claim
-  is exclusive, authorized and routes mail, and it can be refused for a
-  reason other than `held_by`. Outside it, claims stay advisory.
+  is exclusive, authorized, held by a key and routes mail. It can be
+  refused for a reason other than `held_by`, and it can turn inert
+  without being revoked. Outside it, claims stay advisory.
 - `authority` stays `peer` (SWB-R14). Holding a name proves which session
   serves a role, never operator authority.
 - `thread` reads by exact agent id. A holder sees name mail through
   `inbox`, and `thread` shows it only if the ruling extends `thread`.
 - A crash delays delivery by up to one lease. A shorter lease shortens
-  the delay and costs more renewals.
+  the delay and costs more renewals. A restart under the same key, a
+  lapse, a config change and a secret rotation cause no lease wait.
 
 ## Open rulings
 
@@ -239,3 +301,5 @@ pattern narrows who may present it.
    holds the producer's name, or whether that waits for a `reply_to`
    field.
 5. Whether `thread` includes name mail for the current holder.
+6. Whether `service_held` is returned only to bound senders, so an
+   unbound client cannot see whether a name is held.
