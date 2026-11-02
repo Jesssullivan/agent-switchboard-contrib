@@ -230,6 +230,12 @@ TIN-7577):
 its bucket refills or null, and `route` is `rest` or `mcp`. The line
 carries no agent id and no body.
 
+A register that a grace answered writes `op` `register_grace` instead of
+`register`, with `grace` set to the grace that answered it, 1 or 2
+(v0.5.1, review H2 of #57). It has the keys of a `register` line, and
+neither line carries a token. So a log reader can tell a fetch of the
+current token from a register that minted one.
+
 ## Claims
 
 Claims are advisory (SWB-R16, R-C950). A subject is a ticket (`TIN-4655`), a

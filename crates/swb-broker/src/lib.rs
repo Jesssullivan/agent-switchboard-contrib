@@ -190,8 +190,13 @@ fn perform(
     token: Option<&str>,
 ) -> Result<Value, StoreError> {
     let mut created = true;
+    let mut grace = None;
     let result = match name {
-        "register" => store.register(args),
+        "register" => {
+            let outcome = store.register_outcome(args)?;
+            grace = outcome.grace;
+            Ok(outcome.result)
+        }
         "heartbeat" => store.heartbeat(required(args, "me")?),
         "thread" => {
             let limit = opt(args, "limit", Value::as_u64)?;
@@ -276,10 +281,34 @@ fn perform(
         ),
         _ => Err("unknown operation".into()),
     }?;
-    for line in audit_lines(store, name, args, &result, created)? {
+    for line in operation_audit_lines(store, name, args, &result, created, grace)? {
         println!("{line}");
     }
     Ok(result)
+}
+
+/// [`audit_lines`] for one operation, given which grace, if any, answered
+/// a register. Review H2 of #57: a register that a grace answered writes
+/// its own op, `register_grace`, with `grace` set to the grace of the
+/// chain that answered it (1 or 2), so an operator can tell a fetch of the
+/// current token from a register that minted one. The reply is the same
+/// either way, and no other line changes.
+fn operation_audit_lines(
+    store: &Store,
+    name: &str,
+    args: &Value,
+    result: &Value,
+    created: bool,
+    grace: Option<i64>,
+) -> Result<Vec<Value>, StoreError> {
+    let Some(grace) = grace else {
+        return audit_lines(store, name, args, result, created);
+    };
+    let mut lines = audit_lines(store, "register_grace", args, result, created)?;
+    for line in &mut lines {
+        line["grace"] = json!(grace);
+    }
+    Ok(lines)
 }
 
 /// The audit lines one operation writes to stdout, in order. Every line is
@@ -323,7 +352,7 @@ fn audit_lines(
         }
         lines.push(line);
     }
-    if created && matches!(name, "register" | "send" | "ack") {
+    if created && matches!(name, "register" | "register_grace" | "send" | "ack") {
         let body = result.get("body").and_then(Value::as_str).unwrap_or("");
         let body_hmac = if name == "send" {
             Some(store.body_hmac(body)?)
@@ -3045,6 +3074,56 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let listed = json_of(call(&app, "GET", "/v1/peers", "").await).await;
         assert_eq!(listed["peers"][0]["bound"], false);
+    }
+
+    /// Review H2 of #57: a register the grace answered writes a
+    /// `register_grace` line naming the grace that answered it, and a
+    /// register that minted writes `register` with no `grace` key. Neither
+    /// carries a token, and both replies have the same keys.
+    #[test]
+    fn a_grace_register_writes_its_own_audit_line() {
+        let store = Store::memory().unwrap();
+        let args: Value = serde_json::from_str(BOUND_REGISTER).unwrap();
+        let first = store.register_outcome(&args).unwrap();
+        assert_eq!(first.grace, None);
+        let mut with = args.clone();
+        with["session_token"] = first.result["session_token"].clone();
+        let audit = |args: &Value, outcome: &swb_store::RegisterOutcome| {
+            let lines = operation_audit_lines(
+                &store,
+                "register",
+                args,
+                &outcome.result,
+                true,
+                outcome.grace,
+            )
+            .unwrap();
+            assert_eq!(lines.len(), 1);
+            for token in ["session_token", "end_token"] {
+                let value = outcome.result[token].as_str().unwrap();
+                assert!(!lines[0].to_string().contains(value), "{}", lines[0]);
+            }
+            lines[0].clone()
+        };
+        let minted = audit(&args, &first);
+        assert_eq!(minted["op"], "register");
+        assert!(minted.get("grace").is_none(), "{minted}");
+        // A rotation, its lost reply, and the retry the first grace answers.
+        let rotated = store.register_outcome(&with).unwrap();
+        let fetched = store.register_outcome(&with).unwrap();
+        assert_eq!(fetched.result, rotated.result);
+        assert_eq!(audit(&with, &rotated)["op"], "register");
+        let line = audit(&with, &fetched);
+        assert_eq!(line["op"], "register_grace");
+        assert_eq!(line["grace"], 1);
+        assert_eq!(line["agent_id"], BOUND_ID);
+        // The token that grace handed back gets the second grace.
+        with["session_token"] = rotated.result["session_token"].clone();
+        store.register_outcome(&with).unwrap();
+        let second = store.register_outcome(&with).unwrap();
+        let line = audit(&with, &second);
+        assert_eq!(line["op"], "register_grace");
+        assert_eq!(line["grace"], 2);
     }
 
     #[test]

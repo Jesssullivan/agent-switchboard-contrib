@@ -155,6 +155,8 @@ and the lock files move to 0.5.1 in the release bump.
   carries an agent id.
 - A `send_refused` stdout line for each send the rate limit refuses, with
   the harness kind, `retry_after` and the route, and no ids or body.
+- A `register_grace` audit line, in place of `register`, for a register
+  that a grace answered, with `grace` set to 1 or 2 (review H2 of #57).
 - `inbox` takes `after` and returns `next_after` over REST, MCP and the
   channel `inbox` tool.
 - `send` results carry `recipient_state`, and so does the send audit
