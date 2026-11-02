@@ -1,12 +1,12 @@
 # agent-switchboard demo: every mode on main, scripted, no models, no secrets
 # R-C953 recorded demo. Brokers are loopback-only; identity is self-asserted.
 $ swb version
-swb 0.5.0 envelope v3
+swb 0.5.1 envelope v3
 
 ## 1. Start a broker on loopback (host-a)
 
 $ curl -s $BROKER_A/healthz
-{"status":"ok","version":"0.5.0"}
+{"status":"ok","version":"0.5.1"}
 # The Host guard (v0.3.0): a request for another name is refused before routing.
 $ curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' $BROKER_A/v1/peers
 403
