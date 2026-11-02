@@ -68,7 +68,12 @@ and the lock files move to 0.5.1 in the release bump.
   register and its one retry each get the full 1.5 second deadline
   (SWB-R10 as amended, Jess, "Raise to 3.5 seconds", TIN-7577 comment
   `2f1439dc`). The hook entries in `integrations/claude-code` set
-  `"timeout": 4` instead of 2, and the wrapper's backstop is `timeout 4`.
+  `"timeout": 4` instead of 2, and the wrapper's backstop is `timeout 4`
+  (Jess, "Yes, 4 second timeout", TIN-4655 comment `204ebf82`). The
+  Claude Code plugin's `plugin.json` moves from version 0.2.2 to 0.2.3
+  (review K2 of #57), because Claude Code keeps an installed plugin on its
+  version until that changes, so plugin users get the new `hooks.json`.
+  A swb test ties every copy of the timeout to the ruled 4 seconds.
   A hook entry rendered elsewhere, such as lab's Home Manager module,
   needs the same change, or the harness still stops the hook at 2
   seconds, before the retry ends. A dead or blackholed broker now costs a

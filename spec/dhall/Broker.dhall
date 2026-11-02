@@ -113,9 +113,11 @@ in  { rulings = [ "SWB-R09", "SWB-R10", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229
     , hook =
       -- SWB-R10: a harness hook never blocks the harness and always exits 0.
       -- Amended 2026-11-02 (Jess, "Raise to 3.5 seconds (Recommended)",
-      -- TIN-7577 comment 2f1439dc): `swb hook` bounds its own work at
-      -- limit_ms, which leaves room for a bound register and its one retry
-      -- (TIN-7577 comment 3955641b), each with the full request_deadline_ms.
+      -- TIN-7577 comment 2f1439dc, and "Yes, 4 second timeout
+      -- (Recommended)", TIN-4655 comment 204ebf82): `swb hook` bounds its
+      -- own work at limit_ms, which leaves room for a bound register and its
+      -- one retry (TIN-7577 comment 3955641b), each with the full
+      -- request_deadline_ms.
       -- The harness kills a hook after harness_timeout_seconds, the hook
       -- entries' "timeout", which must stay above limit_ms. The swb crate
       -- keeps its own literals (HOOK_LIMIT, LIMIT and swb-broker's

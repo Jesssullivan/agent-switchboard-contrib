@@ -1,7 +1,7 @@
 {
   "name": "swb",
   "displayName": "Agent Switchboard",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Peer messaging between agent sessions through an agent-switchboard broker: the swb channel, session hooks and a peer-dialog skill",
   "author": {
     "name": "xoxd.ai / Tinyland, Inc.",

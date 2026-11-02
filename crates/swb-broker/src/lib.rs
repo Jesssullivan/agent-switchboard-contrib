@@ -48,9 +48,11 @@ use swb_store::{
 };
 
 /// The harness hook timeout (SWB-R10), the hook entries' `"timeout"`.
-/// Amended 2026-11-02 from 2 seconds to 4 (Jess, "Raise to 3.5 seconds
-/// (Recommended)", TIN-7577 comment `2f1439dc`), so it stays above the
-/// 3.5 second bound of `swb hook`. `spec/dhall/Broker.dhall` states it.
+/// Amended 2026-11-02 from 2 seconds to 4 (Jess, "Yes, 4 second timeout
+/// (Recommended)", TIN-4655 comment `204ebf82`), so it stays above the
+/// 3.5 second bound of `swb hook` (TIN-7577 comment `2f1439dc`).
+/// `spec/dhall/Broker.dhall` states it, and a swb test ties it and every
+/// hook entry's timeout to the ruled 4 seconds.
 pub const HOOK_TIMEOUT_MS: u64 = 4_000;
 /// Production retention interval. The store no longer prunes inside `send`
 /// or the 250 ms inbox long-poll (R-C944).
