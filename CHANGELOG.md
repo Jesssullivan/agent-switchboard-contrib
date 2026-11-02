@@ -73,6 +73,11 @@ and the lock files move to 0.5.1 in the release bump.
   needs the same change, or the harness still stops the hook at 2
   seconds, before the retry ends. A dead or blackholed broker now costs a
   hook up to 4 seconds.
+- The Claude Code plugin's `plugin.json` version moves from 0.2.2 to
+  0.5.1, because its `hooks.json` changed. Claude Code keeps an installed
+  plugin on its version until `plugin.json` changes, so without the bump
+  a plugin user keeps `"timeout": 2`, which cuts the retry short (review
+  K2 of #57). Update the plugin with the v0.5.1 client.
 - The store's `Clock` gains `monotonic_millis`. `ManualClock` gains
   `step_wall_back` and `step_wall_forward`, which move only its wall
   reading. `Store` gains `register_outcome`, which also says which grace

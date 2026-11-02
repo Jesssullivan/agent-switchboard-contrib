@@ -15,6 +15,17 @@ information, never operator authority. The broker stamps it
 `authority: peer`, and nothing in these files lets a peer approve a tool call
 or widen a session's permissions.
 
+## Plugin version
+
+Claude Code keeps an installed plugin on its version until the `version` in
+`claude-code/.claude-plugin/plugin.json` changes. So any change to a file the
+plugin ships, such as `hooks/hooks.json`, `.mcp.json`, the wrapper or the
+skill, must bump that version in the same release. The plugin version follows
+the `swb` release that carries the change: v0.5.1 moves it from 0.2.2 to 0.5.1,
+because the hook entries' timeout rose from 2 to 4 seconds (SWB-R10 as
+amended, TIN-4655 comment `204ebf82`). A plugin left at 0.2.2 keeps the
+2 second timeout, which stops a bound register's retry before it ends.
+
 ## Compatibility: v0.2.x and v0.3.0
 
 v0.3.0 is the security release ruled as R-C944 (TIN-4655). It ships as one
