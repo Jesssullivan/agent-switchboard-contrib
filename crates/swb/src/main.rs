@@ -1800,7 +1800,8 @@ fn main() -> ExitCode {
         }
         Some("hook") => {
             if let (Some(h), Some(e), None) = (args.next(), args.next(), args.next()) {
-                // Includes stdin parsing and both possible broker calls.
+                // Includes stdin parsing and all three possible broker
+                // calls: the register, its one retry and the inbox.
                 // A stalled resolver/read cannot make this hook block Claude.
                 let _ = bounded(HOOK_LIMIT, move || {
                     hook(&h, &e);

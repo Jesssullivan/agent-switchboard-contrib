@@ -73,9 +73,11 @@ binding is live:
   Two holders cannot keep each other's tokens alive for longer than 2
   grace windows of the client's registers.
 - The 60 seconds run on the wall clock and on a monotonic clock in the
-  broker process, and the grace ends at whichever reaches 60 first. A wall
-  clock that steps back cannot lengthen it, and one that steps forward
-  ends it at once. The monotonic part is held in memory only, so a broker
+  broker process, and the grace ends at whichever reaches 60 first. No
+  wall clock step can lengthen it. A step back larger than the time since
+  the rotation ends it at once, because the wall reading then falls before
+  the rotation. A step forward ends it once the wall reading passes 60
+  seconds. The monotonic part is held in memory only, so a broker
   restart ends every grace and the replaced token is then refused: the
   grace fails closed. No token is stored for the grace. The broker derives
   the current tokens again from its two token keys, `session_token_key`
@@ -124,14 +126,18 @@ Residuals of binding:
     grace.
   - A third register reply lost in a row: a reply lost on a rotation
     whose replaced token the second grace had handed back. Two concurrent
-    registers that present one saved token count as one grace answer, so
-    after them one lost reply still recovers and a second in a row does
-    not.
+    registers that present one saved token count as one grace answer. On
+    a fresh chain, after them one lost reply still recovers and a second
+    in a row does not. If the pair follows an earlier grace answer, it
+    spends the second grace, and the next lost reply locks the session
+    out.
   - A lost reply that the client does not follow with a register within
     60 seconds, for example when its one retry also misses the deadline
     and no hook runs in time.
-  - A wall clock step forward inside the grace, which ends it at once.
-    This fails closed, as intended.
+  - A wall clock step inside the grace in either direction: a step back
+    larger than the time since the rotation ends it at once, and a step
+    forward ends it once the wall reading passes 60 seconds. This fails
+    closed, as intended.
 - The broker keeps `session_token_key`, `end_token_key` and every row's
   token nonce in its SQLite database. Read access to the database file
   therefore yields every live session and end token, as it has since
