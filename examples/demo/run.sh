@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Scripted, reproducible demo of every swb mode on main (v0.3.0, unreleased).
+# Scripted, reproducible demo of every swb mode on main (v0.5.x).
 #
 # R-C953 (TIN-5770 comment fff218eb): recorded demos now, a sandbox later.
 # Everything here is local and deterministic: two loopback brokers, scripted
@@ -12,7 +12,7 @@
 #   examples/demo/run.sh --record   run it and rewrite docs/demo/transcript.txt
 #                                   and docs/demo/demo.cast (asciicast v2)
 #
-# Needs: bash, curl, jq, mkfifo and an `swb` 0.3.x binary, from SWB_BIN or PATH.
+# Needs: bash, curl, jq, mkfifo and an `swb` 0.5.x binary, from SWB_BIN or PATH.
 # Ports: 127.0.0.1:18181/19191 (broker A) and 18182/19192 (broker B); set
 # SWB_DEMO_PORT_BASE to move them (A = base+1, B = base+2, metrics +1010).
 set -euo pipefail
@@ -32,8 +32,8 @@ for tool in curl jq mkfifo; do
   command -v "$tool" >/dev/null || { echo "demo: $tool is required" >&2; exit 3; }
 done
 case "$("$swb_bin" version)" in
-  "swb 0.3."*) ;;
-  *) echo "demo: needs swb 0.3.x (main); got: $("$swb_bin" version)" >&2; exit 3 ;;
+  "swb 0.5."*) ;;
+  *) echo "demo: needs swb 0.5.x (main); got: $("$swb_bin" version)" >&2; exit 3 ;;
 esac
 
 base="${SWB_DEMO_PORT_BASE:-18180}"

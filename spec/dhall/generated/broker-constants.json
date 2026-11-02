@@ -7,6 +7,8 @@
     ],
     "send_burst_default": 20,
     "send_refill_per_minute_default": 30,
+    "session_token_grace_chain": 2,
+    "session_token_grace_seconds": 60,
     "session_token_hex_length": 64,
     "token_required_for": [
       "send",
@@ -29,6 +31,11 @@
       "end_releases_holder_claims",
       "holder_has_one_claim_per_subject"
     ]
+  },
+  "hook": {
+    "harness_timeout_seconds": 4,
+    "limit_ms": 3500,
+    "request_deadline_ms": 1500
   },
   "message": {
     "artifacts_max": 20,
@@ -55,6 +62,7 @@
   },
   "rulings": [
     "SWB-R09",
+    "SWB-R10",
     "SWB-R14",
     "SWB-R16",
     "SWB-R46",

@@ -13,6 +13,196 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
+## [0.5.1] - Unreleased
+
+Scope ruling SPR-80 (TIN-7125 comment `2ff3e637`), tracking issue
+TIN-7577. The release chain is SWB-R73 (TIN-7577 comment `d59d35a1`).
+Release record: filled at the cut under SWB-R73. The workspace version
+and the lock files move to 0.5.1 in the release bump.
+
+### Upgrade notes
+
+- Envelope v3 is unchanged. Its schema changes only the `body`
+  description, which now says newline and tab are kept. Stored and delivered
+  envelopes keep the same keys. `recipient_state` is a send-result field,
+  described in REFERENCE, and a submitted envelope that carries it is
+  refused with `unknown envelope field`, as any unknown key is.
+- `swb send --in-reply-to` now acknowledges the original by default. A
+  script that used it to keep that message open must add `--no-ack`.
+- A v0.5.0 client against a v0.5.1 broker gets three extra keys it
+  ignores: `next_after` on `inbox`, `recipient_state` on `send` and
+  `registered_seq` on `peers` rows listed with `proc_start`. The wider
+  `proc_start` filter fixes A4 for v0.5.0 channels as soon as the broker
+  upgrades. A v0.5.0 channel still picks its row by `last_seen`, so the
+  same-second tie below stays open for it until the client upgrades.
+- A v0.5.1 client against a v0.5.0 or older broker: the channel sends
+  `after` only when the head page carried `next_after`, so it never sends
+  one there, and A1 stays open until the broker upgrades. A2 and A3 work
+  against any broker. No `recipient_state` arrives, so no A5 warning
+  shows. The channel `inbox` tool answers an error for `after`, because
+  that broker would return its head page instead.
+- The store gains `messages.arrival_seq`, two indexes and an
+  `arrival_seq` counter at startup. Existing messages get positions in
+  `created_at`, `seq` order. A downgrade to v0.5.0 runs: it writes rows
+  without a position, and the next v0.5.1 start fills them in.
+- An inbox now returns mail in arrival order. That matches the old
+  `created_at` order unless the broker's clock stepped back.
+- A message body keeps its newlines and tabs. A reader that split
+  `swb inbox` or REST output on raw line breaks is unaffected, because
+  that output is JSON and escapes them. `swb send` drops one trailing
+  line break from stdin, so a body sent with `printf '%s\n'` is stored
+  as before. A retry with `--msg-id` of a message a v0.5.0 broker stored
+  without its newlines is still a replay. A new `messages.body_lines`
+  column marks rows v0.5.1 writes, and only an older row matches a retry
+  in that flat form. A retry that changes a newline or tab of a v0.5.1
+  body is a conflict.
+- The store gains seven `sessions` columns for the previous-token grace.
+  The wire is unchanged: a bound register returns the same keys,
+  whether it minted the tokens or returned the current ones. A v0.5.0
+  broker after a downgrade ignores the columns and keeps no grace. Its
+  next register of a row changes `registered_seq`, which voids the stale
+  record, so the grace never outlives a downgrade. A v0.5.0 client gets
+  the same answers, and this client's one retry gets a 401 from a v0.5.0
+  broker, as any stale token does.
+- `swb hook` bounds its work at 3.5 seconds instead of 1.8, so a bound
+  register and its one retry each get the full 1.5 second deadline
+  (SWB-R10 as amended, Jess, "Raise to 3.5 seconds", TIN-7577 comment
+  `2f1439dc`). The hook entries in `integrations/claude-code` set
+  `"timeout": 4` instead of 2, and the wrapper's backstop is `timeout 4`
+  (Jess, "Yes, 4 second timeout", TIN-4655 comment `204ebf82`). The
+  Claude Code plugin's `plugin.json` moves from version 0.2.2 to 0.2.3
+  (review K2 of #57), because Claude Code keeps an installed plugin on its
+  version until that changes, so plugin users get the new `hooks.json`.
+  A swb test ties every copy of the timeout to the ruled 4 seconds.
+  A hook entry rendered elsewhere, such as lab's Home Manager module,
+  needs the same change, or the harness still stops the hook at 2
+  seconds, before the retry ends. A dead or blackholed broker now costs a
+  hook up to 4 seconds.
+- The store's `Clock` gains `monotonic_millis`. `ManualClock` gains
+  `step_wall_back` and `step_wall_forward`, which move only its wall
+  reading. `Store` gains `register_outcome`, which also says which grace
+  answered a register.
+
+### Fixed
+
+- **A lost register reply locked a bound session out** (review F4 of #57,
+  also in v0.5.0). The broker committed a token rotation while the reply
+  missed the client's deadline, so the client kept the old token and
+  every call answered 401 until the 6 hour lapse. Under SWB-R67 as
+  amended (Jess, "Short grace for old token", TIN-7577 comment
+  `41c4704d`), the token a rotation replaced stays valid for 60 seconds.
+  Within that grace the client can act and register again to get the
+  current token. Only the token the latest rotation replaced counts, so a
+  token two rotations old is refused, and the previous token is refused
+  once the 60 seconds end. Unbound ids are unchanged.
+- **The grace let two holders keep each other alive** (review G1 to G6 of
+  #57). Under "Grace returns current token" (TIN-7577 comment
+  `ff9be66f`), a register with the previous token returns the current
+  session and end tokens and mints nothing, so no unbounded chain of
+  graces can form and concurrent registers with one saved token get one
+  answer. The chain is bounded at 2 graces (next entry), so a second
+  holder is refused within two of the client's registers. The
+  previous token cannot move the binding to another pid. The end token
+  has the same grace for a bound session (comment `3955641b`). The grace
+  ends at 60 seconds on the wall clock or on a monotonic clock held in
+  the broker process, whichever comes first, so a wall clock step back
+  no longer lengthens it, and a broker restart ends it. The `swb` client
+  retries a bound register once after a deadline, with the token it
+  holds. A swb-store test ties `Broker.dhall`'s grace and token length to
+  the store constants. The MCP `register` and `end` text, `Broker.dhall`
+  and SECURITY.md now state these properties.
+- **One lost reply after a grace answer locked a bound session out**
+  (review H1 of #57). A token the grace handed back had no grace of its
+  own, so a reply lost on the next rotation, or after two concurrent
+  registers, cost the 6 hour lapse. Under "Allow one more grace" (TIN-7577
+  comment `2f1439dc`), a token a grace handed back gets one more grace
+  when it is replaced, and a token handed back in that second grace gets
+  none (`SESSION_TOKEN_GRACE_CHAIN`, 2). Two lost replies in a row now
+  recover, and a third does not. A leaked token can fetch the current
+  one in at most 2 graces, so a ping-pong of two holders ends within 2
+  grace windows of the client's registers. `Broker.dhall` states the
+  chain length and a swb-store test ties it.
+- **A1, paging stall.** The channel showed only the 8 oldest unacked
+  messages and never read past them. `inbox` now takes `after` and
+  returns `next_after`, in arrival order, and the channel poller walks
+  past a full page of messages it already emitted.
+- **A2, lost re-emit.** An ack or a reply that failed, for example during
+  a registration gap, left its message unacknowledged and never pushed
+  again. The channel now pushes it once more on a later read when the
+  failure may pass on a later try: no answer, 401, a 5xx or a session not
+  registered yet. A refusal such as 429 never re-emits, so a rate-limited
+  reply cannot loop.
+- **A3, `send --in-reply-to` left the original unread.** The CLI and the
+  full-mode `send` tool now acknowledge the original, as `reply` does.
+- **A4, `peers` dedupe before the proc_start filter.** Two live processes
+  of one session hid each other's rows. The filter now runs first.
+- **A5, send to a dead recipient.** A send now reports `recipient_state`,
+  and the clients warn when the recipient is not live. SPR-80 rules a
+  warning: the send still succeeds.
+- **A5, `live` for a restarted session's old id** (review F1 of #57). An
+  unbound session that restarts under a new pid leaves its old row inside
+  the 15 minute lease, so a send to the old id said `live` while nobody
+  read it. `recipient_state` is now `superseded` when another pid of the
+  same harness, host and session id registered after the id sent to and
+  no live binding reads the key. The clients warn that the mail may go
+  unread. A live twin process may still read the id, so the warning does
+  not say it is unread.
+- **The channel kept an older session row on a same-second tie** (review
+  F2 of #57, also in v0.5.0). `swb channel` chose among its process's
+  rows by `last_seen`, then by agent id, and its own inbox reads renewed
+  the row it chose. A re-register under a new session id in the same
+  clock second as a channel read could leave the channel reading the old
+  id, so mail to the new id stayed queued with no delivery. `peers` rows
+  listed with `proc_start` now carry `registered_seq`, and the channel
+  picks the newest registration. Against an older broker it falls back
+  to `last_seen`.
+- **Bodies lost their line breaks** (TIN-7577 comment `e2d6b6f5`). The
+  store removed every control character from a body, newline and tab
+  included, although the channel frame keeps both. The store now keeps
+  newline and tab. It removes every carriage return, so CRLF becomes LF
+  and a lone CR goes, and every other control character, as before. The
+  16 KiB limit counts the cleaned body. CLI and REST output stay one JSON
+  line per result, and the channel header stays the first paragraph of
+  its frame, so a body line cannot pass for a header or another message.
+
+### Added
+
+- `/metrics`: `swb_send_rate_limited_total{harness}` for every harness
+  kind, and the gauges `swb_send_limit_burst`,
+  `swb_send_limit_refill_per_minute` and `swb_send_buckets`. No series
+  carries an agent id.
+- A `send_refused` stdout line for each send the rate limit refuses, with
+  the harness kind, `retry_after` and the route, and no ids or body.
+- A `register_grace` audit line, in place of `register`, for a register
+  that a grace answered, with `grace` set to 1 or 2 (review H2 of #57).
+- `inbox` takes `after` and returns `next_after` over REST, MCP and the
+  channel `inbox` tool.
+- `send` results carry `recipient_state`, and so does the send audit
+  line.
+- A 429 from a rate-limited send carries `retry_after` in its body and a
+  `Retry-After` header when the bucket refills.
+- `swb send --no-ack` and `swb inbox --after ULID`.
+- The full-mode channel `send` tool takes `ack`. The `reply` and full
+  `send` results carry `recipient_state` and a `warning` field.
+
+### Known gaps
+
+- The UserPromptSubmit hook notice still names the sender of the oldest
+  unacked message. With a stuck head page, a new message from another
+  peer gets a notice that names the older sender.
+- Default `peers` still lists one row per session, so a second live
+  process of one session shows only through its own `proc_start`. The
+  investigation's item 6 asked to show those rows too.
+- A channel walk that starts again rereads up to 4 pages it already
+  emitted, and each read counts a delivery and writes a `fetch` line. An
+  inbox read that counts no delivery would remove that cost.
+- A first bind whose reply is lost has no previous token to recover with,
+  so it waits for the 6 hour lapse, as in v0.5.0. So does a reply lost
+  just before a broker restart, a third reply lost in a row, a lost reply
+  not followed by a register within 60 seconds, and a lost reply while
+  a forward wall clock step ends the grace early. SECURITY.md lists these
+  cases.
+
 ## [0.5.0] - 2026-10-27
 
 Release record SWB-R71. Source `cfff7913` (the #55 merge), image

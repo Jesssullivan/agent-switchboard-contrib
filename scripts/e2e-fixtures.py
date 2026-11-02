@@ -49,7 +49,7 @@ EXPECTED = {
         ]
     },
     "crates/swb:hook_blackhole_test": {
-        "hook_blackholed_broker_exit_0_within_2s": "all hook cases returned exit 0 within 2 s against a blackholed broker",
+        "hook_blackholed_broker_exit_0_within_4s": "all hook cases returned exit 0 within 4 s against a blackholed broker",
     },
     "crates/swb-store:swb_store_test": {
         name: rust_case(name)

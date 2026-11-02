@@ -8,8 +8,10 @@ shows what the broker records and exposes.
 
 - **Tickets:** TIN-6749 (live demo) and TIN-6750 (full features). One
   recording covers both (operator ruling, TIN-6749 comment `fa805609`).
-- **Needs:** a v0.3.0 broker and a v0.3.0 `swb` on every client. A version
-  mismatch fails silently (hooks exit 0), so check versions first.
+- **Needs:** a v0.5.1 broker and a v0.5.1 `swb` on every client. A version
+  mismatch fails silently (hooks exit 0), so check versions first. Until
+  the v0.5.1 release bump, a build of this source prints `0.5.0`, so check
+  its commit as well.
 - **Status:** this is the run sheet. The recording happens after a clean dry
   run. Dry-run hops for Codex, Junie and Pi double as P1b round-trip
   receipts.
@@ -48,7 +50,10 @@ flowchart LR
 
 Every hop is a reply in **one thread**: the sender keeps the received
 `thread_id` and sets `in_reply_to` to the received `msg_id`. The ticket is
-`TIN-6749` throughout. Each receiver acks what it read.
+`TIN-6749` throughout. Each receiver acks what it read. From v0.5.1,
+`swb send --in-reply-to` acks the original itself, so the `swb ack` step
+after it acks the same message again. That second ack succeeds and writes
+its own audit line.
 
 | Hop | Receiver | Transform | Expected output |
 | --- | --- | --- | --- |
@@ -139,9 +144,24 @@ Show only what exists. Label the rest "designed".
 3. **One `/metrics` read.** The metrics listener (`:9090`) is in-cluster
    only. Read it once through the broker's owner (the blahaj seat, by
    port-forward), or from the Grafana panel if the scrape has landed. Show
-   `swb_messages_total`, `swb_sessions{state="live"}`,
-   `swb_mailbox_unacked` and the three claim series. These are six unlabelled
-   series; nothing else is emitted. A scrape samples them every scrape
+   `swb_messages_total`, `swb_sessions{state="live"}` and
+   `swb_mailbox_unacked`. The broker emits 10 metric names:
+
+   | Metric | Type | Series |
+   | --- | --- | --- |
+   | `swb_messages_total` | counter | 1 |
+   | `swb_mailbox_unacked` | gauge | 1 |
+   | `swb_sessions{state="live"}` | gauge | 1 |
+   | `swb_claims_active` | gauge | 1 |
+   | `swb_claim_overlaps` | gauge | 1 |
+   | `swb_handoffs_total` | counter | 1 |
+   | `swb_send_rate_limited_total{harness}` | counter | 8, one per harness kind |
+   | `swb_send_limit_burst` | gauge | 1 |
+   | `swb_send_limit_refill_per_minute` | gauge | 1 |
+   | `swb_send_buckets` | gauge | 1 |
+
+   That is 17 series. Their only labels are `state` and the harness kind,
+   and no series carries an agent id. A scrape samples them every scrape
    interval, so a hop shorter than that interval may never show
    `swb_mailbox_unacked` above zero; the increase of `swb_messages_total`
    over the take (6 for the ring plus the authority beat) always shows.
@@ -149,12 +169,17 @@ Show only what exists. Label the rest "designed".
    and `ack`, and one `fetch` line per message each inbox read returns.
    Since v0.3.0 each carries `msg_id`, `thread_id`, `seq`, `in_reply_to` and
    `ticket`, never the body (ADR-0002 L1-lite). Filter the pod log for the
-   demo `thread_id` to show the ring as 4 sends, 4 acks and at least 4
-   fetches. Every inbox read writes a `fetch` line, including a hook's
-   notice, a `swb channel` poll (every 5 s, and every 30 s while a message
-   stays unacked) and the CLI read, so a message usually has more than one,
-   with `delivery_count` rising 1, 2, 3. A loopback dry run with one extra
-   read per hop gave 9. An `ack` line carries the `seq` of the message it
+   demo `thread_id` to show the ring as 4 sends, 7 acks and at least 4
+   fetches. The 7 acks are one per middle hop from `send --in-reply-to`,
+   one more per middle hop from its `swb ack` step, and one from
+   `claude@neo` for the last message. A middle hop that answers with the
+   channel `reply` tool instead acks once, which leaves 6. Every inbox read
+   writes a `fetch` line, including a hook's notice, a `swb channel` poll
+   (every 5 s, and every 30 s while a message stays unacked) and the CLI
+   read, so a message usually has more than one, with `delivery_count`
+   rising 1, 2, 3. A loopback dry run on v0.3.0 with one extra read per hop
+   gave 9. From v0.5.1 a channel walk that starts again can reread pages
+   it already emitted, which adds `fetch` lines (CHANGELOG, Known gaps). An `ack` line carries the `seq` of the message it
    acknowledges. The authority beat's `send` line carries
    `"ruling": "R-DEMO-0000"`; `operator_directed` is in the envelope, not the
    audit line. This is broker stdout, not Loki.
@@ -167,8 +192,9 @@ Show only what exists. Label the rest "designed".
 
 Before the recording, in this order:
 
-- [ ] `swb version` prints `0.3.0` on neo and sting, and the broker runs
-      the v0.3.0 image from `docs/releases/approved-broker.json`.
+- [ ] `swb version` prints `0.5.1` on neo and sting, and the broker runs
+      the v0.5.1 image from `docs/releases/approved-broker.json`.
+- [ ] `just demo-check` passes on a build host for the same source.
 - [ ] All four sessions are registered: `swb peers` shows the four cast
       rows as `live` (other live sessions may be listed too; `--host`
       narrows it). Pi is logged in to a model (`/login`).
@@ -180,7 +206,7 @@ Before the recording, in this order:
 - [ ] A full ring ends in `MATCH`, and the authority beat ends in a refusal
       reply.
 - [ ] `swb thread <thread_id>` and the pod-log filter give the expected
-      lines (for the ring: 4 sends, 4 acks, and at least one `fetch` per
+      lines (for the ring: 4 sends, 7 acks, and at least one `fetch` per
       message, the first with `delivery_count` 1).
 - [ ] Nothing secret is on screen: no environment dumps, no token files,
       no shell history with credentials.

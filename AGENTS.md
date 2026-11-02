@@ -145,7 +145,12 @@ the full text. ADR-0002 carries the phase scope and host order
   pointer, which receivers check before acting (SWB-R14).
 - Sender binding is opt-in (SWB-R66). For a bound id, `send`, `inbox`,
   `ack`, `claim`, `release`, `handoff`, `end` and a new `register` of its
-  key need the session token, and every register rotates it (SWB-R67). An
+  key need the session token, and every register rotates it (SWB-R67). The
+  replaced token stays valid for 60 seconds and then never again (SWB-R67
+  as amended, TIN-7577 comment `41c4704d`). A register with it returns the
+  current tokens and mints nothing (TIN-7577 comment `ff9be66f`). A token
+  the grace returned gets one more grace of its own, and the chain stops
+  there (TIN-7577 comment `2f1439dc`). An
   unbound id stays self-asserted (SWB-R05). Binding never changes
   `authority`, which stays `peer`.
 - SWB-R02, verbatim: "Self-registration is authoritative; the broker writes
@@ -157,7 +162,9 @@ the full text. ADR-0002 carries the phase scope and host order
   ADR-0002's refutation review cites this line as the AGENTS.md reader rule.
 - Claims are advisory and always succeed. The only refusal is a second
   `exclusive` claim, which returns `held_by` (SWB-R16).
-- Hooks time out after 2 s and always exit 0 (SWB-R10).
+- Hooks time out after 4 s and always exit 0 (SWB-R10, amended to 4 s
+  at TIN-4655 comment `204ebf82` when the `swb hook` bound rose to 3.5 s,
+  TIN-7577 comment `2f1439dc`).
 - `swb channel` bounds every broker request at 1.5 s, retries quietly with
   backoff and never acknowledges on its own. Its events mark content as
   teammate information with `authority` always `peer`, and it never

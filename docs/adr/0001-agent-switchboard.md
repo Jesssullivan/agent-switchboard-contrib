@@ -113,7 +113,11 @@ registered once on the tailnet so that new harness instances spawn nothing.
   `register` of that key need the token, every register rotates it, and
   the bound id's inbox reads mail addressed to any pid of the key. The
   client keeps the token in a 0600 file (SWB-R67), and `peers` rows say
-  `bound` (SWB-R68). An unbound id keeps the v0.4.0 behaviour above.
+  `bound` (SWB-R68). From v0.5.1 the token a rotation replaced stays
+  valid for 60 seconds (SWB-R67 as amended 2026-11-02), and a register
+  with it returns the current tokens and mints nothing. A token returned
+  that way gets one more grace, and the chain stops there. An unbound id
+  keeps the v0.4.0 behaviour above.
   `swb whoami` prints the identity without a broker
   call, and `swb whoami --register` registers it (details:
   `docs/releases/v0.3.0-migration.md`). How each harness supplies it:
@@ -238,7 +242,8 @@ registered once on the tailnet so that new harness instances spawn nothing.
 - **Payload limits:**
   - the body is at most 16 KiB, and there are at most 20 artifact refs;
   - `ticket` must match `^TIN-\d+$|none`;
-  - control characters are stripped;
+  - control characters are stripped from the body, except newline and tab
+    (v0.5.1, TIN-7577); a carriage return is stripped, so CRLF becomes LF;
   - bodies are returned framed as teammate data and never pass through a
     shell.
 - **Audit (SWB-R19; additions 2026-09-25, SWB-R26 and SWB-R27):**
@@ -273,8 +278,10 @@ registered once on the tailnet so that new harness instances spawn nothing.
     tailnet node is refused (SWB-R33, "Once ACL A is enforced live
     (Recommended)"). The line schema and the audit's reader scope are in
     [ADR-0002](0002-lgtm-plane.md).
-- **Failure behaviour (SWB-R10):** hooks time out after 2 s and always exit 0.
-  The broker being down never blocks a harness.
+- **Failure behaviour (SWB-R10):** hooks time out after 4 s and always exit 0
+  (2 s until the 2026-11-02 amendment). `swb hook` bounds its own work at
+  3.5 s, so a bound register and its one retry each get the 1.5 s request
+  deadline. The broker being down never blocks a harness.
 
 ### MCP tools (12 on `main`)
 
@@ -878,7 +885,8 @@ that stops, restarts or scales a process is performed by the operator
     - with the broker down (the operator scales it to zero), sessions start
       normally and the skill falls back; and with the broker's address
       blackholed (packets dropped, not refused — a NetworkPolicy or host
-      rule the operator applies) every hook still returns within 2 s and
+      rule the operator applies) every hook still returns within the
+      SWB-R10 timeout (2 s then, 4 s since 2026-11-02) and
       exits 0 (critique fix: a fast refusal does not prove the timeout);
     - the registry URL matches the live hostname, proven by a live probe
       receipt from a seat, because a hermetic test cannot see the tailnet
@@ -965,7 +973,7 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R07 | 2026-09-25 | same | Delivery pace: "phased, design doc first." |
 | SWB-R08 | 2026-09-25 | same | Repo: "`xoxd-ai/agent-switchboard`, forked as `Jesssullivan/agent-switchboard`." |
 | SWB-R09 | 2026-09-25 | TIN-4655 comment `67611936` (P0 round one) | "Retention: acked 7 d, unacked 30 d; TTL 72 h (max 14 d)." *Addendum 2026-09-25 (SWB-R25):* broker retention only; Tempo and Loki keep 7 d. |
-| SWB-R10 | 2026-09-25 | same | "Non-blocking hooks: 2 s timeout, always exit 0." |
+| SWB-R10 | 2026-09-25; amended 2026-11-02 | same. Amendment: operator rulings (Jess, "Raise to 3.5 seconds (Recommended)", TIN-7577 comment `2f1439dc`, for the bound, and "Yes, 4 second timeout (Recommended)", TIN-4655 comment `204ebf82`, for the timeout) | "Non-blocking hooks: 2 s timeout, always exit 0." *Amended 2026-11-02:* `swb hook` bounds its own work at 3.5 s instead of 1.8 s, so a bound register's one retry gets a full request deadline. The hook entries' timeout rises from 2 s to 4 s to stay above that bound. Hooks still always exit 0. |
 | SWB-R11 | 2026-09-25 | same | "Registry targets claude_code, codex and opencode (Kimi inherits); VS Code is excluded." |
 | SWB-R12 | 2026-09-25 | same | "Junie reaches the broker through the mcp-mux `tracker` group, never `mux`." |
 | SWB-R13 | 2026-09-25 | same | "Allow private forks; fork PRs pass `ci-ok` as \"gated in merge queue\", with full CI on `merge_group`." |
@@ -997,7 +1005,7 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R64 | 2026-10-27 | Operator ruling (Jess, interview with the video-utils narrate seat), Linear TIN-4655 comment `409fb2ce` ("v0.4.0 release chain approved, run end to end"); SWB-R63; R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | Approve the v0.4.0 harness-kinds release: signed source 3405bf86 (the #51 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:a6303937…` (4579-byte manifest), from two matching clean sting builds of that merge. Recorded in `approved-broker.json`; the signed v0.4.0 tag publishes only this digest, through `release.yml`. |
 | SWB-R65 | 2026-10-27 | Operator ruling (Jess, interview with the video-utils narrate seat), Linear TIN-4655 comment `409fb2ce`; SWB-R63 | Native Kimi Code registers as `kimicode`, never `kimi`; under SWB-R63, `kimi` means Claude Code on a Kimi model. Its switchboard client is `swb channel --tools full` (MCP stdio) with hooks in `SWB_HOOK_FORMAT=text`, and the Claude-JSON adapter shim is dropped once text hooks work. The lab harness parity branch switches to `SWB_HARNESS=kimicode` and lands with the v0.4.0 pin. |
 | SWB-R66 | 2026-10-27 | Operator ruling (D37, narrate seat interview; SPR-34 on TIN-7125 `c54dda62`), Linear TIN-4655 comment `0753094f` | [ADR-0003](0003-sender-binding.md) (opt-in sender binding, drafted at `bd6f88b`) is accepted and ships as v0.5.0, since v0.4.0 already shipped without it. Binding stays opt-in. Acceptance includes the spoof test: a send with `from` set to a bound id and no token fails. Amends SWB-R05 and SWB-R14 as the ADR describes; `authority` stays `peer`. |
-| SWB-R67 | 2026-10-27 | same | A bound client keeps its token in a 0600 file and rotates it on every re-register. |
+| SWB-R67 | 2026-10-27; amended 2026-11-02 | same. Amendment: operator ruling (Jess, "Short grace for old token", TIN-7577 comment `41c4704d`) | A bound client keeps its token in a 0600 file and rotates it on every re-register. *Amended 2026-11-02:* after a rotation, the previous token stays valid for a short grace of about 60 seconds, so a register reply lost to a timeout cannot lock a bound session out until the 6 hour lapse. Two tokens are valid during that window. The broker fixes the grace at 60 seconds and accepts only the token the latest rotation replaced. *Refined 2026-11-02* (Jess, "Client retries once", "Same 60s grace" and "Grace returns current token", TIN-7577 comments `3955641b` and `ff9be66f`, review G1 to G6 of #57): a register that presents the previous token inside the grace returns the current session and end tokens and mints nothing, so no chain of graces can form; a token the grace returned gets no grace of its own; the end token has the same grace; the client retries a bound register once after a deadline. *Amended 2026-11-02* (Jess, "Allow one more grace", TIN-7577 comment `2f1439dc`, review H1 of #57): a token the grace returned gets one more grace of its own, and the chain stops after that, so two lost replies in a row recover and a third does not. A leaked token can fetch the current one in at most 2 graces, so it cannot live on indefinitely through the grace; a fetched token still lives until the client next registers. |
 | SWB-R68 | 2026-10-27 | same | `swb peers` shows whether an id is bound. |
 | SWB-R69 | 2026-10-27 | Operator ruling (Jess, narrate seat interview), Linear TIN-4655 comment `7e292300`; agent-switchboard #54 | Accept #54's three design choices: re-registering a live bound id needs its current token; a binding lapses when its session ends or after 6 h idle, which is how a lost token file is recovered, and a lapse is permanent; the per-sender rate limit (burst 20, 30 per minute, configurable) also applies to unbound senders, as a guard against a looping client. |
 | SWB-R70 | 2026-10-27 | same | Land #54 (head 8ebddff) by admin merge with a recorded release-check waiver, as for #50. Fork PRs skip CI; the local gate receipt covers it (bazel //:check 11/11, cargo test 157, clippy, fmt, spec-dhall and gitleaks). |

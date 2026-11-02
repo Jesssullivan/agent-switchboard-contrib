@@ -14,7 +14,7 @@
 #   run.sh down               stop the broker and delete its state
 #   run.sh selftest           the whole flow with a scripted Claude side; exits 0 on success
 #
-# Needs an `swb` 0.3.x binary (main) on PATH or in SWB_BIN, plus curl and jq.
+# Needs an `swb` 0.5.x binary (main) on PATH or in SWB_BIN, plus curl and jq.
 # The broker binds 127.0.0.1 only. Identity is self-asserted: anyone who can
 # reach the port can act as any agent id, so keep it on loopback.
 set -euo pipefail

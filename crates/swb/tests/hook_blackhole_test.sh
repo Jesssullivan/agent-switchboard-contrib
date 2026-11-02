@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # SWB-R10 / R-C949 (TIN-6688): a harness hook against a blackholed broker
-# returns within 2 s and exits 0, with no output.
+# returns within 4 s and exits 0, with no output. SWB-R10's budget was 2 s;
+# it is 4 s since the hook bound rose to 3.5 s (TIN-7577 comment 2f1439dc;
+# the 4 s timeout is Jess's "Yes, 4 second timeout (Recommended)", TIN-4655
+# comment 204ebf82).
 #
 # The broker address is 192.0.2.1:9 (RFC 5737 TEST-NET-1, never routed), so
 # a SYN gets no answer and connect() waits until the client's own deadline.
@@ -12,13 +15,13 @@
 # case holds stdin open with no EOF, which deterministically exercises the
 # hook's own bound on its stdin read.
 #
-# Timing margin: the SWB-R10 ceiling is 2 s and the hook's own bound is
-# HOOK_LIMIT = 1800 ms (crates/swb/src/main.rs), leaving about 200 ms for
-# fork/exec of env, sh and swb (1866 ms worst case measured on sting, so the
-# margin is thin on a CPU-capped runner). A case that exits 0 with no output
-# but overshoots 2 s is run once more, and a second overshoot fails. That
-# retry also covers a hook that hangs for a bounded time and then exits 0
-# (say at 2.5 s): it fails only if it overshoots twice. A case that exits
+# Timing margin: the SWB-R10 ceiling is 4 s and the hook's own bound is
+# HOOK_LIMIT = 3500 ms (crates/swb/src/main.rs), leaving about 500 ms for
+# fork/exec of env, sh and swb (66 ms over the bound was the worst case
+# measured on sting with the 1800 ms bound). A case that exits 0 with no
+# output but overshoots 4 s is run once more, and a second overshoot fails.
+# That retry also covers a hook that hangs for a bounded time and then
+# exits 0 (say at 4.5 s): it fails only if it overshoots twice. A case that exits
 # non-zero or prints fails on its first run. There is no per-case timeout: a
 # hook that never returns is caught by Bazel's timeout for the whole target
 # (size "small", 60 s) as a TIMEOUT, not as a FAIL line for that case.
@@ -32,6 +35,14 @@
 # wrapper `integrations/claude-code/scripts/swb-hook.sh`, for every event.
 # Arguments after the second (for example the fixture driver's
 # --test-threads=1, which Bazel passes to every test) are ignored.
+#
+# Bound cases (review K1 of #57, TIN-7577): with a saved session token the
+# hook's register is bound, so after its first request misses the 1.5 s
+# deadline it sends the one retry, and returns after about 3 s. When the
+# blackhole path ran, each bound case must take at least 2.5 s, which only
+# the retry reaches, and stay under the 4 s budget. A wrapper whose
+# `timeout` backstop fell back to 2 s cuts the retry at about 2 s and fails
+# here. //crates/swb:swb_test ties the backstop and the hook entries to 4 s.
 set -euo pipefail
 
 swb="$1"
@@ -39,10 +50,14 @@ wrapper="$2"
 [ -x "$swb" ] || { echo "not executable: $swb" >&2; exit 1; }
 [ -f "$wrapper" ] || { echo "missing wrapper: $wrapper" >&2; exit 1; }
 
-budget_us=2000000
+budget_us=4000000
 # A closed-stdin case that reached the blackhole waits on connect for most of
 # HOOK_LIMIT; one that failed at once (no route) returns in a few ms.
 blackhole_min_us=1000000
+# A bound case that sent its retry waits on connect for two full 1.5 s
+# deadlines; without the retry, or cut by a 2 s timeout, it ends near 1.5 s
+# or 2 s.
+bound_min_us=2500000
 scratch="${TEST_TMPDIR:-$(mktemp -d)}/hook-blackhole"
 mkdir -p "$scratch/bin" "$scratch/state"
 chmod 700 "$scratch/state"
@@ -72,8 +87,21 @@ now_us() {
   fi
 }
 
+# A separate state dir for the bound cases, with a saved session token for
+# the binding key (harness:host:session_id), so the hook's register carries
+# it and is retried once after a deadline.
+bound_state="$scratch/bound-state"
+mkdir -p "$bound_state/bindings"
+chmod 700 "$bound_state" "$bound_state/bindings"
+session_token_file="$bound_state/bindings/claude:blackhole-test:blackhole-session.token"
+printf '%064d' 0 >"$session_token_file"
+chmod 600 "$session_token_file"
+
 failures=0
 blackholed=0
+bound_cases=0
+# The least time a case must take once the blackhole path ran; 0 for none.
+case_min_us=0
 # Runs one case; sets case_status, case_elapsed and case_bytes.
 attempt() {
   local stdin_mode="$1"
@@ -112,8 +140,14 @@ run_case() {
   fi
   if [ "$case_status" -ne 0 ] || [ "$case_elapsed" -ge "$budget_us" ] || [ "$case_bytes" -ne 0 ]; then
     verdict=FAIL
-    failures=$((failures + 1))
+  elif [ "$blackholed" -ne 0 ] && [ "$case_elapsed" -lt "$case_min_us" ]; then
+    # The earlier closed-stdin cases reached the blackhole, so this one
+    # should have waited for its retry too.
+    verdict=FAIL
+    printf 'FAIL  %-47s elapsed_ms=%d is under %d ms: the bound retry did not run or was cut\n' \
+      "$name" $((case_elapsed / 1000)) $((case_min_us / 1000))
   fi
+  [ "$verdict" = ok ] || failures=$((failures + 1))
   if [ "$stdin_mode" = "closed" ] && [ "$case_elapsed" -ge "$blackhole_min_us" ]; then
     blackholed=$((blackholed + 1))
   fi
@@ -129,22 +163,33 @@ done
 run_case "swb hook claude SessionStart (stdin never closes)" open "$swb" hook claude SessionStart
 run_case "swb-hook.sh UserPromptSubmit (stdin never closes)" open \
   env PATH="$scratch/bin:$PATH" sh "$wrapper" UserPromptSubmit
+# The bound cases run last, after the unbound closed-stdin cases have shown
+# whether the blackhole path runs here.
+case_min_us=$bound_min_us
+run_case "swb hook claude UserPromptSubmit (bound)" closed \
+  env SWB_STATE_DIR="$bound_state" "$swb" hook claude UserPromptSubmit
+run_case "swb-hook.sh UserPromptSubmit (bound)" closed \
+  env PATH="$scratch/bin:$PATH" SWB_STATE_DIR="$bound_state" sh "$wrapper" UserPromptSubmit
+bound_cases=2
+case_min_us=0
 
 # The hook must not have consumed the seeded token on a failed end.
 [ -f "$token_file" ] || { echo "FAIL seeded end token was removed without a broker answer"; failures=$((failures + 1)); }
+# Nor the seeded session token on a register that got no answer.
+[ -f "$session_token_file" ] || { echo "FAIL seeded session token was removed without a broker answer"; failures=$((failures + 1)); }
 
 if [ "$failures" -ne 0 ]; then
-  echo "$failures case(s) exceeded the 2 s budget, exited non-zero or printed output" >&2
+  echo "$failures case(s) exceeded the 4 s budget, exited non-zero, printed output or cut the bound retry" >&2
   exit 1
 fi
 if [ "$blackholed" -eq 0 ]; then
   # Every closed-stdin case returned in under 1 s: connect failed at once, so
   # the blackhole path did not run. Not a contract break, and not evidence.
-  echo "NO-ROUTE: all hook cases returned exit 0 within 2 s, but no closed-stdin case waited on connect; the blackhole path did not run"
+  echo "NO-ROUTE: all hook cases returned exit 0 within 4 s, but no closed-stdin case waited on connect; the blackhole path did not run"
   if [ "${SWB_HOOK_REQUIRE_BLACKHOLE:-0}" = "1" ]; then
     echo "SWB_HOOK_REQUIRE_BLACKHOLE=1: a NO-ROUTE run is not accepted" >&2
     exit 1
   fi
   exit 0
 fi
-echo "all hook cases returned exit 0 within 2 s against a blackholed broker ($blackholed closed-stdin cases waited on connect)"
+echo "all hook cases returned exit 0 within 4 s against a blackholed broker ($blackholed closed-stdin cases waited on connect, $bound_cases bound cases ran the register retry)"

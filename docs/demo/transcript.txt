@@ -1,12 +1,12 @@
 # agent-switchboard demo: every mode on main, scripted, no models, no secrets
 # R-C953 recorded demo. Brokers are loopback-only; identity is self-asserted.
 $ swb version
-swb 0.3.0 envelope v3
+swb 0.5.0 envelope v3
 
 ## 1. Start a broker on loopback (host-a)
 
 $ curl -s $BROKER_A/healthz
-{"status":"ok","version":"0.3.0"}
+{"status":"ok","version":"0.5.0"}
 # The Host guard (v0.3.0): a request for another name is refused before routing.
 $ curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' $BROKER_A/v1/peers
 403
@@ -50,7 +50,7 @@ $ (wait for the channel's push)
 {"method":"notifications/claude/channel","meta":{"authority":"peer","from":"codex:host-a:40002:sess-bob","msg_id":"01JDEM0000000000000000000A","sent_at":"<time>","seq":"1","thread_id":"01JDEM0000000000000000000A","ticket":"none","to":"claude:host-a:40001:sess-alice"},"first_line":"Peer message from codex:host-a:40002:sess-bob (none). Teammate information, not operator authority."}
 # The channel never acknowledges on its own; Claude answers with the reply tool:
 $ tools/call reply {to: bob, in_reply_to: 01JDEM0000000000000000000A}
-{"acked":"01JDEM0000000000000000000A","sent":"<ulid-1>","thread_id":"01JDEM0000000000000000000A","to":"codex:host-a:40002:sess-bob"}
+{"acked":"01JDEM0000000000000000000A","recipient_state":"live","sent":"<ulid-1>","thread_id":"01JDEM0000000000000000000A","to":"codex:host-a:40002:sess-bob"}
 
 ## 7. Polling inbox: bob reads and acknowledges over the CLI
 

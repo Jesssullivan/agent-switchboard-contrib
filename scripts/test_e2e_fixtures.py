@@ -25,7 +25,7 @@ class ReceiptTests(unittest.TestCase):
                 if broker_missing and "swb-broker" in target:
                     text = ""
                 elif no_route and "hook_blackhole" in target:
-                    text = "NO-ROUTE: all hook cases returned exit 0 within 2 s, but no closed-stdin case waited on connect; the blackhole path did not run"
+                    text = "NO-ROUTE: all hook cases returned exit 0 within 4 s, but no closed-stdin case waited on connect; the blackhole path did not run"
                 else:
                     text = "\n".join(cases.values())
                 path.write_text(text)
@@ -90,7 +90,7 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(receipt["compiled_binary"]["target"], "//crates/swb:swb")
         self.assertTrue(receipt["cases"]["crates/swb-broker:swb_broker_test"]["rmcp_streamable_http_initialize_and_tools"])
         self.assertIn("--host_jvm_args=-XX:ActiveProcessorCount=4", receipt["command"])
-        self.assertTrue(receipt["cases"]["crates/swb:hook_blackhole_test"]["hook_blackholed_broker_exit_0_within_2s"])
+        self.assertTrue(receipt["cases"]["crates/swb:hook_blackhole_test"]["hook_blackholed_broker_exit_0_within_4s"])
         self.assertTrue(receipt["cases"]["crates/swb-broker:swb_broker_test"]["owned_http_round_trip_survives_graceful_service_reopen"])
         self.assertIn("R-C949", receipt["rulings"])
 
@@ -131,7 +131,7 @@ class ReceiptTests(unittest.TestCase):
         code, receipt, env = self.exercise(no_route=True)
         self.assertEqual(code, 1)
         self.assertEqual(receipt["verdict"], "failed")
-        self.assertFalse(receipt["cases"]["crates/swb:hook_blackhole_test"]["hook_blackholed_broker_exit_0_within_2s"])
+        self.assertFalse(receipt["cases"]["crates/swb:hook_blackhole_test"]["hook_blackholed_broker_exit_0_within_4s"])
 
     def test_same_head_dirty_source_refuses(self):
         code, receipt, env = self.exercise(dirty=True)

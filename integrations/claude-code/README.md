@@ -121,13 +121,16 @@ Each hook runs `scripts/swb-hook.sh <event>`, which runs
 | `SessionEnd` | Ends the session at the broker |
 
 The wrapper always exits 0. It exits early when `swb` is not on `PATH` or
-`SWB_BROKER_URL` is unset, and runs `swb` under `timeout 2` when `timeout`
-exists. `swb hook` bounds its own work to 1.8 s and always exits 0, and each
-hook entry sets `"timeout": 2`, the SWB-R10 budget (2 s, always exit 0), so
-a dead or blackholed broker costs at most 2 s and never blocks a prompt or a
+`SWB_BROKER_URL` is unset, and runs `swb` under `timeout 4` when `timeout`
+exists. `swb hook` bounds its own work to 3.5 s and always exits 0, and each
+hook entry sets `"timeout": 4`, the SWB-R10 budget (4 s, always exit 0), so
+a dead or blackholed broker costs at most 4 s and never blocks a prompt or a
 stop. (Claude Code blocks only on exit 2 for these events; nothing here
-returns it.) `SessionEnd` hooks share a 1.5 s budget by default; the 2 s
-timeout raises it to 2 s.
+returns it.) The 3.5 s bound gives a bound register and its one retry the
+full 1.5 s request deadline each. SWB-R10 set 2 s and a 1.8 s bound until
+Jess raised the bound (TIN-7577 comment `2f1439dc`) and the timeout
+(TIN-4655 comment `204ebf82`). `SessionEnd` hooks
+share a 1.5 s budget by default; the 4 s timeout raises it to 4 s.
 
 `swb hook` reads `session_id` from the hook's stdin and the rest of the
 identity from the environment. With no `SWB_*` environment it does nothing,

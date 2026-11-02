@@ -18,16 +18,28 @@
 //! registration of the same (harness, host, session id) must present it, and
 //! inbox delivery keys on (harness, host, session id) so a restarted service
 //! keeps its unread mail. An unbound id behaves as in v0.4.0.
+//!
+//! v0.5.1 (SWB-R67 as amended by Jess's ruling "Short grace for old
+//! token", TIN-7577 comment `41c4704d`): after a re-register rotates a bound
+//! key's token, the token it replaced stays valid for
+//! [`SESSION_TOKEN_GRACE_SECONDS`], so a client whose register reply was
+//! lost can still act and register again. Jess's ruling "Grace returns
+//! current token" (comment `ff9be66f`) refines it: a register with the
+//! replaced token returns the current tokens and mints nothing. Jess's
+//! ruling "Allow one more grace" (comment `2f1439dc`) lets a token handed
+//! back that way have one more grace of its own, and no more
+//! ([`SESSION_TOKEN_GRACE_CHAIN`]).
 
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 use ulid::Ulid;
 
 mod claims;
@@ -54,6 +66,31 @@ pub const PEERS_MAX_LIMIT: u32 = 200;
 pub const END_TOKEN_HEX_LEN: usize = 64;
 /// Hex length of a session token (an HMAC-SHA256, ADR-0003).
 pub const SESSION_TOKEN_HEX_LEN: usize = 64;
+/// How long a bound key's previous session token stays valid after a
+/// re-register rotates it: 60 seconds, the "about 60 seconds" of the
+/// ruling that amends SWB-R67 (Jess, "Short grace for old token", TIN-7577
+/// comment `41c4704d`). A client whose register reply was lost to a
+/// deadline still holds that token, and within the grace it can act as the
+/// binding and register again to get the current one, which that register
+/// returns without minting a new one (comment `ff9be66f`). Only the token
+/// that the latest rotation replaced counts, never an older one, and only
+/// until the grace ends on the wall clock or the monotonic clock, whichever
+/// is first. The value is fixed here: no setting or environment variable
+/// changes it, so it cannot be raised without a new ruling.
+/// `spec/dhall/Broker.dhall` states the same value, and a test ties the two.
+pub const SESSION_TOKEN_GRACE_SECONDS: i64 = 60;
+/// How many graces one chain of tokens gets (Jess, "Allow one more grace",
+/// TIN-7577 comment `2f1439dc`). A token the broker minted and the client
+/// received gets the first grace when it is replaced. A token a grace
+/// register handed back gets one more grace of its own when it is
+/// replaced, and a token handed back inside that second grace gets none.
+/// So two lost register replies in a row recover and a third does not,
+/// and a leaked token fetches the current one at most twice, which ends
+/// any ping-pong of two holders within two grace windows of the client's
+/// registers. A token the client receives from a register that minted it
+/// starts a new chain. `spec/dhall/Broker.dhall` states the same value,
+/// and a test ties the two.
+pub const SESSION_TOKEN_GRACE_CHAIN: i64 = 2;
 
 pub fn effective_ttl_hours(requested: Option<u32>) -> u32 {
     requested
@@ -107,6 +144,9 @@ impl ErrorKind {
 pub struct StoreError {
     pub kind: ErrorKind,
     pub message: String,
+    /// Seconds until a refused send may succeed, for
+    /// [`ErrorKind::RateLimited`] with a bucket that refills (TIN-7577).
+    pub retry_after: Option<u64>,
 }
 
 impl StoreError {
@@ -114,7 +154,13 @@ impl StoreError {
         Self {
             kind,
             message: message.into(),
+            retry_after: None,
         }
+    }
+    /// The same error with `retry_after` set.
+    pub fn with_retry_after(mut self, seconds: Option<u64>) -> Self {
+        self.retry_after = seconds;
+        self
     }
     pub fn code(&self) -> &'static str {
         self.kind.code()
@@ -155,6 +201,11 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// its SQL, so no statement reads SQLite's own clock.
 pub trait Clock: Send + Sync {
     fn now(&self) -> i64;
+    /// Milliseconds on a clock that never steps back, from an arbitrary
+    /// origin that is fixed for the life of the process. The session token
+    /// grace times itself on this as well as on [`Clock::now`], so a wall
+    /// clock step cannot lengthen it (review G4 of #57, TIN-7577).
+    fn monotonic_millis(&self) -> i64;
 }
 
 /// The wall clock. Truncated Unix seconds, the value SQLite `unixepoch()`
@@ -168,32 +219,64 @@ impl Clock for SystemClock {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64)
     }
+    fn monotonic_millis(&self) -> i64 {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        i64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(i64::MAX)
+    }
 }
 
-/// A clock that stands still until [`ManualClock::advance`] moves it. It
-/// never moves backwards. For tests and the spec live adapter only; no
-/// production path constructs one.
+/// A clock that stands still until [`ManualClock::advance`] moves it. Only
+/// [`ManualClock::step_wall_back`] moves it backwards, and only its wall
+/// reading, the way a host clock step does; its monotonic reading never
+/// moves back. For tests and the spec live adapter only; no production path
+/// constructs one.
 #[derive(Debug)]
-pub struct ManualClock(AtomicI64);
+pub struct ManualClock {
+    wall: AtomicI64,
+    monotonic_millis: AtomicI64,
+}
 
 impl ManualClock {
     pub fn new(start: i64) -> Self {
-        Self(AtomicI64::new(start))
+        Self {
+            wall: AtomicI64::new(start),
+            monotonic_millis: AtomicI64::new(0),
+        }
     }
     /// Start at the current wall-clock second.
     pub fn starting_now() -> Self {
         Self::new(SystemClock.now())
     }
-    /// Move forward by `seconds` and return the new time.
+    /// Move forward by `seconds`, on the wall and the monotonic reading,
+    /// and return the new wall time.
     pub fn advance(&self, seconds: u32) -> i64 {
         let step = i64::from(seconds);
-        self.0.fetch_add(step, Ordering::SeqCst) + step
+        self.monotonic_millis
+            .fetch_add(step * 1000, Ordering::SeqCst);
+        self.wall.fetch_add(step, Ordering::SeqCst) + step
+    }
+    /// Step the wall reading back by `seconds` while the monotonic reading
+    /// stands still, as when a host clock is corrected backwards. Returns
+    /// the new wall time.
+    pub fn step_wall_back(&self, seconds: u32) -> i64 {
+        let step = i64::from(seconds);
+        self.wall.fetch_sub(step, Ordering::SeqCst) - step
+    }
+    /// Step the wall reading forward by `seconds` while the monotonic
+    /// reading stands still, as when a host clock is corrected forwards.
+    /// Returns the new wall time.
+    pub fn step_wall_forward(&self, seconds: u32) -> i64 {
+        let step = i64::from(seconds);
+        self.wall.fetch_add(step, Ordering::SeqCst) + step
     }
 }
 
 impl Clock for ManualClock {
     fn now(&self) -> i64 {
-        self.0.load(Ordering::SeqCst)
+        self.wall.load(Ordering::SeqCst)
+    }
+    fn monotonic_millis(&self) -> i64 {
+        self.monotonic_millis.load(Ordering::SeqCst)
     }
 }
 
@@ -201,13 +284,42 @@ impl<C: Clock + ?Sized> Clock for Arc<C> {
     fn now(&self) -> i64 {
         (**self).now()
     }
+    fn monotonic_millis(&self) -> i64 {
+        (**self).monotonic_millis()
+    }
 }
 
-pub struct Store(Mutex<Connection>, Arc<dyn Clock>, Mutex<ratelimit::Limiter>);
+/// When a rotation of one binding ran, on the monotonic clock, kept in
+/// memory only: the agent id of the binding, the `registered_seq` of the
+/// register that rotated it, and [`Clock::monotonic_millis`] at that moment.
+/// A broker restart forgets every hold, so a grace never outlives the
+/// process that started it (review G4 of #57, TIN-7577).
+type GraceHolds = HashMap<String, (i64, i64)>;
+
+pub struct Store(
+    Mutex<Connection>,
+    Arc<dyn Clock>,
+    Mutex<ratelimit::Limiter>,
+    Mutex<GraceHolds>,
+);
+/// What [`Store::register_outcome`] answered.
+#[derive(Debug)]
+pub struct RegisterOutcome {
+    /// The register result, the same keys as in v0.5.0.
+    pub result: Value,
+    /// `Some(1)` or `Some(2)` when a register inside that grace of the
+    /// chain returned the current tokens and minted nothing (TIN-7577
+    /// comments `ff9be66f` and `2f1439dc`); `None` when it minted them.
+    pub grace: Option<i64>,
+}
 #[derive(Debug)]
 pub struct SendOutcome {
     pub envelope: Value,
     pub created: bool,
+    /// Where mail to the recipient stands when the send commits: `live`,
+    /// `idle`, `gone`, `ended`, `superseded` or `unregistered` (A5,
+    /// TIN-7577). A send result carries it; the stored envelope never does.
+    pub recipient_state: &'static str,
 }
 
 /// A `peers` request (R-C944). The default lists live sessions only, one
@@ -224,8 +336,10 @@ pub struct PeersQuery<'a> {
     pub limit: Option<u32>,
     /// The `next_cursor` of the previous page.
     pub cursor: Option<&'a str>,
-    /// Only sessions whose latest registration used this `proc_start`. The
-    /// caller supplies it; listings still never return it.
+    /// Only registrations that used this `proc_start`, then one row per
+    /// harness, host and session id among them (A4, TIN-7577). The caller
+    /// supplies it; listings still never return it. Rows listed with it
+    /// carry `registered_seq`, the store's registration order (F2).
     pub proc_start: Option<&'a str>,
 }
 
@@ -302,8 +416,31 @@ fn valid_rfc3339_shape(s: &str) -> bool {
             && suffix[4].is_ascii_digit()
             && suffix[5].is_ascii_digit())
 }
+/// A single-line field with every control character removed. v0.5.0 and
+/// older stored message bodies this way; a replay compares against it so a
+/// stored body keeps matching across the upgrade (TIN-7577).
 fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
+}
+/// A message body as the store keeps it (TIN-7577). Newline and tab stay,
+/// so a multi-line body keeps its lines. Every carriage return goes: CRLF
+/// becomes LF and a lone CR is dropped, so a CR cannot move a terminal's
+/// cursor back over a line it already printed. Every other control
+/// character goes too, as `clean` drops them.
+fn clean_body(s: &str) -> String {
+    s.chars()
+        .filter(|&c| matches!(c, '\n' | '\t') || !c.is_control())
+        .collect()
+}
+/// Whether a `--msg-id` retry carries the stored body, so it is a replay
+/// (TIN-7577). A row that kept its lines (`body_lines`, written by v0.5.1
+/// and later) matches the cleaned retry body exactly, so a retry that adds
+/// or moves a newline, tab or CR is a conflict. A row from v0.5.0 or older
+/// holds the body with every control character removed, so only such a row
+/// also matches the retry in that flattened form.
+fn same_body(old_body: &str, old_lines: bool, body: &str, raw_body: &str) -> bool {
+    old_body == body
+        || (!old_lines && !old_body.contains(['\n', '\t']) && old_body == clean(raw_body))
 }
 fn sql_err(e: rusqlite::Error) -> StoreError {
     StoreError::new(ErrorKind::Internal, e.to_string())
@@ -370,9 +507,106 @@ fn unauthorized(message: &str) -> StoreError {
 struct Binding {
     agent_id: String,
     nonce: Vec<u8>,
+    /// The token the latest rotation replaced, while
+    /// [`SESSION_TOKEN_GRACE_SECONDS`] has not run out since it (SWB-R67 as
+    /// amended, TIN-7577 comments `41c4704d` and `ff9be66f`).
+    previous: Option<PreviousToken>,
+    /// Which grace, 1 or 2, handed back the current token, if a register
+    /// inside a grace returned it. The next rotation gives that token the
+    /// next grace of the chain, or none once the chain is spent
+    /// ([`SESSION_TOKEN_GRACE_CHAIN`]).
+    returned: Option<i64>,
+}
+/// A replaced session token: the agent id and nonce it was derived from,
+/// and which grace of its chain it is in, 1 or 2.
+type PreviousToken = (String, Vec<u8>, i64);
+/// Which session token of a binding a caller presented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenMatch {
+    Current,
+    /// The token the latest rotation replaced, inside its grace.
+    Previous,
+    None,
 }
 /// A key's latest session row: agent id, nonce, bound, ended, last_seen.
 type BindingRow = (String, Option<Vec<u8>>, i64, i64, i64);
+/// The latest session row of `agent_id`'s delivery key (harness, host and
+/// session id), or `None` for a malformed id or a key with no row.
+fn latest_key_row(db: &Connection, agent_id: &str) -> StoreResult<Option<BindingRow>> {
+    let [harness, host, _, session] = match agent_id.splitn(4, ':').collect::<Vec<_>>()[..] {
+        [a, b, c, d] => [a, b, c, d],
+        _ => return Ok(None),
+    };
+    db.query_row(
+        "SELECT agent_id, token_nonce, bound, ended, last_seen FROM sessions
+         WHERE harness=?1 AND host=?2 AND session_id=?3
+         ORDER BY registered_seq DESC, agent_id DESC LIMIT 1",
+        params![harness, host, session],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )
+    .optional()
+    .map_err(sql_err)
+}
+/// Whether a key's latest row is a live binding: bound, not ended, with a
+/// token nonce, and seen within [`IDLE_MAX_AGE_SECONDS`]. The inbox gate and
+/// `recipient_state_of` share this one test, so a send never reports a
+/// binding the inbox does not honour (TIN-7577).
+fn is_live_binding(row: &BindingRow, now: i64) -> bool {
+    matches!(row, (_, Some(_), 1, 0, seen) if *seen >= now - IDLE_MAX_AGE_SECONDS)
+}
+/// Where mail to `recipient` stands (A5, TIN-7577). A live binding of its
+/// delivery key reads mail for every pid of that key, so the binding's own
+/// lease counts. Otherwise the recipient's own row decides, and an id with
+/// no row is `unregistered`. An unended row that another agent id of the
+/// same harness, host and session id registered after is `superseded`: the
+/// session restarted under a new pid, so its live lease no longer shows
+/// that anyone reads this id (review F1 of #57). Read-only: it never marks
+/// a lapsed binding.
+fn recipient_state_of(db: &Connection, recipient: &str, now: i64) -> StoreResult<&'static str> {
+    if let Some(row) = latest_key_row(db, recipient)?
+        && is_live_binding(&row, now)
+    {
+        return Ok(lease_state(row.4, false, now));
+    }
+    let row: Option<(i64, i64, String, String, Option<String>, i64)> = db
+        .query_row(
+            "SELECT last_seen, ended, harness, host, session_id, registered_seq
+             FROM sessions WHERE agent_id=?1",
+            [recipient],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_err)?;
+    let Some((seen, ended, harness, host, session, seq)) = row else {
+        return Ok("unregistered");
+    };
+    if ended != 0 {
+        return Ok("ended");
+    }
+    let session = session.unwrap_or_else(|| session_of(recipient).to_owned());
+    let newer: Option<i64> = db
+        .query_row(
+            "SELECT 1 FROM sessions WHERE harness=?1 AND host=?2 AND session_id=?3
+               AND agent_id!=?4 AND registered_seq>?5 LIMIT 1",
+            params![harness, host, session, recipient, seq],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql_err)?;
+    if newer.is_some() {
+        return Ok("superseded");
+    }
+    Ok(lease_state(seen, false, now))
+}
 fn lease_state(seen: i64, ended: bool, now: i64) -> &'static str {
     if ended {
         "ended"
@@ -478,6 +712,52 @@ impl Store {
                 "bound",
                 "ALTER TABLE sessions ADD COLUMN bound INTEGER NOT NULL DEFAULT 0",
             ),
+            // v0.5.1 (SWB-R67 as amended, TIN-7577 comment `41c4704d`): the
+            // binding's previous token, kept as the agent id and nonce it
+            // was derived from, when the rotation ran, and the
+            // `registered_seq` of the register that rotated it. A broker
+            // that does not know these columns (v0.5.0 after a downgrade)
+            // changes `registered_seq` on its next register of the row, so
+            // the stale record no longer matches and grants nothing.
+            (
+                "prev_token_agent_id",
+                "ALTER TABLE sessions ADD COLUMN prev_token_agent_id TEXT",
+            ),
+            (
+                "prev_token_nonce",
+                "ALTER TABLE sessions ADD COLUMN prev_token_nonce BLOB",
+            ),
+            (
+                "prev_token_rotated_at",
+                "ALTER TABLE sessions ADD COLUMN prev_token_rotated_at INTEGER",
+            ),
+            (
+                "prev_token_registered_seq",
+                "ALTER TABLE sessions ADD COLUMN prev_token_registered_seq INTEGER",
+            ),
+            // v0.5.1 (TIN-7577 comment `ff9be66f`): the `registered_seq` of
+            // the row's current token when a register inside the grace
+            // returned that token instead of minting one. The next rotation
+            // gives that token the next grace of its chain, or none once the
+            // chain is spent (comment `2f1439dc`). A register by a broker
+            // that does not know the column changes `registered_seq`, so a
+            // stale value never matches again.
+            (
+                "token_returned_seq",
+                "ALTER TABLE sessions ADD COLUMN token_returned_seq INTEGER",
+            ),
+            // v0.5.1 (TIN-7577 comment `2f1439dc`, "Allow one more grace"):
+            // which grace of its chain the previous token is in, and which
+            // grace handed back the current token. Both count only while
+            // the seq column beside them matches `registered_seq`.
+            (
+                "prev_token_grace",
+                "ALTER TABLE sessions ADD COLUMN prev_token_grace INTEGER",
+            ),
+            (
+                "token_returned_grace",
+                "ALTER TABLE sessions ADD COLUMN token_returned_grace INTEGER",
+            ),
         ] {
             if !columns.iter().any(|c| c == column) {
                 db.execute(ddl, []).map_err(sql_err)?;
@@ -536,6 +816,86 @@ impl Store {
              CREATE INDEX IF NOT EXISTS messages_by_key ON messages(recipient_key, state, created_at);",
         )
         .map_err(sql_err)?;
+        // v0.5.1 (TIN-7577): each message's arrival position, from a
+        // store-wide counter that only grows. An inbox cursor compares it, so
+        // a later send always sorts after the cursor, whatever its msg_id or
+        // clock second. Rows without one (an older store, or rows a v0.5.0
+        // broker wrote after a downgrade) are filled in send order, after
+        // every position already handed out.
+        let has_arrival = db
+            .prepare("SELECT name FROM pragma_table_info('messages')")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(sql_err)?
+            .iter()
+            .any(|c| c == "arrival_seq");
+        if !has_arrival {
+            db.execute("ALTER TABLE messages ADD COLUMN arrival_seq INTEGER", [])
+                .map_err(sql_err)?;
+        }
+        // One transaction for the backfill and the counter, so a large store
+        // syncs once at startup, not once per row. A crash before the commit
+        // leaves every row unfilled, and the next start fills them again.
+        let fill = db.unchecked_transaction().map_err(sql_err)?;
+        let base: i64 = fill
+            .query_row(
+                "SELECT MAX(COALESCE((SELECT MAX(arrival_seq) FROM messages),0),
+                            COALESCE((SELECT value FROM counters WHERE name='arrival_seq'),0))",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        let unordered: Vec<String> = fill
+            .prepare(
+                "SELECT msg_id FROM messages WHERE arrival_seq IS NULL ORDER BY created_at, seq, rowid",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<_, _>>()
+            })
+            .map_err(sql_err)?;
+        for (offset, msg_id) in (1i64..).zip(&unordered) {
+            fill.execute(
+                "UPDATE messages SET arrival_seq=?2 WHERE msg_id=?1",
+                params![msg_id, base + offset],
+            )
+            .map_err(sql_err)?;
+        }
+        fill.execute(
+            "INSERT INTO counters(name,value) VALUES('arrival_seq',?1)
+             ON CONFLICT(name) DO UPDATE SET value=MAX(value, excluded.value)",
+            [base + unordered.len() as i64],
+        )
+        .map_err(sql_err)?;
+        fill.commit().map_err(sql_err)?;
+        // v0.5.1 (TIN-7577): whether the stored body kept its newlines and
+        // tabs. A v0.5.1 send writes 1. Every older row reads 0: the column
+        // is added with that default, and a v0.5.0 broker running on this
+        // store after a downgrade names its columns and leaves it at 0. Only
+        // a row at 0 can match a retry in the flattened form.
+        let has_lines = db
+            .prepare("SELECT name FROM pragma_table_info('messages')")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(sql_err)?
+            .iter()
+            .any(|c| c == "body_lines");
+        if !has_lines {
+            db.execute(
+                "ALTER TABLE messages ADD COLUMN body_lines INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(sql_err)?;
+        }
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS messages_inbox_arrival ON messages(recipient, state, arrival_seq);
+             CREATE INDEX IF NOT EXISTS messages_key_arrival ON messages(recipient_key, state, arrival_seq);",
+        )
+        .map_err(sql_err)?;
         // P2 (SWB-R16, R-C950): the claim and handoff tables.
         claims::migrate(&db)?;
         for name in ["audit_hmac_key", "end_token_key", "session_token_key"] {
@@ -550,6 +910,7 @@ impl Store {
             Mutex::new(db),
             clock,
             Mutex::new(ratelimit::Limiter::default()),
+            Mutex::new(GraceHolds::new()),
         ))
     }
     fn keyed_mac(db: &Connection, key_name: &str) -> StoreResult<Hmac<Sha256>> {
@@ -603,24 +964,22 @@ impl Store {
     /// lapse is permanent: the row is marked unbound here, so no later call
     /// can bring the binding or its old token back. Only a new `register`
     /// with `bind: true` binds the key again, under a new token.
-    fn live_binding(db: &Connection, agent_id: &str, now: i64) -> StoreResult<Option<Binding>> {
-        let [harness, host, _, session] = match agent_id.splitn(4, ':').collect::<Vec<_>>()[..] {
-            [a, b, c, d] => [a, b, c, d],
-            _ => return Ok(None),
-        };
-        let row: Option<BindingRow> = db
-            .query_row(
-                "SELECT agent_id, token_nonce, bound, ended, last_seen FROM sessions
-                 WHERE harness=?1 AND host=?2 AND session_id=?3
-                 ORDER BY registered_seq DESC, agent_id DESC LIMIT 1",
-                params![harness, host, session],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()
-            .map_err(sql_err)?;
-        Ok(match row {
-            Some((agent_id, Some(nonce), 1, 0, seen)) if seen >= now - IDLE_MAX_AGE_SECONDS => {
-                Some(Binding { agent_id, nonce })
+    fn live_binding(
+        &self,
+        db: &Connection,
+        agent_id: &str,
+        now: i64,
+    ) -> StoreResult<Option<Binding>> {
+        Ok(match latest_key_row(db, agent_id)? {
+            Some(row) if is_live_binding(&row, now) => {
+                let (agent_id, nonce, ..) = row;
+                let (previous, returned) = self.grace_of(db, &agent_id, now)?;
+                nonce.map(|nonce| Binding {
+                    agent_id,
+                    nonce,
+                    previous,
+                    returned,
+                })
             }
             Some((agent_id, _, 1, _, _)) => {
                 db.execute("UPDATE sessions SET bound=0 WHERE agent_id=?1", [&agent_id])
@@ -630,26 +989,145 @@ impl Store {
             _ => None,
         })
     }
-    /// Whether `presented` is the session token of `binding`.
-    fn token_matches(db: &Connection, binding: &Binding, presented: &str) -> StoreResult<bool> {
+    /// The grace state of `agent_id`'s binding (SWB-R67 as amended, TIN-7577
+    /// comments `41c4704d`, `ff9be66f` and `2f1439dc`): the token its latest
+    /// rotation replaced, as the agent id and nonce it was derived from and
+    /// the grace it is in, while that token is in its grace, and which
+    /// grace, if any, handed back the current token.
+    ///
+    /// A record written by a build that kept no grace number counts as the
+    /// first grace for the previous token and as a spent chain for a
+    /// returned one, which is what that build meant.
+    ///
+    /// The grace runs for [`SESSION_TOKEN_GRACE_SECONDS`] from the rotation
+    /// and ends at whichever comes first of two clocks. On the wall clock,
+    /// the record must come from the row's latest register, so a register by
+    /// a broker that does not keep it voids it, and a wall clock that reads
+    /// before the rotation voids it too. On the monotonic clock, the hold
+    /// this process took at the rotation must match the record and be under
+    /// the grace old. A wall clock that steps back after the rotation
+    /// therefore cannot lengthen the grace (review G4 of #57), and a broker
+    /// restart, which forgets every hold, ends it.
+    fn grace_of(
+        &self,
+        db: &Connection,
+        agent_id: &str,
+        now: i64,
+    ) -> StoreResult<(Option<PreviousToken>, Option<i64>)> {
+        type Grace = (
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let row: Option<Grace> = db
+            .query_row(
+                "SELECT prev_token_agent_id, prev_token_nonce, prev_token_rotated_at,
+                        prev_token_registered_seq, registered_seq, token_returned_seq,
+                        prev_token_grace, token_returned_grace
+                 FROM sessions WHERE agent_id=?1",
+                [agent_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let Some((prev_agent, prev_nonce, at, seq, current, returned_seq, grace, returned_grace)) =
+            row
+        else {
+            return Ok((None, None));
+        };
+        let returned = (returned_seq == Some(current))
+            .then(|| returned_grace.unwrap_or(SESSION_TOKEN_GRACE_CHAIN));
+        let previous = match (prev_agent, prev_nonce, at, seq) {
+            (Some(prev_agent), Some(prev_nonce), Some(at), Some(seq))
+                if seq == current
+                    && (0..SESSION_TOKEN_GRACE_SECONDS).contains(&(now - at))
+                    && self.held_in_grace(agent_id, seq)? =>
+            {
+                Some((prev_agent, prev_nonce, grace.unwrap_or(1)))
+            }
+            _ => None,
+        };
+        Ok((previous, returned))
+    }
+    /// Whether this process holds a grace for `agent_id`'s rotation number
+    /// `seq` that is under [`SESSION_TOKEN_GRACE_SECONDS`] old on the
+    /// monotonic clock.
+    fn held_in_grace(&self, agent_id: &str, seq: i64) -> StoreResult<bool> {
+        let elapsed = |at: i64| self.1.monotonic_millis().saturating_sub(at);
+        Ok(matches!(
+            self.holds()?.get(agent_id),
+            Some((held, at)) if *held == seq
+                && (0..SESSION_TOKEN_GRACE_SECONDS * 1000).contains(&elapsed(*at))
+        ))
+    }
+    fn holds(&self) -> StoreResult<MutexGuard<'_, GraceHolds>> {
+        self.3
+            .lock()
+            .map_err(|_| StoreError::new(ErrorKind::Internal, "grace lock poisoned"))
+    }
+    /// Start the monotonic grace of `agent_id`'s rotation number `seq`, or
+    /// with `None` drop any it had. Holds past the grace are dropped too.
+    fn set_hold(&self, agent_id: &str, seq: Option<i64>) -> StoreResult<()> {
+        let now = self.1.monotonic_millis();
+        let mut holds = self.holds()?;
+        holds.retain(|_, (_, at)| now.saturating_sub(*at) < SESSION_TOKEN_GRACE_SECONDS * 1000);
+        match seq {
+            Some(seq) => holds.insert(agent_id.to_owned(), (seq, now)),
+            None => holds.remove(agent_id),
+        };
+        Ok(())
+    }
+    /// Which token of `binding` `presented` is: its current token, the one
+    /// its latest rotation replaced while that one is in its grace, or
+    /// neither. A token two rotations old, or one never issued, is neither.
+    fn token_match(db: &Connection, binding: &Binding, presented: &str) -> StoreResult<TokenMatch> {
         if presented.len() != SESSION_TOKEN_HEX_LEN {
-            return Ok(false);
+            return Ok(TokenMatch::None);
         }
         let Some(bytes) = unhex(presented) else {
-            return Ok(false);
+            return Ok(TokenMatch::None);
         };
-        Ok(
-            Self::session_token_mac(db, &binding.agent_id, &binding.nonce)?
-                .verify_slice(&bytes)
-                .is_ok(),
-        )
+        if Self::session_token_mac(db, &binding.agent_id, &binding.nonce)?
+            .verify_slice(&bytes)
+            .is_ok()
+        {
+            return Ok(TokenMatch::Current);
+        }
+        Ok(match &binding.previous {
+            Some((agent_id, nonce, _))
+                if Self::session_token_mac(db, agent_id, nonce)?
+                    .verify_slice(&bytes)
+                    .is_ok() =>
+            {
+                TokenMatch::Previous
+            }
+            _ => TokenMatch::None,
+        })
     }
     /// Sender binding (ADR-0003, SWB-R66): may a request act as `agent_id`?
     ///
     /// An id whose delivery key has no live binding needs nothing, as in
     /// v0.4.0, and a token it presents is ignored. While the key is bound,
     /// only the binding's own agent id may act, and only with the session
-    /// token its latest registration returned. Every refusal is
+    /// token its latest registration returned, or for
+    /// [`SESSION_TOKEN_GRACE_SECONDS`] after a rotation, the token that
+    /// rotation replaced (SWB-R67 as amended). Every refusal is
     /// [`ErrorKind::Unauthorized`]. An invalid id passes here so the
     /// operation itself reports it. [`Store::send_as`] (for `from`),
     /// [`Store::inbox_as`], [`Store::ack_as`], [`Store::claim_as`],
@@ -657,13 +1135,15 @@ impl Store {
     /// (for `me`) run this check inside their own transaction.
     pub fn authorize(&self, agent_id: &str, session_token: Option<&str>) -> StoreResult<()> {
         let db = self.db()?;
-        Self::gate(&db, agent_id, session_token, self.now()).map(|_| ())
+        self.gate(&db, agent_id, session_token, self.now())
+            .map(|_| ())
     }
     /// [`Store::authorize`] on `db`, inside the caller's transaction, so the
     /// check and the operation it guards see the same binding (ADR-0003).
     /// `Ok(true)` means `agent_id` holds a live binding and presented its
     /// token; `Ok(false)` means its key is unbound.
     fn gate(
+        &self,
         db: &Connection,
         agent_id: &str,
         session_token: Option<&str>,
@@ -672,7 +1152,7 @@ impl Store {
         if !valid_agent_id(agent_id) {
             return Ok(false);
         }
-        let Some(binding) = Self::live_binding(db, agent_id, now)? else {
+        let Some(binding) = self.live_binding(db, agent_id, now)? else {
             return Ok(false);
         };
         let Some(token) = session_token else {
@@ -683,7 +1163,7 @@ impl Store {
                 "agent id superseded by a bound registration of its session",
             ));
         }
-        if !Self::token_matches(db, &binding, token)? {
+        if Self::token_match(db, &binding, token)? == TokenMatch::None {
             return Err(unauthorized("invalid session token"));
         }
         Ok(true)
@@ -699,8 +1179,10 @@ impl Store {
         Ok(())
     }
     /// Take one send from `sender`'s token bucket, or answer
-    /// [`ErrorKind::RateLimited`] with the seconds until the next one. An
-    /// invalid sender passes, so `send` itself reports it.
+    /// [`ErrorKind::RateLimited`] with the seconds until the next one, in
+    /// the message and in `retry_after`. A refusal is counted by the
+    /// sender's harness kind (TIN-7577). An invalid sender passes, so `send`
+    /// itself reports it.
     pub fn admit_send(&self, sender: &str) -> StoreResult<()> {
         if !valid_agent_id(sender) {
             return Ok(());
@@ -710,19 +1192,28 @@ impl Store {
             .2
             .lock()
             .map_err(|_| StoreError::new(ErrorKind::Internal, "limiter lock poisoned"))?;
-        limiter.admit(sender, now).map_err(|wait| {
-            let message = if wait == u64::MAX {
-                "rate limited".to_owned()
-            } else {
-                format!("rate limited; retry in {wait} s")
-            };
-            StoreError::new(ErrorKind::RateLimited, message)
-        })
+        match limiter.admit(sender, now) {
+            Ok(()) => Ok(()),
+            Err(wait) => {
+                let kind = sender.split(':').next().unwrap_or_default();
+                if let Some(i) = HARNESS_KINDS.iter().position(|k| *k == kind) {
+                    limiter.refused[i] = limiter.refused[i].saturating_add(1);
+                }
+                let message = if wait == u64::MAX {
+                    "rate limited".to_owned()
+                } else {
+                    format!("rate limited; retry in {wait} s")
+                };
+                Err(StoreError::new(ErrorKind::RateLimited, message)
+                    .with_retry_after((wait != u64::MAX).then_some(wait)))
+            }
+        }
     }
     /// Register (or re-register) a self-asserted session and return its
     /// agent id, lease and end token (R-C944). Every registration mints a
-    /// fresh token and invalidates every earlier one, so knowing a row's
-    /// `proc_start` never retrieves the token its registrant holds. A hook
+    /// fresh token and invalidates every earlier one, except a bound
+    /// session's grace register below, so knowing a row's `proc_start`
+    /// never retrieves the token its registrant holds. A hook
     /// that registers on every prompt saves the newest token each time.
     ///
     /// Sender binding (ADR-0003, SWB-R66, SWB-R67): `bind: true` binds the
@@ -731,7 +1222,30 @@ impl Store {
     /// pid, with or without `bind`) must present the current token as
     /// `session_token`, keeps the binding and rotates the token. Every
     /// result says `bound`.
+    ///
+    /// SWB-R67 as amended (Jess, "Short grace for old token", TIN-7577
+    /// comment `41c4704d`, refined by "Grace returns current token", comment
+    /// `ff9be66f`): a rotation records the token it replaced, and for
+    /// [`SESSION_TOKEN_GRACE_SECONDS`] that token is accepted too, here and
+    /// by every operation that needs the session token. A register that
+    /// presents it, from the binding's current agent id, mints nothing: it
+    /// returns the current session token and end token, so a client whose
+    /// reply was lost recovers, and concurrent registers with one saved
+    /// token all get the same answer (review G2 of #57). A token the grace
+    /// returned gets one more grace of its own when it is replaced, and a
+    /// token returned inside that second grace gets none (Jess, "Allow one
+    /// more grace", comment `2f1439dc`), so two holders cannot keep each
+    /// other alive for more than [`SESSION_TOKEN_GRACE_CHAIN`] graces
+    /// (review G1 and H1 of #57). A first bind, or a bind after a lapse,
+    /// records no previous token, so a lost reply to it cannot be
+    /// recovered before the binding lapses.
     pub fn register(&self, input: &Value) -> StoreResult<Value> {
+        self.register_outcome(input).map(|outcome| outcome.result)
+    }
+    /// [`Store::register`], and which grace, if any, answered it, so the
+    /// broker's audit line can tell a grace register from one that minted
+    /// tokens (review H2 of #57). The result is the same either way.
+    pub fn register_outcome(&self, input: &Value) -> StoreResult<RegisterOutcome> {
         let harness = field(input, "harness")?;
         if !valid_harness(harness) {
             return Err("invalid harness".into());
@@ -766,16 +1280,58 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
-        let held = Self::live_binding(&tx, &id, now)?;
+        let held = self.live_binding(&tx, &id, now)?;
         if let Some(binding) = &held {
             let Some(token) = presented else {
                 return Err(unauthorized("session token required"));
             };
-            if !Self::token_matches(&tx, binding, token)? {
-                return Err(unauthorized("invalid session token"));
+            match Self::token_match(&tx, binding, token)? {
+                TokenMatch::Current => {}
+                TokenMatch::Previous if binding.agent_id == id => {
+                    // Inside the grace: return the current tokens and mint
+                    // nothing (TIN-7577 comment `ff9be66f`). The current
+                    // token is marked as handed back by this grace, which
+                    // decides the grace it gets when it is replaced.
+                    let grace = binding.previous.as_ref().map_or(1, |p| p.2);
+                    tx.execute(
+                        "UPDATE sessions SET last_seen=?2, token_returned_seq=registered_seq,
+                                token_returned_grace=?3 WHERE agent_id=?1",
+                        params![binding.agent_id, now, grace],
+                    )
+                    .map_err(sql_err)?;
+                    let result =
+                        Self::register_result(&tx, &binding.agent_id, &binding.nonce, true)?;
+                    tx.commit().map_err(sql_err)?;
+                    return Ok(RegisterOutcome {
+                        result,
+                        grace: Some(grace),
+                    });
+                }
+                // The previous token recovers only the binding's own agent
+                // id; taking the binding to another pid needs the current one.
+                TokenMatch::Previous | TokenMatch::None => {
+                    return Err(unauthorized("invalid session token"));
+                }
             }
         }
         let bound = bind || held.is_some();
+        // The token this register replaces is always the binding's current
+        // one. A token the client received from a minting register gets the
+        // first grace; one a grace handed back gets the next grace of its
+        // chain, and none once the chain is spent (comment `2f1439dc`).
+        let replaced = held.as_ref().and_then(|binding| {
+            let grace = binding.returned.map_or(1, |g| g + 1);
+            (grace <= SESSION_TOKEN_GRACE_CHAIN).then_some((binding, grace))
+        });
+        let (prev_agent, prev_nonce, prev_at, prev_grace) = match replaced {
+            Some((binding, grace)) => (
+                Some(binding.agent_id.clone()),
+                Some(binding.nonce.clone()),
+                Some(now),
+                Some(grace),
+            ),
+            None => (None, None, None, None),
+        };
         let nonce = random_bytes::<16>()?.to_vec();
         tx.execute("INSERT INTO counters(name,value) VALUES('registrations',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
         let seq: i64 = tx
@@ -785,11 +1341,18 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(sql_err)?;
-        tx.execute("INSERT INTO sessions(agent_id,harness,host,proc_start,last_seen,session_id,registered_seq,token_nonce,bound) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+        let prev_seq = prev_at.map(|_| seq);
+        tx.execute("INSERT INTO sessions(agent_id,harness,host,proc_start,last_seen,session_id,registered_seq,token_nonce,bound,
+                      prev_token_agent_id,prev_token_nonce,prev_token_rotated_at,prev_token_registered_seq,prev_token_grace,
+                      token_returned_seq,token_returned_grace)
+                    VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL)
                     ON CONFLICT(agent_id) DO UPDATE SET proc_start=excluded.proc_start,last_seen=excluded.last_seen,ended=0,
                       session_id=excluded.session_id,registered_seq=excluded.registered_seq,token_nonce=excluded.token_nonce,
-                      bound=excluded.bound",
-            params![id,harness,host,proc_start,now,session_id,seq,nonce,bound]).map_err(sql_err)?;
+                      bound=excluded.bound,prev_token_agent_id=excluded.prev_token_agent_id,
+                      prev_token_nonce=excluded.prev_token_nonce,prev_token_rotated_at=excluded.prev_token_rotated_at,
+                      prev_token_registered_seq=excluded.prev_token_registered_seq,prev_token_grace=excluded.prev_token_grace,
+                      token_returned_seq=NULL,token_returned_grace=NULL",
+            params![id,harness,host,proc_start,now,session_id,seq,nonce,bound,prev_agent,prev_nonce,prev_at,prev_seq,prev_grace]).map_err(sql_err)?;
         // The newest registration of a key is the only row that may carry its
         // binding, so an earlier pid's row can never become bound again.
         tx.execute(
@@ -797,17 +1360,33 @@ impl Store {
             params![harness, host, session_id, id],
         )
         .map_err(sql_err)?;
-        let token = hex(&Self::end_token_mac(&tx, &id, &nonce)?
+        let result = Self::register_result(&tx, &id, &nonce, bound)?;
+        tx.commit().map_err(sql_err)?;
+        // The monotonic half of the grace starts once the rotation commits.
+        self.set_hold(&id, prev_seq)?;
+        Ok(RegisterOutcome {
+            result,
+            grace: None,
+        })
+    }
+    /// A register result: the same keys whether the register minted the
+    /// tokens or returned the current ones inside the grace, so the wire
+    /// stays as in v0.5.0.
+    fn register_result(
+        db: &Connection,
+        agent_id: &str,
+        nonce: &[u8],
+        bound: bool,
+    ) -> StoreResult<Value> {
+        let token = hex(&Self::end_token_mac(db, agent_id, nonce)?
             .finalize()
             .into_bytes());
-        let mut result =
-            json!({"agent_id":id,"lease_seconds":LEASE_SECONDS,"end_token":token,"bound":bound});
+        let mut result = json!({"agent_id":agent_id,"lease_seconds":LEASE_SECONDS,"end_token":token,"bound":bound});
         if bound {
-            result["session_token"] = json!(hex(&Self::session_token_mac(&tx, &id, &nonce)?
+            result["session_token"] = json!(hex(&Self::session_token_mac(db, agent_id, nonce)?
                 .finalize()
                 .into_bytes()));
         }
-        tx.commit().map_err(sql_err)?;
         Ok(result)
     }
     /// End a session. Only the end token its latest registration returned
@@ -820,6 +1399,12 @@ impl Store {
     }
     /// [`Store::end`] acting as `me` with its session token. Ending a bound
     /// session lapses its binding for good (ADR-0003).
+    ///
+    /// A bound session's end token has the same grace as its session token
+    /// (TIN-7577 comments `3955641b` and `ff9be66f`): for
+    /// [`SESSION_TOKEN_GRACE_SECONDS`] after a rotation of `me`'s own
+    /// binding, the end token that rotation replaced ends it too. An unbound
+    /// session's end token has no grace.
     pub fn end_as(
         &self,
         me: &str,
@@ -838,7 +1423,7 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
-        Self::gate(&tx, me, session_token, now)?;
+        let bound = self.gate(&tx, me, session_token, now)?;
         let nonce: Option<Option<Vec<u8>>> = tx
             .query_row(
                 "SELECT token_nonce FROM sessions WHERE agent_id=?1",
@@ -847,12 +1432,21 @@ impl Store {
             )
             .optional()
             .map_err(sql_err)?;
-        let matches = match nonce.flatten() {
+        let mut matches = match nonce.flatten() {
             Some(nonce) => Self::end_token_mac(&tx, me, &nonce)?
                 .verify_slice(&presented)
                 .is_ok(),
             None => false,
         };
+        if !matches
+            && bound
+            && let Some((prev_agent, prev_nonce, _)) = self.grace_of(&tx, me, now)?.0
+            && prev_agent == me
+        {
+            matches = Self::end_token_mac(&tx, me, &prev_nonce)?
+                .verify_slice(&presented)
+                .is_ok();
+        }
         if !matches {
             return Ok(json!({"agent_id":me,"state":"unknown"}));
         }
@@ -904,15 +1498,17 @@ impl Store {
         }
         let mut stmt = db
             .prepare(
+                // A4 (TIN-7577): the proc_start filter runs before the
+                // one-row-per-session dedupe, so two live processes of one
+                // session each find their own row.
                 "WITH latest AS (
-                   SELECT agent_id,harness,host,proc_start,last_seen,ended,bound,
+                   SELECT agent_id,harness,host,last_seen,ended,bound,registered_seq,
                      ROW_NUMBER() OVER (PARTITION BY harness,host,COALESCE(session_id,agent_id)
                                         ORDER BY registered_seq DESC, agent_id DESC) AS pos
-                   FROM sessions)
-                 SELECT agent_id,harness,host,last_seen,ended,bound FROM latest
+                   FROM sessions WHERE (?7 IS NULL OR proc_start=?7))
+                 SELECT agent_id,harness,host,last_seen,ended,bound,registered_seq FROM latest
                  WHERE pos=1 AND (?1 IS NULL OR host=?1) AND (?2 IS NULL OR agent_id>?2)
                    AND (?3 OR (ended=0 AND last_seen>=?4-?5))
-                   AND (?7 IS NULL OR proc_start=?7)
                  ORDER BY agent_id LIMIT ?6",
             )
             .map_err(sql_err)?;
@@ -933,11 +1529,18 @@ impl Store {
                     let state = lease_state(seen, ended != 0, now);
                     // SWB-R68: a row is bound while its binding is live.
                     let bound = r.get::<_, i64>(5)? == 1 && matches!(state, "live" | "idle");
-                    Ok(
-                        json!({"agent_id":r.get::<_,String>(0)?,"harness":r.get::<_,String>(1)?,
+                    let mut row = json!({"agent_id":r.get::<_,String>(0)?,"harness":r.get::<_,String>(1)?,
                         "host":r.get::<_,String>(2)?,"last_seen":seen,
-                        "state":state,"bound":bound}),
-                    )
+                        "state":state,"bound":bound});
+                    // Review F2 of #57: a caller that names its own
+                    // proc_start also gets the registration order, so it
+                    // can pick its newest row when two share a last_seen
+                    // second. Rows listed without the filter stay as they
+                    // were.
+                    if query.proc_start.is_some() {
+                        row["registered_seq"] = json!(r.get::<_, i64>(6)?);
+                    }
+                    Ok(row)
                 },
             )
             .map_err(sql_err)?;
@@ -963,12 +1566,11 @@ impl Store {
         if !valid_agent_id(sender) || !valid_agent_id(recipient) {
             return Err("invalid agent id".into());
         }
-        let body = clean(
-            input
-                .get("body")
-                .and_then(Value::as_str)
-                .ok_or("missing body")?,
-        );
+        let raw_body = input
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or("missing body")?;
+        let body = clean_body(raw_body);
         if body.len() > 16384 {
             return Err("body exceeds 16 KiB".into());
         }
@@ -1102,27 +1704,32 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
-        Self::gate(&tx, sender, session_token, now)?;
-        let old: Option<(String, String, String)> = tx
+        self.gate(&tx, sender, session_token, now)?;
+        let old: Option<(String, String, String, String, bool)> = tx
             .query_row(
-                "SELECT sender,body,envelope FROM messages WHERE msg_id=?1",
+                "SELECT sender,body,envelope,recipient,body_lines FROM messages WHERE msg_id=?1",
                 [&msg_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()
             .map_err(sql_err)?;
-        if let Some((old_sender, old_body, envelope)) = old {
+        if let Some((old_sender, old_body, envelope, old_recipient, old_lines)) = old {
             // SWB-R46: disclose neither the stored receipt nor its metadata on conflict.
-            if old_sender != sender || old_body != body {
+            if old_sender != sender || !same_body(&old_body, old_lines, &body, raw_body) {
                 return Err(StoreError::new(ErrorKind::Conflict, "msg_id conflict"));
             }
             let envelope = serde_json::from_str(&envelope)
                 .map_err(|e| StoreError::new(ErrorKind::Internal, e.to_string()))?;
             touch(&tx, sender, now)?;
+            // The stored recipient, not this request's `to`: a replay answers
+            // for the envelope it returns, so it cannot probe another id
+            // without spending a bucket token (TIN-7577).
+            let recipient_state = recipient_state_of(&tx, &old_recipient, now)?;
             tx.commit().map_err(sql_err)?;
             return Ok(SendOutcome {
                 envelope,
                 created: false,
+                recipient_state,
             });
         }
         self.admit_send(sender)?;
@@ -1180,15 +1787,26 @@ impl Store {
             )
             .map_err(sql_err)?;
         map.insert("expires_at".into(), json!(expires_at));
-        tx.execute("INSERT INTO messages(msg_id,thread_id,seq,sender,recipient,body,envelope,created_at,expires_at,recipient_key)
-                    VALUES(?1,?2,?3,?4,?5,?6,?7,?9,?9+?8,?10)",
-            params![msg_id,thread_id,seq,sender,recipient,body,envelope.to_string(),i64::from(ttl)*3600,now,delivery_key(recipient)]).map_err(sql_err)?;
+        // v0.5.1 (TIN-7577): the message's arrival position for inbox paging.
+        tx.execute("INSERT INTO counters(name,value) VALUES('arrival_seq',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
+        let arrival: i64 = tx
+            .query_row(
+                "SELECT value FROM counters WHERE name='arrival_seq'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        tx.execute("INSERT INTO messages(msg_id,thread_id,seq,sender,recipient,body,envelope,created_at,expires_at,recipient_key,arrival_seq,body_lines)
+                    VALUES(?1,?2,?3,?4,?5,?6,?7,?9,?9+?8,?10,?11,1)",
+            params![msg_id,thread_id,seq,sender,recipient,body,envelope.to_string(),i64::from(ttl)*3600,now,delivery_key(recipient),arrival]).map_err(sql_err)?;
         tx.execute("INSERT INTO counters(name,value) VALUES('messages_total',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
         touch(&tx, sender, now)?;
+        let recipient_state = recipient_state_of(&tx, recipient, now)?;
         tx.commit().map_err(sql_err)?;
         Ok(SendOutcome {
             envelope,
             created: true,
+            recipient_state,
         })
     }
     /// Fetch `me`'s unacknowledged messages, as an unbound caller (no
@@ -1208,8 +1826,27 @@ impl Store {
         limit: u32,
         session_token: Option<&str>,
     ) -> StoreResult<Value> {
+        self.inbox_page(me, limit, None, session_token)
+    }
+    /// One page of `me`'s unacknowledged messages, oldest first in arrival
+    /// order (A1, TIN-7577). `after` names a message of this mailbox, in any
+    /// state, and the page starts after it. An id this mailbox never held,
+    /// another mailbox's id and a pruned id all answer `unknown after`.
+    /// The result carries `next_after`: the last msg_id when the page is
+    /// full, so a caller can walk past messages it already holds; `null`
+    /// otherwise. Binding works as in [`Store::inbox_as`].
+    pub fn inbox_page(
+        &self,
+        me: &str,
+        limit: u32,
+        after: Option<&str>,
+        session_token: Option<&str>,
+    ) -> StoreResult<Value> {
         if !valid_agent_id(me) {
             return Err("invalid agent id".into());
+        }
+        if after.is_some_and(|id| !valid_ulid(id)) {
+            return Err("invalid after".into());
         }
         let mut db = self.db()?;
         let now = self.now();
@@ -1217,25 +1854,49 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
         tx.execute("UPDATE messages SET state='expired' WHERE state!='acked' AND state!='expired' AND expires_at<=?1",[now]).map_err(sql_err)?;
-        let by_key = Self::gate(&tx, me, session_token, now)?;
+        let by_key = self.gate(&tx, me, session_token, now)?;
+        let target = if by_key {
+            delivery_key(me)
+        } else {
+            me.to_owned()
+        };
+        let floor: Option<i64> = match after {
+            None => None,
+            Some(id) => {
+                let sql = if by_key {
+                    "SELECT arrival_seq FROM messages WHERE msg_id=?1 AND recipient_key=?2"
+                } else {
+                    "SELECT arrival_seq FROM messages WHERE msg_id=?1 AND recipient=?2"
+                };
+                let found: Option<Option<i64>> = tx
+                    .query_row(sql, params![id, target], |r| r.get(0))
+                    .optional()
+                    .map_err(sql_err)?;
+                Some(
+                    found
+                        .flatten()
+                        .ok_or_else(|| StoreError::new(ErrorKind::Invalid, "unknown after"))?,
+                )
+            }
+        };
         let messages: Vec<(String, String)> = {
             let sql = if by_key {
-                "SELECT msg_id,envelope FROM messages WHERE recipient_key=?1 AND state IN ('queued','notified','fetched') ORDER BY created_at,seq LIMIT ?2"
+                "SELECT msg_id,envelope FROM messages WHERE recipient_key=?1 AND state IN ('queued','notified','fetched') AND (?3 IS NULL OR arrival_seq>?3) ORDER BY arrival_seq,created_at,seq LIMIT ?2"
             } else {
-                "SELECT msg_id,envelope FROM messages WHERE recipient=?1 AND state IN ('queued','notified','fetched') ORDER BY created_at,seq LIMIT ?2"
-            };
-            let target = if by_key {
-                delivery_key(me)
-            } else {
-                me.to_owned()
+                "SELECT msg_id,envelope FROM messages WHERE recipient=?1 AND state IN ('queued','notified','fetched') AND (?3 IS NULL OR arrival_seq>?3) ORDER BY arrival_seq,created_at,seq LIMIT ?2"
             };
             let mut stmt = tx.prepare(sql).map_err(sql_err)?;
             let rows = stmt
-                .query_map(params![target, limit.min(100)], |r| {
+                .query_map(params![target, limit.min(100), floor], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })
                 .map_err(sql_err)?;
             rows.collect::<Result<_, _>>().map_err(sql_err)?
+        };
+        let next_after = if limit > 0 && messages.len() == limit.min(100) as usize {
+            messages.last().map(|(id, _)| id.clone())
+        } else {
+            None
         };
         for (id, _) in &messages {
             tx.execute("UPDATE messages SET state='fetched',delivery_count=delivery_count+1 WHERE msg_id=?1",[id]).map_err(sql_err)?;
@@ -1258,7 +1919,7 @@ impl Store {
             })
             .collect::<StoreResult<Vec<_>>>()?;
         tx.commit().map_err(sql_err)?;
-        Ok(json!({"messages":values}))
+        Ok(json!({"messages":values,"next_after":next_after}))
     }
     /// The thread id, seq, in_reply_to and ticket of a stored message, for
     /// the broker's audit line (ADR-0002 L1-lite). Metadata only, never the
@@ -1303,7 +1964,7 @@ impl Store {
         let db = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
-        let key = if Self::gate(&db, me, session_token, now)? {
+        let key = if self.gate(&db, me, session_token, now)? {
             Some(delivery_key(me))
         } else {
             None
@@ -1366,9 +2027,29 @@ impl Store {
             .optional()
             .map_err(sql_err)?
             .unwrap_or(0);
-        Ok(format!(
+        let mut text = format!(
             "# TYPE swb_messages_total counter\nswb_messages_total {sent}\n# TYPE swb_mailbox_unacked gauge\nswb_mailbox_unacked {unacked}\n# TYPE swb_sessions gauge\nswb_sessions{{state=\"live\"}} {live}\n# TYPE swb_claims_active gauge\nswb_claims_active {claims_active}\n# TYPE swb_claim_overlaps gauge\nswb_claim_overlaps {claim_overlaps}\n# TYPE swb_handoffs_total counter\nswb_handoffs_total {handoffs}\n"
-        ))
+        );
+        // TIN-7577: send refusals by harness kind and the limit's settings.
+        // The lock order is the store, then the limiter, as in send_as.
+        // No series carries an agent id.
+        let limiter = self
+            .2
+            .lock()
+            .map_err(|_| StoreError::new(ErrorKind::Internal, "limiter lock poisoned"))?;
+        text.push_str("# TYPE swb_send_rate_limited_total counter\n");
+        for (kind, count) in HARNESS_KINDS.iter().zip(limiter.refused) {
+            text.push_str(&format!(
+                "swb_send_rate_limited_total{{harness=\"{kind}\"}} {count}\n"
+            ));
+        }
+        text.push_str(&format!(
+            "# TYPE swb_send_limit_burst gauge\nswb_send_limit_burst {}\n# TYPE swb_send_limit_refill_per_minute gauge\nswb_send_limit_refill_per_minute {}\n# TYPE swb_send_buckets gauge\nswb_send_buckets {}\n",
+            limiter.limit.burst,
+            limiter.limit.refill_per_minute,
+            limiter.buckets_held()
+        ));
+        Ok(text)
     }
 }
 #[cfg(test)]
@@ -1429,7 +2110,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_clock_moves_only_forward_and_only_when_told() {
+    fn manual_clock_moves_only_when_told() {
         let clock = ManualClock::new(T0);
         assert_eq!(clock.now(), T0);
         assert_eq!(clock.now(), T0);
@@ -1438,6 +2119,11 @@ mod tests {
         assert_eq!(clock.advance(u32::MAX), T0 + 901 + i64::from(u32::MAX));
         let shared: Arc<dyn Clock> = Arc::new(ManualClock::new(5));
         assert_eq!(shared.now(), 5);
+        // A wall step back leaves the monotonic reading where it was.
+        let mono = clock.monotonic_millis();
+        assert_eq!(clock.step_wall_back(1), T0 + 900 + i64::from(u32::MAX));
+        assert_eq!(clock.monotonic_millis(), mono);
+        assert!(SystemClock.monotonic_millis() <= SystemClock.monotonic_millis());
     }
 
     #[test]
@@ -1681,8 +2367,10 @@ mod tests {
                 .kind,
             ErrorKind::Unauthorized
         );
-        // SWB-R67: every re-register by the holder rotates the token, and the
-        // old one stops working. Registering without bind keeps the binding.
+        // SWB-R67: every re-register by the holder rotates the token.
+        // Registering without bind keeps the binding. As amended (TIN-7577
+        // comment 41c4704d) the old token keeps working for the grace;
+        // the clocked tests below cover its end.
         let again = s
             .register(
                 &json!({"harness":"hermes","host":"sting","pid":100,"session_id":"svc",
@@ -1692,10 +2380,7 @@ mod tests {
         assert_eq!(again["bound"], true);
         let rotated = token_of(&again);
         assert_ne!(rotated, token);
-        assert_eq!(
-            s.authorize(me, Some(&token)).unwrap_err(),
-            "invalid session token"
-        );
+        s.authorize(me, Some(&token)).unwrap();
         s.authorize(me, Some(&rotated)).unwrap();
         // Another session id on the same host is its own, unbound key.
         s.authorize("hermes:sting:100:other", None).unwrap();
@@ -1829,6 +2514,649 @@ mod tests {
         assert_eq!(s.peers(&all()).unwrap()["peers"][0]["bound"], false);
         let taken = reg(&s, "hermes", "sting", 100, "svc", "start-100");
         assert_eq!(taken["bound"], false);
+    }
+
+    /// Re-register a bound key as `pid` presenting `token`, the way the
+    /// client does with the token it saved.
+    fn rotate(s: &Store, pid: u32, token: &str) -> StoreResult<Value> {
+        s.register(
+            &json!({"harness":"hermes","host":"sting","pid":pid,"session_id":"svc",
+            "proc_start":format!("start-{pid}"),"session_token":token}),
+        )
+    }
+
+    /// The register result keys, so a v0.5.0 client sees the same shape.
+    fn keys(v: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The registrations counter, which a register that mints a token
+    /// moves and a register answered inside the grace does not.
+    fn registrations(s: &Store) -> i64 {
+        s.0.lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM counters WHERE name='registrations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Review F4 of #57, SWB-R67 as amended (TIN-7577 comments 41c4704d and
+    /// ff9be66f): the broker commits a rotation and the reply is lost to the
+    /// client deadline, so the client still holds the old token. Within the
+    /// grace it can read and send, and a register with it, by the same pid
+    /// or by a restarted one, returns the tokens the lost reply carried and
+    /// mints nothing.
+    #[test]
+    fn a_lost_register_reply_recovers_the_current_tokens_within_the_grace() {
+        let grace = u32::try_from(SESSION_TOKEN_GRACE_SECONDS).unwrap();
+        for new_pid in [100, 200] {
+            let (s, clock) = clocked();
+            let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+            let old_id = first["agent_id"].as_str().unwrap().to_owned();
+            let held = token_of(&first);
+            // The rotation commits; its reply never reaches the client.
+            let lost = rotate(&s, new_pid, &held).unwrap();
+            assert_eq!(
+                keys(&lost),
+                [
+                    "agent_id",
+                    "bound",
+                    "end_token",
+                    "lease_seconds",
+                    "session_token"
+                ]
+            );
+            let me = lost["agent_id"].as_str().unwrap().to_owned();
+            assert_ne!(token_of(&lost), held);
+            let minted = registrations(&s);
+            clock.advance(grace - 1);
+            // The saved token still acts as the binding inside the grace.
+            s.authorize(&me, Some(&held)).unwrap();
+            s.inbox_as(&me, 10, Some(&held)).unwrap();
+            s.send_as(
+                &json!({"from":me,"to":"claude:honey:1:a","ticket":"none","body":"b"}),
+                Some(&held),
+            )
+            .unwrap();
+            // A restarted pid's old id stays superseded, token or not.
+            if me != old_id {
+                assert_eq!(
+                    s.authorize(&old_id, Some(&held)).unwrap_err(),
+                    "agent id superseded by a bound registration of its session"
+                );
+            }
+            // Registering again with it returns exactly the lost reply.
+            let recovered = rotate(&s, new_pid, &held).unwrap();
+            assert_eq!(recovered, lost);
+            assert_eq!(registrations(&s), minted, "nothing was minted");
+            s.authorize(&me, Some(&token_of(&recovered))).unwrap();
+            // The grace still ends 60 seconds after the one rotation.
+            clock.advance(1);
+            assert_eq!(
+                s.authorize(&me, Some(&held)).unwrap_err(),
+                "invalid session token"
+            );
+            assert_eq!(
+                rotate(&s, new_pid, &held).unwrap_err(),
+                "invalid session token"
+            );
+            s.authorize(&me, Some(&token_of(&recovered))).unwrap();
+        }
+    }
+
+    /// Review G1 of #57, the ping-pong: a holder of a replaced token and the
+    /// client alternate registers 59 seconds apart, each saving the token
+    /// its reply carries. Under 41c4704d alone each register made the other
+    /// side's token the previous one, so both stayed valid for ever. Now the
+    /// leaked token only fetches the current one, and a fetched token gets
+    /// one more grace and no more ("Allow one more grace", TIN-7577 comment
+    /// 2f1439dc), so the leaked side fetches twice and is then shut out for
+    /// good, while the client is never refused.
+    #[test]
+    fn the_g1_ping_pong_ends_after_two_graces() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        // A copy of t0 leaks; the client then rotates to t1.
+        let mut leaked = token_of(&first);
+        let mut client = token_of(&rotate(&s, 100, &leaked).unwrap());
+        let mut refused_at = None;
+        let mut fetches = Vec::new();
+        for round in 0..200u32 {
+            clock.advance(59);
+            let leaker = round % 2 == 0;
+            let presented = if leaker { &leaked } else { &client }.clone();
+            match s.register_outcome(&json!({"harness":"hermes","host":"sting","pid":100,
+                "session_id":"svc","proc_start":"start-100","session_token":presented}))
+            {
+                Ok(outcome) if leaker => {
+                    fetches.push(outcome.grace);
+                    leaked = token_of(&outcome.result);
+                }
+                Ok(outcome) => client = token_of(&outcome.result),
+                Err(e) => {
+                    assert_eq!(e, "invalid session token", "round {round}");
+                    assert!(leaker, "the client is never refused");
+                    refused_at.get_or_insert(round);
+                }
+            }
+            if refused_at.is_some() {
+                assert_eq!(
+                    s.authorize(&me, Some(&leaked)).unwrap_err(),
+                    "invalid session token",
+                    "round {round}"
+                );
+            }
+            s.authorize(&me, Some(&client)).unwrap();
+        }
+        // Round 0: t0 fetched t1 in the first grace. Round 1: the client
+        // rotated t1, which a grace had handed back, so t1 got the second
+        // grace. Round 2: t1 fetched t2 in it. Round 3: the client rotated
+        // t2, which the second grace handed back, so t2 got no grace.
+        // Round 4: the leaked side is refused, and stays refused.
+        assert_eq!(fetches, [Some(1), Some(2)]);
+        assert_eq!(refused_at, Some(4));
+    }
+
+    /// The same ping-pong at its fastest: the client registers as soon as
+    /// the leaked side has fetched, and the leaked side fetches at the last
+    /// second of each grace. The leaked side is refused within two grace
+    /// windows of the first rotation, so a leaked token never lives on
+    /// indefinitely through the grace (TIN-7577 comment 2f1439dc).
+    #[test]
+    fn the_g1_ping_pong_ends_within_two_grace_windows() {
+        let grace = u32::try_from(SESSION_TOKEN_GRACE_SECONDS).unwrap();
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let mut leaked = token_of(&first);
+        let mut client = token_of(&rotate(&s, 100, &leaked).unwrap());
+        let rotated_at = clock.now();
+        let mut fetches = 0;
+        while s.authorize(&me, Some(&leaked)).is_ok() {
+            assert!(fetches < 2, "the leaked side fetched a third time");
+            clock.advance(grace - 1);
+            leaked = token_of(&rotate(&s, 100, &leaked).unwrap());
+            fetches += 1;
+            client = token_of(&rotate(&s, 100, &client).unwrap());
+        }
+        // Shut out at the client's register 118 seconds after the first
+        // rotation, and for good: no later register lets it back in.
+        assert!(clock.now() - rotated_at < 2 * SESSION_TOKEN_GRACE_SECONDS);
+        assert_eq!(fetches, 2);
+        assert_eq!(
+            rotate(&s, 100, &leaked).unwrap_err(),
+            "invalid session token"
+        );
+        clock.advance(1);
+        client = token_of(&rotate(&s, 100, &client).unwrap());
+        assert_eq!(
+            s.authorize(&me, Some(&leaked)).unwrap_err(),
+            "invalid session token"
+        );
+        s.authorize(&me, Some(&client)).unwrap();
+    }
+
+    /// A register whose reply is lost, then the client's retry with the
+    /// token it holds: the token the retry recovered, and which grace
+    /// answered it.
+    fn lose_and_retry(s: &Store, held: &str) -> StoreResult<(String, Option<i64>)> {
+        let lost = rotate(s, 100, held)?;
+        let retry = s.register_outcome(&json!({"harness":"hermes","host":"sting","pid":100,
+            "session_id":"svc","proc_start":"start-100","session_token":held}))?;
+        assert_eq!(retry.result, lost, "the retry returns the lost reply");
+        Ok((token_of(&retry.result), retry.grace))
+    }
+
+    /// H1 of review 5740636770, "Allow one more grace" (TIN-7577 comment
+    /// 2f1439dc): two register replies lost in a row both recover. The
+    /// second retry presents a token the first grace handed back, and that
+    /// token has a grace of its own.
+    #[test]
+    fn two_consecutive_lost_replies_recover() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let (t1, grace) = lose_and_retry(&s, &token_of(&first)).unwrap();
+        assert_eq!(grace, Some(1));
+        clock.advance(30);
+        let (t2, grace) = lose_and_retry(&s, &t1).unwrap();
+        assert_eq!(grace, Some(2));
+        s.authorize(&me, Some(&t2)).unwrap();
+        s.inbox_as(&me, 10, Some(&t2)).unwrap();
+        // The second grace ends 60 seconds after its rotation, as the first.
+        clock.advance(u32::try_from(SESSION_TOKEN_GRACE_SECONDS).unwrap());
+        assert_eq!(
+            s.authorize(&me, Some(&t1)).unwrap_err(),
+            "invalid session token"
+        );
+        s.authorize(&me, Some(&t2)).unwrap();
+    }
+
+    /// The chain stops after the second grace: a third register reply lost
+    /// in a row leaves the client with a token that has no grace, so its
+    /// retry is refused and the key is locked out until the binding lapses.
+    #[test]
+    fn a_third_consecutive_lost_reply_does_not_recover() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let (t1, _) = lose_and_retry(&s, &token_of(&first)).unwrap();
+        clock.advance(30);
+        let (t2, _) = lose_and_retry(&s, &t1).unwrap();
+        clock.advance(30);
+        let lost = rotate(&s, 100, &t2).unwrap();
+        assert_eq!(rotate(&s, 100, &t2).unwrap_err(), "invalid session token");
+        assert_eq!(
+            s.authorize(&me, Some(&t2)).unwrap_err(),
+            "invalid session token"
+        );
+        // Only the lost reply's token acts as the binding now.
+        s.authorize(&me, Some(&token_of(&lost))).unwrap();
+    }
+
+    /// A register that mints a token the client receives starts a new
+    /// chain, so after two recovered losses and one good register, a lost
+    /// reply recovers again in the first grace.
+    #[test]
+    fn a_register_that_mints_starts_a_new_chain() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let (t1, _) = lose_and_retry(&s, &token_of(&first)).unwrap();
+        let (t2, _) = lose_and_retry(&s, &t1).unwrap();
+        clock.advance(120);
+        let received = s
+            .register_outcome(&json!({"harness":"hermes","host":"sting","pid":100,
+                "session_id":"svc","proc_start":"start-100","session_token":t2}))
+            .unwrap();
+        assert_eq!(received.grace, None, "it minted");
+        clock.advance(120);
+        let (_, grace) = lose_and_retry(&s, &token_of(&received.result)).unwrap();
+        assert_eq!(grace, Some(1));
+    }
+
+    /// H1 of review 5740636770, probe q2: two concurrent registers with one
+    /// saved token make the second a grace register, so the token both
+    /// replies carry was handed back by a grace. Ten minutes later one lost
+    /// reply still recovers, in that token's second grace.
+    #[test]
+    fn concurrent_registers_then_one_lost_reply_recover() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let saved = token_of(&first);
+        let one = rotate(&s, 100, &saved).unwrap();
+        let two = s
+            .register_outcome(&json!({"harness":"hermes","host":"sting","pid":100,
+                "session_id":"svc","proc_start":"start-100","session_token":saved}))
+            .unwrap();
+        assert_eq!(two.result, one);
+        assert_eq!(two.grace, Some(1));
+        clock.advance(600);
+        let (recovered, grace) = lose_and_retry(&s, &token_of(&one)).unwrap();
+        assert_eq!(grace, Some(2));
+        s.authorize(&me, Some(&recovered)).unwrap();
+    }
+
+    /// A wall clock that steps forward inside the grace ends it at once:
+    /// the grace ends on whichever clock reaches 60 seconds first, so it
+    /// fails closed and the client must hold the current token.
+    #[test]
+    fn a_forward_wall_clock_step_inside_the_grace_ends_it() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let old = token_of(&first);
+        let current = token_of(&rotate(&s, 100, &old).unwrap());
+        clock.advance(10);
+        s.authorize(&me, Some(&old)).unwrap();
+        clock.step_wall_forward(120);
+        assert_eq!(
+            s.authorize(&me, Some(&old)).unwrap_err(),
+            "invalid session token"
+        );
+        assert_eq!(rotate(&s, 100, &old).unwrap_err(), "invalid session token");
+        s.authorize(&me, Some(&current)).unwrap();
+    }
+
+    /// A first bind has no previous token, so if its reply is lost the
+    /// client holds no token: every register of the key is refused until
+    /// the binding lapses after the idle limit. SECURITY.md lists this case.
+    #[test]
+    fn a_lost_reply_to_the_first_bind_locks_the_key_until_it_lapses() {
+        let (s, clock) = clocked();
+        let lost = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = lost["agent_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            bind(&s, "hermes", "sting", 100, "svc", None).unwrap_err(),
+            "session token required"
+        );
+        clock.advance(u32::try_from(IDLE_MAX_AGE_SECONDS).unwrap() + 1);
+        s.authorize(&me, None).unwrap();
+        assert_eq!(
+            bind(&s, "hermes", "sting", 100, "svc", None).unwrap()["bound"],
+            true
+        );
+    }
+
+    /// Review G2 of #57: two registers that present one saved token at the
+    /// same moment, as a hook and a doctor of one session can, get the same
+    /// answer, so the saved file holds the current token whichever reply is
+    /// written last.
+    #[test]
+    fn concurrent_registers_with_one_saved_token_converge() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let saved = token_of(&first);
+        let one = rotate(&s, 100, &saved).unwrap();
+        let two = rotate(&s, 100, &saved).unwrap();
+        assert_eq!(one, two);
+        // Long after the grace, the token either reply wrote still works,
+        // and so does the end token, for a register and for end.
+        clock.advance(u32::try_from(SESSION_TOKEN_GRACE_SECONDS).unwrap() * 10);
+        s.authorize(&me, Some(&token_of(&two))).unwrap();
+        assert_eq!(
+            rotate(&s, 100, &saved).unwrap_err(),
+            "invalid session token"
+        );
+        let next = rotate(&s, 100, &token_of(&one)).unwrap();
+        assert_ne!(token_of(&next), token_of(&one));
+        assert_eq!(
+            s.end_as(
+                &me,
+                next["end_token"].as_str().unwrap(),
+                Some(&token_of(&next))
+            )
+            .unwrap()["state"],
+            "ended"
+        );
+    }
+
+    /// Review G4 of #57: a wall clock that steps back after a rotation
+    /// cannot lengthen the grace. It still ends 60 seconds after the
+    /// rotation on the monotonic clock.
+    #[test]
+    fn a_clock_step_back_after_a_rotation_does_not_extend_the_grace() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let old = token_of(&first);
+        let current = token_of(&rotate(&s, 100, &old).unwrap());
+        // Rotate at T. At T+50 the wall clock steps back 40 seconds.
+        clock.advance(50);
+        clock.step_wall_back(40);
+        s.authorize(&me, Some(&old)).unwrap();
+        // 60 real seconds after the rotation the wall clock reads T+20,
+        // and the old token is refused all the same.
+        clock.advance(10);
+        assert_eq!(clock.now(), T0 + 20);
+        assert_eq!(
+            s.authorize(&me, Some(&old)).unwrap_err(),
+            "invalid session token"
+        );
+        assert_eq!(rotate(&s, 100, &old).unwrap_err(), "invalid session token");
+        assert_eq!(
+            s.end_as(&me, first["end_token"].as_str().unwrap(), Some(&current))
+                .unwrap()["state"],
+            "unknown"
+        );
+        s.authorize(&me, Some(&current)).unwrap();
+        // A wall clock that reads before the rotation voids the grace too.
+        let next = rotate(&s, 100, &current).unwrap();
+        clock.step_wall_back(1);
+        assert_eq!(
+            s.authorize(&me, Some(&current)).unwrap_err(),
+            "invalid session token"
+        );
+        s.authorize(&me, Some(&token_of(&next))).unwrap();
+    }
+
+    /// The monotonic half of the grace lives in the broker process only, so
+    /// a broker restart ends every grace: the previous token is refused
+    /// while the current one keeps working (fails closed).
+    #[test]
+    fn a_broker_restart_ends_the_grace() {
+        let dir = std::env::temp_dir().join(format!("swb-grace-{}", Ulid::new()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("swb.sqlite");
+        let clock = Arc::new(ManualClock::new(T0));
+        let (me, old, current) = {
+            let s = Store::open_with_clock(&path, clock.clone()).unwrap();
+            let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+            let old = token_of(&first);
+            let current = token_of(&rotate(&s, 100, &old).unwrap());
+            s.authorize(first["agent_id"].as_str().unwrap(), Some(&old))
+                .unwrap();
+            (first["agent_id"].as_str().unwrap().to_owned(), old, current)
+        };
+        let s = Store::open_with_clock(&path, clock.clone()).unwrap();
+        assert_eq!(
+            s.authorize(&me, Some(&old)).unwrap_err(),
+            "invalid session token"
+        );
+        assert_eq!(rotate(&s, 100, &old).unwrap_err(), "invalid session token");
+        s.authorize(&me, Some(&current)).unwrap();
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// TIN-7577 comment 3955641b: a bound session's end token has the same
+    /// grace. Inside it the end token the rotation replaced ends the
+    /// session; after it, that end token answers `unknown`.
+    #[test]
+    fn a_bound_end_token_has_the_same_grace() {
+        let grace = u32::try_from(SESSION_TOKEN_GRACE_SECONDS).unwrap();
+        for (wait, state) in [(grace - 1, "ended"), (grace, "unknown")] {
+            let (s, clock) = clocked();
+            let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+            let me = first["agent_id"].as_str().unwrap().to_owned();
+            let lost = rotate(&s, 100, &token_of(&first)).unwrap();
+            clock.advance(wait);
+            assert_eq!(
+                s.end_as(
+                    &me,
+                    first["end_token"].as_str().unwrap(),
+                    Some(&token_of(&lost))
+                )
+                .unwrap()["state"],
+                state
+            );
+        }
+        // A register inside the grace returns the current end token, which
+        // keeps working after the grace; the replaced one stops.
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let lost = rotate(&s, 100, &token_of(&first)).unwrap();
+        let recovered = rotate(&s, 100, &token_of(&first)).unwrap();
+        assert_eq!(recovered["end_token"], lost["end_token"]);
+        clock.advance(grace);
+        assert_eq!(
+            s.end_as(
+                &me,
+                first["end_token"].as_str().unwrap(),
+                Some(&token_of(&recovered))
+            )
+            .unwrap()["state"],
+            "unknown"
+        );
+        assert_eq!(
+            s.end_as(
+                &me,
+                recovered["end_token"].as_str().unwrap(),
+                Some(&token_of(&recovered))
+            )
+            .unwrap()["state"],
+            "ended"
+        );
+    }
+
+    /// Review G6 of #57: `spec/dhall/Broker.dhall` states the grace and the
+    /// token length, `just spec-dhall` ties it to the rendered
+    /// `broker-constants.json`, and this test ties that file to the store's
+    /// constants.
+    #[test]
+    fn the_dhall_binding_constants_match_the_store() {
+        let constants: Value = serde_json::from_str(include_str!(
+            "../../../spec/dhall/generated/broker-constants.json"
+        ))
+        .unwrap();
+        let binding = &constants["binding"];
+        assert_eq!(
+            binding["session_token_grace_seconds"],
+            json!(SESSION_TOKEN_GRACE_SECONDS),
+            "Broker.dhall and SESSION_TOKEN_GRACE_SECONDS disagree"
+        );
+        assert_eq!(
+            binding["session_token_hex_length"],
+            json!(SESSION_TOKEN_HEX_LEN),
+            "Broker.dhall and SESSION_TOKEN_HEX_LEN disagree"
+        );
+        assert_eq!(
+            binding["session_token_grace_chain"],
+            json!(SESSION_TOKEN_GRACE_CHAIN),
+            "Broker.dhall and SESSION_TOKEN_GRACE_CHAIN disagree"
+        );
+        assert_eq!(
+            constants["session"]["end_token_hex_length"],
+            json!(END_TOKEN_HEX_LEN)
+        );
+    }
+
+    /// SWB-R67 as amended: the previous token is accepted until the grace
+    /// ends and refused from then on, for every operation and for register.
+    #[test]
+    fn the_previous_token_is_refused_after_the_grace() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let old = token_of(&first);
+        let current = token_of(&rotate(&s, 100, &old).unwrap());
+        clock.advance(u32::try_from(SESSION_TOKEN_GRACE_SECONDS).unwrap() - 1);
+        s.authorize(&me, Some(&old)).unwrap();
+        clock.advance(1);
+        assert_eq!(
+            s.authorize(&me, Some(&old)).unwrap_err(),
+            "invalid session token"
+        );
+        assert_eq!(
+            s.inbox_as(&me, 10, Some(&old)).unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+        assert_eq!(rotate(&s, 100, &old).unwrap_err(), "invalid session token");
+        // The binding and its current token are untouched.
+        s.authorize(&me, Some(&current)).unwrap();
+        assert_eq!(s.peers(&all()).unwrap()["peers"][0]["bound"], true);
+    }
+
+    /// SWB-R67 as amended: only the token the latest rotation replaced is
+    /// accepted. A token two rotations old, or one never issued, is refused
+    /// even inside the grace, and the previous token recovers only the
+    /// binding's own agent id.
+    #[test]
+    fn a_token_two_rotations_old_is_refused() {
+        let (s, _clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let t0 = token_of(&first);
+        let t1 = token_of(&rotate(&s, 100, &t0).unwrap());
+        let t2 = token_of(&rotate(&s, 100, &t1).unwrap());
+        assert_eq!(
+            s.authorize(&me, Some(&t0)).unwrap_err(),
+            "invalid session token"
+        );
+        assert_eq!(
+            s.inbox_as(&me, 10, Some(&t0)).unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+        assert_eq!(rotate(&s, 100, &t0).unwrap_err(), "invalid session token");
+        for never in ["0".repeat(64), "f".repeat(64)] {
+            assert_eq!(
+                s.authorize(&me, Some(&never)).unwrap_err(),
+                "invalid session token"
+            );
+        }
+        // The immediately previous token and the current one both work.
+        s.authorize(&me, Some(&t1)).unwrap();
+        s.authorize(&me, Some(&t2)).unwrap();
+        // The previous token cannot move the binding to another pid.
+        assert_eq!(rotate(&s, 300, &t1).unwrap_err(), "invalid session token");
+        assert_eq!(s.peers(&all()).unwrap()["peers"][0]["agent_id"], me);
+        // From the binding's own pid it returns t2 and rotates nothing.
+        assert_eq!(token_of(&rotate(&s, 100, &t1).unwrap()), t2);
+        s.authorize(&me, Some(&t1)).unwrap();
+        // Ending the session lapses the binding; a new bind records no
+        // previous token, so nothing from before the lapse works again.
+        let last = rotate(&s, 100, &t2).unwrap();
+        let t3 = token_of(&last);
+        s.end_as(&me, last["end_token"].as_str().unwrap(), Some(&t3))
+            .unwrap();
+        let rebound = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        for old in [&t2, &t3] {
+            assert_eq!(
+                s.authorize(&me, Some(old)).unwrap_err(),
+                "invalid session token"
+            );
+        }
+        s.authorize(&me, Some(&token_of(&rebound))).unwrap();
+    }
+
+    /// A broker without the grace record (v0.5.0 after a downgrade) updates
+    /// the row's nonce and registered_seq but not the record. The stale
+    /// record then grants nothing.
+    #[test]
+    fn a_register_that_keeps_no_grace_record_voids_it() {
+        let (s, _clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let t0 = token_of(&first);
+        rotate(&s, 100, &t0).unwrap();
+        s.authorize(&me, Some(&t0)).unwrap();
+        s.0.lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET registered_seq=registered_seq+1, token_nonce=?2 WHERE agent_id=?1",
+                params![me, vec![7u8; 16]],
+            )
+            .unwrap();
+        assert_eq!(
+            s.authorize(&me, Some(&t0)).unwrap_err(),
+            "invalid session token"
+        );
+    }
+
+    /// The grace touches only bound keys. An unbound id needs no token,
+    /// ignores one, gets no session token, and its end token still rotates
+    /// on every register with no grace.
+    #[test]
+    fn the_unbound_path_is_unchanged_by_the_token_grace() {
+        let (s, _clock) = clocked();
+        let first = reg(&s, "claude", "honey", 1, "a", "1");
+        assert_eq!(
+            keys(&first),
+            ["agent_id", "bound", "end_token", "lease_seconds"]
+        );
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let again = reg(&s, "claude", "honey", 1, "a", "1");
+        assert_eq!(again["bound"], false);
+        assert!(again.get("session_token").is_none());
+        s.authorize(&me, None).unwrap();
+        s.authorize(&me, Some(&"0".repeat(64))).unwrap();
+        s.inbox(&me, 10).unwrap();
+        assert_eq!(
+            s.end(&me, first["end_token"].as_str().unwrap()).unwrap()["state"],
+            "unknown"
+        );
+        assert_eq!(
+            s.end(&me, again["end_token"].as_str().unwrap()).unwrap()["state"],
+            "ended"
+        );
     }
 
     /// Review of #54: a lapse is permanent. A tokenless call after the lapse
@@ -1992,6 +3320,67 @@ mod tests {
         assert_eq!(SendLimit::default().burst, SEND_BURST_DEFAULT);
     }
 
+    /// TIN-7577: refusals are counted by harness kind, and /metrics shows
+    /// them with the limit settings, with no agent id.
+    #[test]
+    fn rate_limit_refusals_are_counted_by_harness_kind() {
+        let (s, _clock) = clocked();
+        s.set_send_limit(SendLimit {
+            burst: 1,
+            refill_per_minute: 6,
+        })
+        .unwrap();
+        for sender in ["claude:host-a:1:a", "codex:host-b:2:b"] {
+            s.admit_send(sender).unwrap();
+            let refused = s.admit_send(sender).unwrap_err();
+            assert_eq!(refused.kind, ErrorKind::RateLimited);
+            assert_eq!(refused.retry_after, Some(10));
+            assert_eq!(refused, "rate limited; retry in 10 s");
+        }
+        let text = s.metrics().unwrap();
+        for line in [
+            "# TYPE swb_send_rate_limited_total counter\n",
+            "swb_send_rate_limited_total{harness=\"claude\"} 1\n",
+            "swb_send_rate_limited_total{harness=\"codex\"} 1\n",
+            "swb_send_rate_limited_total{harness=\"kimi\"} 0\n",
+            "swb_send_limit_burst 1\n",
+            "swb_send_limit_refill_per_minute 6\n",
+            "swb_send_buckets 2\n",
+        ] {
+            assert!(text.contains(line), "{line:?} not in {text}");
+        }
+        assert_eq!(
+            text.matches("swb_send_rate_limited_total{").count(),
+            HARNESS_KINDS.len()
+        );
+        assert!(
+            !text.contains("host-a") && !text.contains("host-b"),
+            "{text}"
+        );
+        // Other errors carry no retry_after.
+        assert_eq!(StoreError::new(ErrorKind::Invalid, "x").retry_after, None);
+    }
+
+    #[test]
+    fn retry_after_is_none_when_the_bucket_never_refills() {
+        let s = Store::memory().unwrap();
+        s.set_send_limit(SendLimit {
+            burst: 1,
+            refill_per_minute: 0,
+        })
+        .unwrap();
+        let me = "pi:host-b:2:b";
+        s.admit_send(me).unwrap();
+        let refused = s.admit_send(me).unwrap_err();
+        assert_eq!(refused, "rate limited");
+        assert_eq!(refused.retry_after, None);
+        assert!(
+            s.metrics()
+                .unwrap()
+                .contains("swb_send_rate_limited_total{harness=\"pi\"} 1\n")
+        );
+    }
+
     #[test]
     fn an_older_store_gains_delivery_keys_for_its_messages() {
         let path = std::env::temp_dir().join(format!("swb-key-{}.sqlite3", Ulid::new()));
@@ -2031,6 +3420,205 @@ mod tests {
             )
             .unwrap();
         assert_eq!(read["messages"][0]["msg_id"], id.as_str());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A ULID string with the given value. A small value gives a small,
+    /// canonical id, so a test can choose the msg_id order.
+    fn ulid_of(value: u128) -> String {
+        Ulid(value << 80).to_string()
+    }
+
+    fn no_send_limit(s: &Store) {
+        s.set_send_limit(SendLimit {
+            burst: 0,
+            refill_per_minute: 0,
+        })
+        .unwrap();
+    }
+
+    fn page_ids(page: &Value) -> Vec<String> {
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["msg_id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// A1 (TIN-7577): a reader walks past a full page of messages it holds.
+    #[test]
+    fn inbox_pages_past_a_full_page_with_next_after() {
+        let (s, _clock) = clocked();
+        no_send_limit(&s);
+        let to = "pi:host-b:2:b";
+        // The msg_ids fall as the sends go on, and every send lands in one
+        // second, so neither msg_id nor created_at gives the send order.
+        let ids: Vec<String> = (0..20u128).map(|n| ulid_of(1000 - n)).collect();
+        for (n, id) in ids.iter().enumerate() {
+            s.send(&json!({"from":"claude:host-a:1:a","to":to,"ticket":"none",
+                "body":format!("m{n}"),"msg_id":id}))
+                .unwrap();
+        }
+        let first = s.inbox_page(to, 8, None, None).unwrap();
+        assert_eq!(page_ids(&first), ids[..8].to_vec());
+        assert_eq!(first["next_after"], ids[7].as_str());
+        let second = s.inbox_page(to, 8, Some(ids[7].as_str()), None).unwrap();
+        assert_eq!(page_ids(&second), ids[8..16].to_vec());
+        assert_eq!(second["next_after"], ids[15].as_str());
+        let third = s.inbox_page(to, 8, Some(ids[15].as_str()), None).unwrap();
+        assert_eq!(page_ids(&third), ids[16..].to_vec());
+        assert_eq!(third["next_after"], Value::Null);
+        // The head page stays the same 8 while they are unacknowledged.
+        let head = s.inbox(to, 8).unwrap();
+        assert_eq!(page_ids(&head), ids[..8].to_vec());
+        assert_eq!(head["next_after"], ids[7].as_str());
+    }
+
+    #[test]
+    fn a_send_after_the_cursor_is_never_skipped() {
+        let (s, _clock) = clocked();
+        no_send_limit(&s);
+        let to = "pi:host-b:2:b";
+        let send = |id: &str| {
+            s.send(
+                &json!({"from":"claude:host-a:1:a","to":to,"ticket":"none","body":"x","msg_id":id}),
+            )
+            .unwrap();
+        };
+        let high = ulid_of(9000);
+        let low = ulid_of(1);
+        send(&high);
+        let page = s.inbox_page(to, 1, None, None).unwrap();
+        assert_eq!(page["next_after"], high.as_str());
+        // A later send in the same second, with a smaller msg_id.
+        send(&low);
+        let next = s.inbox_page(to, 1, Some(high.as_str()), None).unwrap();
+        assert_eq!(page_ids(&next), vec![low.clone()]);
+    }
+
+    #[test]
+    fn after_must_name_a_message_of_this_mailbox() {
+        let s = Store::memory().unwrap();
+        let (a, b) = ("pi:host-b:2:b", "codex:host-b:3:c");
+        let sent = |to: &str| {
+            s.send(&json!({"from":"claude:host-a:1:a","to":to,"ticket":"none","body":"x"}))
+                .unwrap()
+                .envelope["msg_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let mine = sent(a);
+        let theirs = sent(b);
+        for foreign in [theirs, Ulid::new().to_string()] {
+            let error = s
+                .inbox_page(a, 8, Some(foreign.as_str()), None)
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Invalid);
+            assert_eq!(error, "unknown after");
+        }
+        assert_eq!(
+            s.inbox_page(a, 8, Some("nope"), None).unwrap_err(),
+            "invalid after"
+        );
+        // An acknowledged cursor still resolves.
+        s.ack(a, &mine).unwrap();
+        let page = s.inbox_page(a, 8, Some(mine.as_str()), None).unwrap();
+        assert!(page["messages"].as_array().unwrap().is_empty());
+        assert_eq!(page["next_after"], Value::Null);
+    }
+
+    #[test]
+    fn a_bound_mailbox_pages_by_delivery_key() {
+        let s = Store::memory().unwrap();
+        let first = bind(&s, "hermes", "host-b", 100, "svc", None).unwrap();
+        let old = first["agent_id"].as_str().unwrap().to_owned();
+        let send = |body: &str| {
+            s.send(&json!({"from":"claude:host-a:1:a","to":old,"ticket":"none","body":body}))
+                .unwrap()
+                .envelope["msg_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let cursor = send("one");
+        send("two");
+        let second = bind(&s, "hermes", "host-b", 200, "svc", Some(&token_of(&first))).unwrap();
+        let new = second["agent_id"].as_str().unwrap();
+        let token = token_of(&second);
+        let page = s
+            .inbox_page(new, 8, Some(cursor.as_str()), Some(&token))
+            .unwrap();
+        assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(page["messages"][0]["body"], "two");
+        assert_eq!(
+            s.inbox_page(new, 8, Some(cursor.as_str()), None)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unauthorized
+        );
+    }
+
+    #[test]
+    fn an_older_store_gains_arrival_positions_in_send_order() {
+        let path = std::env::temp_dir().join(format!("swb-arrival-{}.sqlite3", Ulid::new()));
+        let first;
+        let second;
+        {
+            let s = Store::open(&path).unwrap();
+            let send = |body: &str| {
+                s.send(&json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none","body":body}))
+                    .unwrap()
+                    .envelope["msg_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            first = send("one");
+            second = send("two");
+            s.0.lock()
+                .unwrap()
+                .execute_batch(
+                    "UPDATE messages SET arrival_seq=NULL; DELETE FROM counters WHERE name='arrival_seq';",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let db = s.0.lock().unwrap();
+        let positions: Vec<(String, i64)> = db
+            .prepare("SELECT msg_id, arrival_seq FROM messages ORDER BY arrival_seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(positions, vec![(first, 1), (second, 2)]);
+        let counter: i64 = db
+            .query_row(
+                "SELECT value FROM counters WHERE name='arrival_seq'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(counter, 2);
+        drop(db);
+        let third = s
+            .send(&json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none","body":"three"}))
+            .unwrap();
+        let position: i64 =
+            s.0.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT arrival_seq FROM messages WHERE msg_id=?1",
+                    [third.envelope["msg_id"].as_str().unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(position, 3);
         drop(s);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
@@ -2174,6 +3762,339 @@ mod tests {
             .unwrap_err(),
             "invalid host"
         );
+    }
+
+    /// A4 (TIN-7577): two live processes of one session each find their
+    /// own row by proc_start; without a filter the latest one wins.
+    #[test]
+    fn peers_filters_proc_start_before_it_keeps_one_row_per_session() {
+        let s = Store::memory().unwrap();
+        reg(&s, "claude", "host-b", 1, "shared", "p1");
+        reg(&s, "claude", "host-b", 2, "shared", "p2");
+        let ids = |proc_start: Option<&str>| -> Vec<String> {
+            let page = s
+                .peers(&PeersQuery {
+                    proc_start,
+                    ..PeersQuery::default()
+                })
+                .unwrap();
+            page["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["agent_id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(ids(Some("p1")), vec!["claude:host-b:1:shared"]);
+        assert_eq!(ids(Some("p2")), vec!["claude:host-b:2:shared"]);
+        assert_eq!(ids(None), vec!["claude:host-b:2:shared"]);
+        // pid 1 registers again: it is now the latest, and pid 2 still
+        // finds its own row.
+        reg(&s, "claude", "host-b", 1, "shared", "p1");
+        assert_eq!(ids(Some("p2")), vec!["claude:host-b:2:shared"]);
+        assert_eq!(ids(Some("p1")), vec!["claude:host-b:1:shared"]);
+        assert_eq!(ids(None), vec!["claude:host-b:1:shared"]);
+        assert!(ids(Some("p3")).is_empty());
+    }
+
+    /// A5 (TIN-7577): a send reports where mail to its recipient stands,
+    /// and the stored envelope never carries it.
+    #[test]
+    fn send_reports_the_recipient_state() {
+        let (s, clock) = clocked();
+        let to = "pi:host-b:2:b";
+        let send = |body: &str| {
+            s.send(&json!({"from":"claude:host-a:1:a","to":to,"ticket":"none","body":body}))
+                .unwrap()
+        };
+        assert_eq!(send("before").recipient_state, "unregistered");
+        let row = reg(&s, "pi", "host-b", 2, "b", "p");
+        assert_eq!(send("live").recipient_state, "live");
+        clock.advance(901);
+        assert_eq!(send("idle").recipient_state, "idle");
+        clock.advance(20_700);
+        assert_eq!(send("gone").recipient_state, "gone");
+        s.end(to, row["end_token"].as_str().unwrap()).unwrap();
+        let msg = json!({"from":"claude:host-a:1:a","to":to,"ticket":"none","body":"ended",
+            "msg_id":Ulid::new().to_string()});
+        let first = s.send(&msg).unwrap();
+        assert!(first.created);
+        assert_eq!(first.recipient_state, "ended");
+        // A replay carries it too.
+        let replay = s.send(&msg).unwrap();
+        assert!(!replay.created);
+        assert_eq!(replay.recipient_state, "ended");
+        assert!(replay.envelope.get("recipient_state").is_none());
+        // A replay that names another `to` answers for the stored
+        // recipient, not for the id it names.
+        reg(&s, "codex", "host-b", 3, "c", "p");
+        let mut elsewhere = msg.clone();
+        elsewhere["to"] = json!("codex:host-b:3:c");
+        let replay = s.send(&elsewhere).unwrap();
+        assert!(!replay.created);
+        assert_eq!(replay.envelope["to"], to);
+        assert_eq!(replay.recipient_state, "ended");
+        // A submitted envelope never carries recipient_state.
+        let mut forged = msg.clone();
+        forged["msg_id"] = json!(Ulid::new().to_string());
+        forged["recipient_state"] = json!("live");
+        assert_eq!(s.send(&forged).unwrap_err(), "unknown envelope field");
+        let read = s.inbox(to, 10).unwrap();
+        let messages = read["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 5);
+        assert!(messages.iter().all(|m| m.get("recipient_state").is_none()));
+    }
+
+    /// Review F1 of #57: an unbound session that restarts under a new pid
+    /// leaves its old row inside the lease. Mail to the old id is
+    /// `superseded`, not `live`, in the same clock second too. A
+    /// re-register of the old pid makes it the newest row again.
+    #[test]
+    fn send_reports_superseded_for_an_older_pid_of_the_same_session() {
+        let (s, _clock) = clocked();
+        let old = "claude:host-b:51:s";
+        let new = "claude:host-b:52:s";
+        let send = |to: &str| {
+            s.send(&json!({"from":"pi:host-a:1:a","to":to,"ticket":"none","body":"x"}))
+                .unwrap()
+                .recipient_state
+        };
+        reg(&s, "claude", "host-b", 51, "s", "p51");
+        assert_eq!(send(old), "live");
+        reg(&s, "claude", "host-b", 52, "s", "p52");
+        assert_eq!(send(old), "superseded");
+        assert_eq!(send(new), "live");
+        // Another session id, harness or host does not supersede.
+        reg(&s, "claude", "host-b", 53, "other", "p53");
+        reg(&s, "codex", "host-b", 54, "s", "p54");
+        reg(&s, "claude", "host-c", 55, "s", "p55");
+        assert_eq!(send(new), "live");
+        // The old pid registers again and is the newest row.
+        reg(&s, "claude", "host-b", 51, "s", "p51");
+        assert_eq!(send(old), "live");
+        assert_eq!(send(new), "superseded");
+        // An ended row stays `ended`.
+        let ended = reg(&s, "claude", "host-b", 52, "s", "p52");
+        s.end(new, ended["end_token"].as_str().unwrap()).unwrap();
+        assert_eq!(send(new), "ended");
+        assert_eq!(send(old), "superseded");
+    }
+
+    /// Review F1 of #57, bound control: a live binding of the key reads
+    /// mail for every pid of it, so the older pid stays `live`.
+    #[test]
+    fn send_to_an_older_pid_of_a_live_binding_stays_live() {
+        let s = Store::memory().unwrap();
+        let first = bind(&s, "hermes", "host-b", 51, "svc", None).unwrap();
+        bind(&s, "hermes", "host-b", 52, "svc", Some(&token_of(&first))).unwrap();
+        let sent = s
+            .send(&json!({"from":"pi:host-a:1:a","to":"hermes:host-b:51:svc",
+                "ticket":"none","body":"x"}))
+            .unwrap();
+        assert_eq!(sent.recipient_state, "live");
+    }
+
+    /// Review F2 of #57: one process re-registers under a new session id in
+    /// the same clock second. Both rows share `last_seen`, so a filtered
+    /// listing carries `registered_seq` and the new row's is greater. An
+    /// unfiltered listing does not carry it.
+    #[test]
+    fn peers_with_proc_start_carry_registered_seq_for_a_same_second_tie() {
+        let (s, _clock) = clocked();
+        reg(&s, "claude", "host-b", 7, "zzz-old", "p7");
+        reg(&s, "claude", "host-b", 7, "aaa-new", "p7");
+        let page = s
+            .peers(&PeersQuery {
+                all: true,
+                proc_start: Some("p7"),
+                ..PeersQuery::default()
+            })
+            .unwrap();
+        let rows = page["peers"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let seq = |id: &str| {
+            rows.iter().find(|r| r["agent_id"] == id).unwrap()["registered_seq"]
+                .as_i64()
+                .unwrap()
+        };
+        assert_eq!(rows[0]["last_seen"], rows[1]["last_seen"]);
+        assert!(seq("claude:host-b:7:aaa-new") > seq("claude:host-b:7:zzz-old"));
+        let plain = s.peers(&all()).unwrap();
+        assert!(
+            plain["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r.get("registered_seq").is_none())
+        );
+    }
+
+    /// TIN-7577: a body keeps its newlines and tabs through send, inbox
+    /// and thread. CRLF becomes LF; a lone CR and every other control
+    /// character are dropped.
+    #[test]
+    fn a_body_keeps_its_lines_through_the_store() {
+        let s = Store::memory().unwrap();
+        let (from, to) = ("claude:host-a:1:a", "pi:host-b:2:b");
+        // `thread` answers a registered reader only.
+        reg(&s, "pi", "host-b", 2, "b", "p");
+        let raw = "line one\r\n\tindented\nlast\rx\u{1b}[2J\u{7}\u{85}\0end\n";
+        let want = "line one\n\tindented\nlastx[2Jend\n";
+        let sent = s
+            .send(&json!({"from":from,"to":to,"ticket":"none","body":raw}))
+            .unwrap();
+        assert!(sent.created);
+        assert_eq!(sent.envelope["body"], want);
+        let stored: String =
+            s.0.lock()
+                .unwrap()
+                .query_row("SELECT body FROM messages", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(stored, want);
+        let read = s.inbox(to, 10).unwrap();
+        assert_eq!(read["messages"][0]["body"], want);
+        let thread_id = sent.envelope["thread_id"].as_str().unwrap();
+        let thread = s.thread(to, thread_id, None, None).unwrap();
+        assert_eq!(thread["messages"][0]["body"], want);
+        // A body of only line breaks and tabs is kept as sent.
+        let blank = s
+            .send(&json!({"from":from,"to":to,"ticket":"none","body":"\n\t\n"}))
+            .unwrap();
+        assert_eq!(blank.envelope["body"], "\n\t\n");
+        // The 16 KiB limit counts the cleaned body: dropped CRs do not count.
+        let long = format!("{}{}", "a".repeat(16384), "\r".repeat(10));
+        let kept = s
+            .send(&json!({"from":from,"to":to,"ticket":"none","body":long}))
+            .unwrap();
+        assert_eq!(kept.envelope["body"].as_str().unwrap().len(), 16384);
+        let over = format!("{}\n", "a".repeat(16384));
+        assert_eq!(
+            s.send(&json!({"from":from,"to":to,"ticket":"none","body":over}))
+                .unwrap_err(),
+            "body exceeds 16 KiB"
+        );
+    }
+
+    /// TIN-7577: a retry of a message that v0.5.0 or older stored without
+    /// its newlines is still a replay after the upgrade. The store is
+    /// opened once in the v0.5.0 shape, with a flat body and no
+    /// `body_lines` column, and the upgrade adds the column at 0. Any other
+    /// body under that msg_id is still a conflict (SWB-R46).
+    #[test]
+    fn a_retry_of_a_message_stored_before_v051_without_newlines_is_a_replay() {
+        let path = std::env::temp_dir().join(format!("swb-lines-{}.sqlite3", Ulid::new()));
+        let msg_id = Ulid::new().to_string();
+        let msg = json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none",
+            "body":"one\ntwo","msg_id":msg_id});
+        {
+            let s = Store::open(&path).unwrap();
+            assert!(s.send(&msg).unwrap().created);
+            s.0.lock()
+                .unwrap()
+                .execute_batch(
+                    "UPDATE messages SET body='onetwo'; ALTER TABLE messages DROP COLUMN body_lines;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let lines: i64 =
+            s.0.lock()
+                .unwrap()
+                .query_row("SELECT body_lines FROM messages", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(lines, 0);
+        assert!(!s.send(&msg).unwrap().created);
+        let mut tab = msg.clone();
+        tab["body"] = json!("one\ttwo");
+        assert!(!s.send(&tab).unwrap().created);
+        let mut flat = msg.clone();
+        flat["body"] = json!("onetwo");
+        assert!(!s.send(&flat).unwrap().created);
+        let mut other = msg.clone();
+        other["body"] = json!("one\nthree");
+        assert_eq!(s.send(&other).unwrap_err().kind, ErrorKind::Conflict);
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// TIN-7577: a body that v0.5.1 stored is compared exactly. A retry that
+    /// adds a newline, tab or CRLF to a flat body is a conflict, and so is a
+    /// flat retry of a multi-line body (SWB-R46).
+    #[test]
+    fn a_retry_that_changes_the_lines_of_a_v051_body_is_a_conflict() {
+        let s = Store::memory().unwrap();
+        let send = |body: &str, msg_id: &str| {
+            s.send(
+                &json!({"from":"claude:host-a:1:a","to":"pi:host-b:2:b","ticket":"none",
+                "body":body,"msg_id":msg_id}),
+            )
+        };
+        let flat_id = Ulid::new().to_string();
+        assert!(send("onetwo", &flat_id).unwrap().created);
+        for retry in ["one\ntwo", "one\ttwo", "one\r\ntwo", "onetwo\n"] {
+            assert_eq!(
+                send(retry, &flat_id).unwrap_err().kind,
+                ErrorKind::Conflict,
+                "{retry:?}"
+            );
+        }
+        assert!(!send("onetwo", &flat_id).unwrap().created);
+        let multi_id = Ulid::new().to_string();
+        assert!(send("one\ntwo", &multi_id).unwrap().created);
+        for retry in ["onetwo", "one\ttwo", "one\n\ntwo"] {
+            assert_eq!(
+                send(retry, &multi_id).unwrap_err().kind,
+                ErrorKind::Conflict,
+                "{retry:?}"
+            );
+        }
+        // CRLF is stored as LF, so the same text sent with CRLF is a replay.
+        assert!(!send("one\r\ntwo", &multi_id).unwrap().created);
+        let lines: Vec<i64> =
+            s.0.lock()
+                .unwrap()
+                .prepare("SELECT body_lines FROM messages")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(lines, vec![1, 1]);
+    }
+
+    #[test]
+    fn a_live_binding_makes_mail_to_an_old_pid_live() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "host-b", 100, "svc", None).unwrap();
+        let old = first["agent_id"].as_str().unwrap().to_owned();
+        // The old pid goes quiet; the restarted service binds again.
+        clock.advance(1000);
+        bind(&s, "hermes", "host-b", 200, "svc", Some(&token_of(&first))).unwrap();
+        let state = |to: &str| {
+            s.send(&json!({"from":"claude:host-a:1:a","to":to,"ticket":"none","body":"x"}))
+                .unwrap()
+                .recipient_state
+        };
+        assert_eq!(state(&old), "live");
+        // A bound row without a token nonce is no binding to the inbox gate.
+        // The old pid's own row is then older than pid 200's, so it is
+        // superseded (review F1 of #57), not idle.
+        s.0.lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET token_nonce=NULL WHERE agent_id!=?1 AND harness='hermes'",
+                [&old],
+            )
+            .unwrap();
+        assert_eq!(state(&old), "superseded");
+        // An unbound session that went quiet stays gone, and another pid
+        // of it with no row is unregistered.
+        reg(&s, "pi", "host-b", 2, "b", "p");
+        clock.advance(21_601);
+        assert_eq!(state("pi:host-b:2:b"), "gone");
+        assert_eq!(state("pi:host-b:3:b"), "unregistered");
     }
 
     #[test]

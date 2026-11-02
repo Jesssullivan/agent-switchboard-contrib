@@ -39,14 +39,20 @@ let LeaseState =
       -- peers() classification in swb-store: ended wins, then age bands.
       < live | idle | gone | ended >
 
-in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655", "R-C944", "R-C950", "SWB-R61", "SWB-R66", "SWB-R67", "SWB-R68" ]
+in  { rulings = [ "SWB-R09", "SWB-R10", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655", "R-C944", "R-C950", "SWB-R61", "SWB-R66", "SWB-R67", "SWB-R68" ]
     , session =
       { lease_seconds = 900
       , live_max_age_seconds = 900
       , idle_max_age_seconds = 21600
       , states = [ LeaseState.live, LeaseState.idle, LeaseState.gone, LeaseState.ended ]
       , -- R-C944 (v0.3.0): register returns a 64-hex end token; end accepts
-        -- nothing else. Every register rotates it and invalidates the old one.
+        -- nothing else. Every register rotates it and invalidates the old one,
+        -- except for a bound session as amended under binding below: a
+        -- register inside a grace returns the current end token, and while
+        -- the replaced session token is in its grace, the end token
+        -- replaced with it still ends the session. A rotation that gives
+        -- the replaced token no grace (the chain is spent) gives its end
+        -- token none either.
         end_token_hex_length = 64
       }
     , peers =
@@ -77,12 +83,48 @@ in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655"
       -- goes (idle_max_age_seconds without a call). The send bucket defaults
       -- are the implementing PR's choice; swb serve reads SWB_SEND_BURST and
       -- SWB_SEND_REFILL_PER_MINUTE, and a burst of 0 turns the limit off.
+      -- SWB-R67 as amended 2026-11-02 (Jess, "Short grace for old token",
+      -- TIN-7577 comment 41c4704d): the token a rotation replaced stays
+      -- valid for session_token_grace_seconds, then never again. Only the
+      -- token the latest rotation replaced counts, so a token two
+      -- rotations old is refused. Refined the same day ("Grace returns
+      -- current token", comment ff9be66f): a register with the replaced
+      -- token returns the current session and end tokens and mints
+      -- nothing. "Allow one more grace" (comment 2f1439dc): a token a grace
+      -- handed back gets one more grace of its own when it is replaced, and
+      -- a token handed back in that second grace gets none, so a chain has
+      -- session_token_grace_chain graces. A token a minting register
+      -- returned starts a new chain. The end token has the same grace
+      -- (comment 3955641b). The grace ends
+      -- on the wall or the monotonic clock, whichever is first, and a
+      -- broker restart ends it. The store fixes the value
+      -- (SESSION_TOKEN_GRACE_SECONDS and SESSION_TOKEN_GRACE_CHAIN), a
+      -- swb-store test ties both to the rendered broker-constants.json,
+      -- and no setting raises either.
       { session_token_hex_length = 64
+      , session_token_grace_seconds = 60
+      , session_token_grace_chain = 2
       , delivery_key = [ "harness", "host", "session_id" ]
       , token_required_for =
         [ "send", "inbox", "ack", "claim", "release", "handoff", "end", "register" ]
       , send_burst_default = 20
       , send_refill_per_minute_default = 30
+      }
+    , hook =
+      -- SWB-R10: a harness hook never blocks the harness and always exits 0.
+      -- Amended 2026-11-02 (Jess, "Raise to 3.5 seconds (Recommended)",
+      -- TIN-7577 comment 2f1439dc, and "Yes, 4 second timeout
+      -- (Recommended)", TIN-4655 comment 204ebf82): `swb hook` bounds its
+      -- own work at limit_ms, which leaves room for a bound register and its
+      -- one retry (TIN-7577 comment 3955641b), each with the full
+      -- request_deadline_ms.
+      -- The harness kills a hook after harness_timeout_seconds, the hook
+      -- entries' "timeout", which must stay above limit_ms. The swb crate
+      -- keeps its own literals (HOOK_LIMIT, LIMIT and swb-broker's
+      -- HOOK_TIMEOUT_MS), and a swb test ties them to the rendered JSON.
+      { request_deadline_ms = 1500
+      , limit_ms = 3500
+      , harness_timeout_seconds = 4
       }
     , claim =
       { lease_default_hours = 4
