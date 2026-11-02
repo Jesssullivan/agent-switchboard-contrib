@@ -77,8 +77,10 @@ token after 60 seconds, or the previous token presented for another pid,
 answers 401 `invalid session token`. The 60 seconds are fixed in the
 broker (`SESSION_TOKEN_GRACE_SECONDS`) and no setting changes them. They
 run on the wall clock and on a monotonic clock, and the grace ends at
-whichever reaches 60 first, so a wall clock step back cannot lengthen it
-and a step forward ends it at once. The monotonic part is held in the
+whichever reaches 60 first, so a wall clock step back cannot lengthen it.
+A step forward ends it at once, and so does a step back to before the
+rotation: both fail closed, and the client waits for the lapse unless it
+holds the current token. The monotonic part is held in the
 broker process only: a broker restart ends every grace, and a client
 whose reply was lost just before it waits for the lapse. So does a client
 whose first bind reply was lost, because a first bind has no previous

@@ -74,12 +74,13 @@ binding is live:
   grace windows of the client's registers.
 - The 60 seconds run on the wall clock and on a monotonic clock in the
   broker process, and the grace ends at whichever reaches 60 first. A wall
-  clock that steps back cannot lengthen it, and one that steps forward
-  ends it at once. The monotonic part is held in memory only, so a broker
-  restart ends every grace and the replaced token is then refused: the
-  grace fails closed. No token is stored for the grace. The broker derives
-  the current tokens again from its two token keys, `session_token_key`
-  and `end_token_key`, and the row's nonce.
+  clock that steps back cannot lengthen it. One that steps forward ends it
+  at once, and so does one that steps back to before the rotation, such as
+  a 1 second step back just after it. Both fail closed. The monotonic part
+  is held in memory only, so a broker restart ends every grace and the
+  replaced token is then refused: the grace fails closed. No token is stored
+  for the grace. The broker derives the current tokens again from its two
+  token keys, `session_token_key` and `end_token_key`, and the row's nonce.
 - A register that a grace answered writes the audit line
   `register_grace` with the grace that answered it, not `register`, so an
   operator can see a fetch of the current token.
@@ -124,14 +125,17 @@ Residuals of binding:
     grace.
   - A third register reply lost in a row: a reply lost on a rotation
     whose replaced token the second grace had handed back. Two concurrent
-    registers that present one saved token count as one grace answer, so
-    after them one lost reply still recovers and a second in a row does
-    not.
+    registers that present one saved token count as one grace answer. When
+    that token came from a register that minted it, the pair uses the
+    first grace, so after them one lost reply still recovers and a second
+    in a row does not. When a grace had handed that token back, the pair
+    uses the second grace, so the next lost reply locks the session out.
   - A lost reply that the client does not follow with a register within
     60 seconds, for example when its one retry also misses the deadline
     and no hook runs in time.
-  - A wall clock step forward inside the grace, which ends it at once.
-    This fails closed, as intended.
+  - A wall clock step inside the grace that ends it at once: a step
+    forward, or a step back to before the rotation. This fails closed, as
+    intended.
 - The broker keeps `session_token_key`, `end_token_key` and every row's
   token nonce in its SQLite database. Read access to the database file
   therefore yields every live session and end token, as it has since

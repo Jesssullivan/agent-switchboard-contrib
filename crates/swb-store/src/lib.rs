@@ -2803,6 +2803,36 @@ mod tests {
         s.authorize(&me, Some(&recovered)).unwrap();
     }
 
+    /// Review K6 of #57: two concurrent registers that present a token a
+    /// grace had handed back use the second grace, so the token both
+    /// replies carry has none, and the next lost reply locks the session
+    /// out. SECURITY.md states this limit of the concurrent case.
+    #[test]
+    fn concurrent_registers_after_a_grace_answer_spend_the_chain() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let (saved, grace) = lose_and_retry(&s, &token_of(&first)).unwrap();
+        assert_eq!(grace, Some(1));
+        clock.advance(600);
+        let one = rotate(&s, 100, &saved).unwrap();
+        let two = s
+            .register_outcome(&json!({"harness":"hermes","host":"sting","pid":100,
+                "session_id":"svc","proc_start":"start-100","session_token":saved}))
+            .unwrap();
+        assert_eq!(two.result, one);
+        assert_eq!(two.grace, Some(2));
+        clock.advance(600);
+        let held = token_of(&one);
+        let lost = rotate(&s, 100, &held).unwrap();
+        assert_eq!(rotate(&s, 100, &held).unwrap_err(), "invalid session token");
+        assert_eq!(
+            s.authorize(&me, Some(&held)).unwrap_err(),
+            "invalid session token"
+        );
+        s.authorize(&me, Some(&token_of(&lost))).unwrap();
+    }
+
     /// A wall clock that steps forward inside the grace ends it at once:
     /// the grace ends on whichever clock reaches 60 seconds first, so it
     /// fails closed and the client must hold the current token.
