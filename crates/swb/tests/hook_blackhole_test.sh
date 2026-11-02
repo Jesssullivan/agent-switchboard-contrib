@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # SWB-R10 / R-C949 (TIN-6688): a harness hook against a blackholed broker
 # returns within 4 s and exits 0, with no output. SWB-R10's budget was 2 s;
-# it is 4 s since the hook bound rose to 3.5 s (TIN-7577 comment 2f1439dc).
+# it is 4 s since the hook bound rose to 3.5 s (TIN-7577 comment 2f1439dc,
+# and Jess, "Yes, 4 second timeout (Recommended)", TIN-4655 comment
+# 204ebf82).
 #
 # The broker address is 192.0.2.1:9 (RFC 5737 TEST-NET-1, never routed), so
 # a SYN gets no answer and connect() waits until the client's own deadline.
@@ -33,6 +35,14 @@
 # wrapper `integrations/claude-code/scripts/swb-hook.sh`, for every event.
 # Arguments after the second (for example the fixture driver's
 # --test-threads=1, which Bazel passes to every test) are ignored.
+#
+# Bound cases (review K1 of #57): with a saved session token under
+# `bindings/`, a register that misses its 1.5 s deadline is sent once more,
+# so against the blackhole the hook waits for two deadlines, about 3 s. A
+# bound case that waited on connect must last at least 2.5 s and stay under
+# the 4 s budget. That fails when the hook bound or the wrapper's `timeout`
+# backstop cuts the retry short, as the former `timeout 2` did at about 2 s.
+# A bound case that returned at once is a NO-ROUTE run, as above.
 set -euo pipefail
 
 swb="$1"
@@ -44,6 +54,9 @@ budget_us=4000000
 # A closed-stdin case that reached the blackhole waits on connect for most of
 # HOOK_LIMIT; one that failed at once (no route) returns in a few ms.
 blackhole_min_us=1000000
+# A bound case that reached the blackhole waits for the register and its one
+# retry, two 1.5 s deadlines; one cut at 2 s is short of this.
+bound_min_us=2500000
 scratch="${TEST_TMPDIR:-$(mktemp -d)}/hook-blackhole"
 mkdir -p "$scratch/bin" "$scratch/state"
 chmod 700 "$scratch/state"
@@ -102,8 +115,12 @@ attempt() {
 }
 
 run_case() {
-  local name="$1" stdin_mode="$2"
+  local name="$1" stdin_mode="$2" min_us=0
   shift 2
+  if [ "$stdin_mode" = "bound" ]; then
+    stdin_mode=closed
+    min_us="$bound_min_us"
+  fi
   local verdict=ok
   attempt "$stdin_mode" "$@"
   if [ "$case_status" -eq 0 ] && [ "$case_bytes" -eq 0 ] && [ "$case_elapsed" -ge "$budget_us" ]; then
@@ -112,6 +129,10 @@ run_case() {
     attempt "$stdin_mode" "$@"
   fi
   if [ "$case_status" -ne 0 ] || [ "$case_elapsed" -ge "$budget_us" ] || [ "$case_bytes" -ne 0 ]; then
+    verdict=FAIL
+    failures=$((failures + 1))
+  elif [ "$case_elapsed" -ge "$blackhole_min_us" ] && [ "$case_elapsed" -lt "$min_us" ]; then
+    # It reached the blackhole, but the retry did not get its deadline.
     verdict=FAIL
     failures=$((failures + 1))
   fi
@@ -131,11 +152,24 @@ run_case "swb hook claude SessionStart (stdin never closes)" open "$swb" hook cl
 run_case "swb-hook.sh UserPromptSubmit (stdin never closes)" open \
   env PATH="$scratch/bin:$PATH" sh "$wrapper" UserPromptSubmit
 
+# Bound cases: seed a session token, so each register is retried once.
+mkdir -p "$scratch/state/bindings"
+chmod 700 "$scratch/state/bindings"
+binding_file="$scratch/state/bindings/claude:blackhole-test:blackhole-session.token"
+printf '%064d' 1 >"$binding_file"
+chmod 600 "$binding_file"
+run_case "swb hook claude UserPromptSubmit (bound, retried)" bound \
+  "$swb" hook claude UserPromptSubmit
+run_case "swb-hook.sh UserPromptSubmit (bound, retried)" bound \
+  env PATH="$scratch/bin:$PATH" sh "$wrapper" UserPromptSubmit
+# The hook must not have dropped the session token without a broker answer.
+[ -f "$binding_file" ] || { echo "FAIL seeded session token was removed without a broker answer"; failures=$((failures + 1)); }
+
 # The hook must not have consumed the seeded token on a failed end.
 [ -f "$token_file" ] || { echo "FAIL seeded end token was removed without a broker answer"; failures=$((failures + 1)); }
 
 if [ "$failures" -ne 0 ]; then
-  echo "$failures case(s) exceeded the 4 s budget, exited non-zero or printed output" >&2
+  echo "$failures case(s) exceeded the 4 s budget, exited non-zero, printed output or cut a bound retry short" >&2
   exit 1
 fi
 if [ "$blackholed" -eq 0 ]; then

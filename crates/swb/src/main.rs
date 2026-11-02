@@ -1800,7 +1800,8 @@ fn main() -> ExitCode {
         }
         Some("hook") => {
             if let (Some(h), Some(e), None) = (args.next(), args.next(), args.next()) {
-                // Includes stdin parsing and both possible broker calls.
+                // Includes stdin parsing and up to three broker calls:
+                // the register, its one retry and the inbox.
                 // A stalled resolver/read cannot make this hook block Claude.
                 let _ = bounded(HOOK_LIMIT, move || {
                     hook(&h, &e);
@@ -1931,8 +1932,9 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
-    /// SWB-R10 as amended (TIN-7577 comment 2f1439dc): the request
-    /// deadline, the hook bound and the harness timeout match
+    /// SWB-R10 as amended (TIN-7577 comment 2f1439dc for the 3.5 second
+    /// bound, TIN-4655 comment 204ebf82 for the 4 second timeout): the
+    /// request deadline, the hook bound and the harness timeout match
     /// `spec/dhall/Broker.dhall`, a bound register and its one retry fit
     /// inside the hook bound with full deadlines, and the hook bound fits
     /// inside the harness timeout.
@@ -1960,6 +1962,64 @@ mod tests {
         );
         assert!(2 * LIMIT <= HOOK_LIMIT, "the retry gets a full deadline");
         assert!(HOOK_LIMIT < Duration::from_millis(swb_broker::HOOK_TIMEOUT_MS));
+        assert_eq!(
+            hook["harness_timeout_seconds"].as_u64().map(|s| s * 1000),
+            Some(swb_broker::HOOK_TIMEOUT_MS),
+            "Broker.dhall's timeout in milliseconds and HOOK_TIMEOUT_MS disagree"
+        );
+    }
+
+    /// The hook timeouts `integrations/claude-code` ships: every `"timeout"`
+    /// in a hook JSON file and the wrapper's `timeout` backstop.
+    fn shipped_hook_timeouts() -> Vec<(&'static str, u64)> {
+        let mut found = Vec::new();
+        for (name, text) in [
+            (
+                "hooks.json",
+                include_str!("../../../integrations/claude-code/hooks/hooks.json"),
+            ),
+            (
+                "settings.hooks.json",
+                include_str!("../../../integrations/claude-code/examples/settings.hooks.json"),
+            ),
+        ] {
+            let parsed: Value = serde_json::from_str(text).unwrap();
+            let events = parsed["hooks"].as_object().unwrap();
+            assert_eq!(events.len(), 4, "{name} names the four hook events");
+            for entry in events.values().flat_map(|v| v.as_array().unwrap()) {
+                for hook in entry["hooks"].as_array().unwrap() {
+                    let timeout = hook["timeout"].as_u64();
+                    assert!(timeout.is_some(), "{name}: a hook entry has no timeout");
+                    found.push((name, timeout.unwrap()));
+                }
+            }
+        }
+        let wrapper = include_str!("../../../integrations/claude-code/scripts/swb-hook.sh");
+        let backstops: Vec<u64> = wrapper
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("timeout "))
+            .filter_map(|rest| rest.split_whitespace().next()?.parse().ok())
+            .collect();
+        assert_eq!(backstops.len(), 1, "swb-hook.sh has one timeout backstop");
+        found.push(("swb-hook.sh", backstops[0]));
+        found
+    }
+
+    /// SWB-R10 as amended (Jess, "Yes, 4 second timeout (Recommended)",
+    /// TIN-4655 comment `204ebf82`): the hook entries' timeout is 4
+    /// seconds, so the 3.5 second hook bound and its one register retry
+    /// fit inside it. `HOOK_TIMEOUT_MS`, both hook JSON files and the
+    /// wrapper's backstop must all say 4 seconds, in whole seconds, since
+    /// the harness reads the JSON value as seconds (review K1 of #57).
+    #[test]
+    fn the_shipped_hook_timeouts_are_the_ruled_4_seconds() {
+        const RULED_MS: u64 = 4_000;
+        assert_eq!(swb_broker::HOOK_TIMEOUT_MS, RULED_MS, "HOOK_TIMEOUT_MS");
+        let found = shipped_hook_timeouts();
+        assert_eq!(found.len(), 9, "4 + 4 hook entries and the wrapper");
+        for (name, seconds) in found {
+            assert_eq!(seconds * 1000, RULED_MS, "{name} timeout");
+        }
     }
 
     #[test]
