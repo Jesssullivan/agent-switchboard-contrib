@@ -80,8 +80,11 @@ where
         .map_err(|e| e.to_string())?;
     receiver
         .recv_timeout(limit)
-        .map_err(|_| "broker deadline exceeded".to_string())?
+        .map_err(|_| DEADLINE.to_string())?
 }
+
+/// The error a broker call reports when its reply misses the deadline.
+const DEADLINE: &str = "broker deadline exceeded";
 
 /// Where a command reads `SWB_*` settings. Production passes [`process_env`];
 /// tests pass a closure so no test mutates process-wide environment.
@@ -159,7 +162,7 @@ fn blocking_raw(
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err("broker deadline exceeded".into());
+            return Err(DEADLINE.into());
         }
         socket
             .set_read_timeout(Some(left))
@@ -172,6 +175,16 @@ fn blocking_raw(
                 if bytes.len() > MAX_RESPONSE_BYTES {
                     return Err("broker response too large".into());
                 }
+            }
+            // A read that runs out of time is the deadline, whichever of the
+            // socket and the outer bound notices first.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(DEADLINE.into());
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -252,7 +265,22 @@ fn register_with(lookup: Lookup, harness: &str, session_id: &str) -> Result<Valu
             "session_id":session_id, "proc_start":need(lookup, "SWB_PROC_START")?
         }),
     );
-    call_with(lookup, "POST", "/v1/register", Some(&payload))
+    register_call(lookup, &payload)
+}
+
+/// `POST /v1/register` with `payload`. A bound register whose reply missed
+/// the deadline may still have rotated the session token, so it is sent
+/// once more, unchanged, with the token the client holds. Inside the
+/// broker's 60 second grace that register returns the current tokens and
+/// mints nothing (TIN-7577 comments `3955641b` and `ff9be66f`). An unbound
+/// register, which carries no session token, is never retried.
+fn register_call(lookup: Lookup, payload: &Value) -> Result<Value, String> {
+    match call_with(lookup, "POST", "/v1/register", Some(payload)) {
+        Err(e) if e == DEADLINE && payload.get("session_token").is_some() => {
+            call_with(lookup, "POST", "/v1/register", Some(payload))
+        }
+        other => other,
+    }
 }
 
 fn inbox_with(lookup: Lookup, me: &str) -> Result<Value, String> {
@@ -607,7 +635,7 @@ fn whoami_cmd(lookup: Lookup, live_register: bool) -> Result<Value, String> {
         return Ok(json!({"agent_id":agent_id,"registered":false}));
     }
     let payload = binding_payload(lookup, payload);
-    let mut response = call_with(lookup, "POST", "/v1/register", Some(&payload))?;
+    let mut response = register_call(lookup, &payload)?;
     let saved = save_token(lookup, &response);
     let bound = save_session_token(lookup, &response);
     if let Some(map) = response.as_object_mut() {
@@ -1475,12 +1503,7 @@ fn doctor_checks(lookup: Lookup, live_register: bool) -> Vec<(&'static str, Chec
                 }),
                 true,
                 true,
-            ) => match call_with(
-                lookup,
-                "POST",
-                "/v1/register",
-                Some(&binding_payload(lookup, payload.clone())),
-            ) {
+            ) => match register_call(lookup, &binding_payload(lookup, payload.clone())) {
                 Ok(v) if v.get("agent_id").and_then(Value::as_str) == Some(id.as_str()) => {
                     // Keep the hook's saved end token current (R-C944), and a
                     // bound session's rotated session token (SWB-R67).
@@ -2858,6 +2881,161 @@ mod tests {
         assert_eq!(request_json(&requests[2])["session_token"], rotated());
         assert_eq!(request_json(&requests[2])["from"], me);
         assert_eq!(request_json(&requests[3])["session_token"], rotated());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A broker that answers each connection by `plan`: `None` reads the
+    /// request and holds the connection past the client deadline without a
+    /// reply, as when a register commits but its reply is lost; `Some`
+    /// answers 200 with that body. After the plan it waits for one more
+    /// connection and reports whether any came. It returns the requests.
+    fn stalling_broker(
+        plan: Vec<Option<&'static str>>,
+    ) -> (String, std::thread::JoinHandle<(Vec<String>, bool)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        listener.set_nonblocking(true).unwrap();
+        let accept = move |within: Duration| {
+            let deadline = Instant::now() + within;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => return Some(stream),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+        };
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for step in plan {
+                let mut stream = accept(Duration::from_secs(5)).expect("request never came");
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 4096];
+                    let n = stream.read(&mut chunk).unwrap();
+                    assert!(n > 0, "client closed early");
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(split) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..split]).to_string();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                seen.push(String::from_utf8_lossy(&request).into_owned());
+                match step {
+                    None => std::thread::sleep(LIMIT + Duration::from_millis(300)),
+                    Some(body) => write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap(),
+                }
+            }
+            let extra = accept(Duration::from_millis(700)).is_some();
+            (seen, extra)
+        });
+        (url, server)
+    }
+
+    fn bound_env(url: String, state: String) -> impl Fn(&str) -> Option<String> {
+        move |name: &str| match name {
+            "SWB_BROKER_URL" => Some(url.clone()),
+            "SWB_STATE_DIR" => Some(state.clone()),
+            "SWB_HOST" => Some("sting".into()),
+            "SWB_SESSION_PID" => Some("100".into()),
+            "SWB_PROC_START" => Some("start-100".into()),
+            "SWB_HARNESS" => Some("hermes".into()),
+            "SWB_SESSION_ID" => Some("cade".into()),
+            "SWB_BIND" => Some("1".into()),
+            _ => None,
+        }
+    }
+
+    /// TIN-7577 comments 3955641b and ff9be66f: a bound register whose
+    /// reply is lost to the deadline is sent once more with the token the
+    /// client holds, and the client saves what that retry returns.
+    #[test]
+    fn a_bound_register_that_misses_its_deadline_is_retried_once() {
+        let state = scratch_state_dir("retry");
+        let id = "hermes:sting:100:cade";
+        let reply: &'static str = Box::leak(
+            json!({"agent_id":id,"lease_seconds":900,"end_token":TOKEN,"bound":true,
+                "session_token":rotated()})
+            .to_string()
+            .into_boxed_str(),
+        );
+        let (url, server) = stalling_broker(vec![None, Some(reply)]);
+        let env = bound_env(url, state.clone());
+        save_session_token(
+            &env,
+            &json!({"agent_id":id,"bound":true,"session_token":session_token()}),
+        )
+        .unwrap();
+        let registered = whoami_cmd(&env, true).unwrap();
+        assert_eq!(registered["agent_id"], id);
+        assert_eq!(load_session_token(&env, id).unwrap(), rotated());
+        let (requests, extra) = server.join().unwrap();
+        assert!(!extra, "more than one retry");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(request_json(&requests[0]), request_json(&requests[1]));
+        assert_eq!(request_json(&requests[1])["session_token"], session_token());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The retry happens once: a second deadline is the caller's error, and
+    /// the saved token is left as it was.
+    #[test]
+    fn a_register_retry_that_misses_its_deadline_too_is_not_retried_again() {
+        let state = scratch_state_dir("retry-twice");
+        let id = "hermes:sting:100:cade";
+        let (url, server) = stalling_broker(vec![None, None]);
+        let env = bound_env(url, state.clone());
+        save_session_token(
+            &env,
+            &json!({"agent_id":id,"bound":true,"session_token":session_token()}),
+        )
+        .unwrap();
+        assert_eq!(whoami_cmd(&env, true).unwrap_err(), DEADLINE);
+        assert_eq!(load_session_token(&env, id).unwrap(), session_token());
+        let (requests, extra) = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!extra, "a third register was sent");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// An unbound register carries no token for the grace to recognise, so
+    /// a missed deadline is reported as before, after one request.
+    #[test]
+    fn an_unbound_register_that_misses_its_deadline_is_not_retried() {
+        let state = scratch_state_dir("retry-unbound");
+        let (url, server) = stalling_broker(vec![None]);
+        let bound = bound_env(url, state.clone());
+        let env = |name: &str| match name {
+            "SWB_BIND" => None,
+            other => bound(other),
+        };
+        assert_eq!(whoami_cmd(&env, true).unwrap_err(), DEADLINE);
+        let (requests, extra) = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(request_json(&requests[0]).get("session_token").is_none());
+        assert!(!extra, "an unbound register was retried");
         let _ = std::fs::remove_dir_all(&state);
     }
 
