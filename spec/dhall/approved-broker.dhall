@@ -1,38 +1,38 @@
 -- Source of docs/releases/approved-broker.json. `just spec-dhall` (and the
 -- flake check spec-dhall) renders this with dhall-to-json and fails unless it
 -- is identical, after `jq -S`, to the committed JSON. Edit this file and the
--- JSON together; release-check.py keeps reading the JSON. SWB-R71 (TIN-4655 7e292300, SWB-R66, R-C435), R-C229.
+-- JSON together; release-check.py keeps reading the JSON. SWB-R73 (TIN-7577 d59d35a1, SWB-R74, R-C435), R-C229.
 let ApprovedRelease = ./ApprovedRelease.dhall
 
 in    { file_sha256 =
           [ { mapKey = ".bazelversion", mapValue = "1b9487d55bea47fea50d226cc9c53bc548877ad2a318bac8fbc8b320f429e5c5" }
           , { mapKey = "BUILD.bazel", mapValue = "56e6cc630af92bd173f7d9031a4773af3d7b8bb14d7c92d3604b48bf34f31e3c" }
-          , { mapKey = "Cargo.lock", mapValue = "fc0e60b7900d5f702b9e0aa24adc647007671a33241136ad3d108ca5d8980ea3" }
-          , { mapKey = "Cargo.toml", mapValue = "466894a0b090f4ccc2efc8e577ae46a53f25a4a9e308757f773df6ad993ce5f4" }
-          , { mapKey = "MODULE.bazel", mapValue = "b362c5cab3dcdffd862cfd2d29ea606c06330bca46ec908bb9c13028d328991e" }
-          , { mapKey = "MODULE.bazel.lock", mapValue = "cf4db60f2781df71223f6693183751525b75a443aece2eb959b82447f347cc69" }
-          , { mapKey = "cargo-bazel-lock.json", mapValue = "bdf9fbd294354e931427b6b2a9f2c958489926d0ceb9b3b8195166f73b47fcc5" }
+          , { mapKey = "Cargo.lock", mapValue = "d6d1d5f753d4f19810994d8f67395eb54ac3c8204dcf07adb086c4012ad3e613" }
+          , { mapKey = "Cargo.toml", mapValue = "8dd6d64c0a714aceb4f9718b5c896391090f73bcfb26f3076ef2362449b279ea" }
+          , { mapKey = "MODULE.bazel", mapValue = "30c046fef75b3466b67347adf241fe39e3aea1c3169f3f5e5dec228fd01a492c" }
+          , { mapKey = "MODULE.bazel.lock", mapValue = "a2090bf27cad0f4bfb69e34c01790ad9d5d61f8c909191614ede970275b52dad" }
+          , { mapKey = "cargo-bazel-lock.json", mapValue = "dc2612d1ebb7480b0408421ea5134c38ef841dff25b73a81bfd8e1715e5ae1cf" }
           , { mapKey = "crates/swb-agentd/BUILD.bazel", mapValue = "4c53792c73662c8cf3737e36559acc042f53a28c4c5d638586e177df1f56adb7" }
           , { mapKey = "crates/swb-agentd/Cargo.toml", mapValue = "9a9241ecf6f202db1835a13ff1a7191be18e29283adecd0542ff0a5a2cb097e8" }
           , { mapKey = "crates/swb-agentd/src/lib.rs", mapValue = "03c8ff21db3b6556a4de5436ecf22589bf4ed43303cd6504b743394ad218bef7" }
           , { mapKey = "crates/swb-broker/BUILD.bazel", mapValue = "e2913c2d01c34aa7dd5571d9d8690f96989b412e8b53fffe77ed25f5727d96b8" }
           , { mapKey = "crates/swb-broker/Cargo.toml", mapValue = "b92e7edb6b245a708f197de03c8e644d166d7275084604eb2e67825122e21dc7" }
-          , { mapKey = "crates/swb-broker/src/lib.rs", mapValue = "3b974fd4156c6ddd03a9a34d3f2d159e58bdcedddb8ccb4fa21532836343e150" }
+          , { mapKey = "crates/swb-broker/src/lib.rs", mapValue = "4ba55d18e71d3d777b846d336d8a2c6331c6c46a91b9fcc2dfc3efe596f01bc8" }
           , { mapKey = "crates/swb-broker/src/service_roundtrip_tests.rs", mapValue = "c192483ffe811b51bab9895bfee105d7739c1d30c8a6d1a2bbfc707154dc26c6" }
           , { mapKey = "crates/swb-broker/tests/stamp.rs", mapValue = "f07fa0a5d40fbb81aa4062354d87f3baf216aa03f66b15520ce0bb6897b117f3" }
           , { mapKey = "crates/swb-proto/BUILD.bazel", mapValue = "25fcf691c3b25c02249fba3b5f880672b5da088a5566f9d8b9ab4076ae604e8c" }
           , { mapKey = "crates/swb-proto/Cargo.toml", mapValue = "b88b6f22fe6d6f6fc34aff96fa459628085e44cd1841f615dfc77b8925c01471" }
-          , { mapKey = "crates/swb-proto/src/lib.rs", mapValue = "5e365a7b59e0fb5cd5252db95d2f3f24d2fb43e3b768852dcd44eb8ead49ca7d" }
-          , { mapKey = "crates/swb-store/BUILD.bazel", mapValue = "f40f8fe61af26111872ca5c409dfc9cae57bf8b1fd95b32cfcdfb56940bec704" }
+          , { mapKey = "crates/swb-proto/src/lib.rs", mapValue = "8a574dde848ab9c6c4ceb6830625b0577e57cc7654bbb47ec178062f2a151621" }
+          , { mapKey = "crates/swb-store/BUILD.bazel", mapValue = "49b6d7f5468c388810a9afe15a0a6596b1238978629a682f104280bde54c83b0" }
           , { mapKey = "crates/swb-store/Cargo.toml", mapValue = "1c7dcf3a8476f2dbb4e6097a623326906753f919d00c8abea9722e25d332c459" }
-          , { mapKey = "crates/swb-store/src/claims.rs", mapValue = "b90b3d0f98a0747156b147c71d45423126ca9bb71f69d3af9f06aef6284f9720" }
-          , { mapKey = "crates/swb-store/src/lib.rs", mapValue = "ca68987014bfc1b3ee95219a6656d2c44c089673a8f673a1134105acdd167d90" }
-          , { mapKey = "crates/swb-store/src/ratelimit.rs", mapValue = "0a5fa09bb182a8dd017561a23fd7dd78f44436e3790309b228298ca0dfc22032" }
-          , { mapKey = "crates/swb/BUILD.bazel", mapValue = "0dce5b88a9271cf234e307faeb64cacafa2b3eea865c216b8413b97a2b25fd61" }
+          , { mapKey = "crates/swb-store/src/claims.rs", mapValue = "a3d35a26d0ec6d9e2670f58dc082049d92dcf125aca7fd25d5b8fed9687ae77f" }
+          , { mapKey = "crates/swb-store/src/lib.rs", mapValue = "a64baad973a246653951b4acfddc4d67c742a5862b38b29c0840449834870bde" }
+          , { mapKey = "crates/swb-store/src/ratelimit.rs", mapValue = "d2c59dfd29ae77944da7cfcae8dbba8e7982cc11d18ab7254c014771d5223190" }
+          , { mapKey = "crates/swb/BUILD.bazel", mapValue = "b2bd00a02f1acb7445105e20c5ba4a4078463a525e34a4ba4ebe1c6f8ed2bcef" }
           , { mapKey = "crates/swb/Cargo.toml", mapValue = "66eeb9a4fb4d22b4735f688bc8dfa359db870b23d744cd7af74895f79b71de35" }
-          , { mapKey = "crates/swb/src/channel.rs", mapValue = "0c3d514a585d96c9b839573e8a773afb97afb1a9b843f7ebd03beab43a3310bd" }
-          , { mapKey = "crates/swb/src/main.rs", mapValue = "637cd07296696b3189fc1066e459beca862e4e5c4b6f15eefc615ad827e08f4a" }
-          , { mapKey = "crates/swb/tests/hook_blackhole_test.sh", mapValue = "7c6372a01c8d0cf5602188ad562ff77788c0dec0a2c9f3e202def88a7fa22ac3" }
+          , { mapKey = "crates/swb/src/channel.rs", mapValue = "40438e0574e5285d41f5c6983fa1f5a5e10d65373c869bf05027ef04ca91cf74" }
+          , { mapKey = "crates/swb/src/main.rs", mapValue = "e9fc2322c66d6c961036ac66f54b6b2753386952da0063da6c280df3b9796498" }
+          , { mapKey = "crates/swb/tests/hook_blackhole_test.sh", mapValue = "ab2fcabd4bbbb10aed0c27f6def3a2a6111d3720b4e60751a943c2279da53c00" }
           , { mapKey = "deploy/BUILD.bazel", mapValue = "414e9a927e0dfb89f8236367db755014ce8b56b815621ee1d0f9da99a1265ac0" }
           , { mapKey = "platforms/BUILD.bazel", mapValue = "6d5c7d3dada37113084e621e8065a05e4e58e0c7dd7d206dfd7f0cb3f4507d25" }
           , { mapKey = "tools/BUILD.bazel", mapValue = "d7ae7983138ad3c50004efd36fb29cac5583647b5dc3f46189f594f2470bd31c" }
@@ -43,7 +43,7 @@ in    { file_sha256 =
           , { mapKey = "tools/cc/zig_cc.nix", mapValue = "f536da29f96dfce255ab24bb75999fbcf93d2196561c9aca5affa4ca7e7ab26d" }
           , { mapKey = "tools/clippy_test.sh", mapValue = "1a0c16f7e334bdfae84d8f25dab84cc2dfb45a8adcd95189e0d9662d10559261" }
           ]
-      , image = "ghcr.io/xoxd-ai/agent-switchboard@sha256:05738e97af06f767d7894b1f3e0697b9eece0888527e9937130a4041bff7498e"
+      , image = "ghcr.io/xoxd-ai/agent-switchboard@sha256:77e004b2a0a93b44b1555239066856621c4f00e604e66b272b22dd94f94256f5"
       , live_acceptance = False
       , manifest_size = 4579
       , platform =
@@ -54,16 +54,16 @@ in    { file_sha256 =
         , user = "65532"
         }
       , pr_heads =
-          [ { mapKey = "55", mapValue = "0c8e28a7fc545f94441b079704b3e9b6bf542841" }
+          [ { mapKey = "60", mapValue = "7c88e73816d9f728c3d2aebe6b51cacb0d18c30e" }
           ]
       , publication_receipt =
-          "PENDING: v0.5.0 release workflow registry readback; ratified SWB-R71 under TIN-4655 comment 7e292300 (operator interview 2026-10-27) and R-C435 (TIN-5770 comment d3d90700)"
+          "PENDING: v0.5.1 release workflow registry readback; ratified SWB-R73 under TIN-7577 comment d59d35a1 (operator, 2026-10-28) and R-C435 (TIN-5770 comment d3d90700)"
       , qualification = "published-candidate-only"
-      , rulings = [ "SWB-R71", "SWB-R66", "R-C416", "R-C435", "R-N13" ]
+      , rulings = [ "SWB-R73", "SWB-R74", "R-C416", "R-C435", "R-N13" ]
       , schema = "swb.approved-release.v1"
-      , source = "cfff7913fb6bc6c5aee2974b357d0b75b371326b"
+      , source = "154cfb19f4242a0c995249c153dcb7bf887d3a35"
       , source_inputs =
           [ ".bazelversion", "BUILD.bazel", "MODULE.bazel", "MODULE.bazel.lock", "Cargo.toml", "Cargo.lock", "cargo-bazel-lock.json", "crates/", "deploy/", "platforms/", "tools/" ]
-      , upstream_main = "9b128254b4072863355b681f987743c708f014f5"
+      , upstream_main = "96a5060a5c3777eb8cdd5b0a79230fc12864523e"
       }
     : ApprovedRelease

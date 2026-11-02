@@ -760,6 +760,23 @@ Mimir series, the lookup recipes, the outbox and the L0–L5 phases — is
   broker ignores `bind`, so the live broker and every client that binds
   move to v0.5.0 together, and the lab seat pins and delivers it. SWB-R64
   v0.4.0 stays published; this record authorizes no other image.
+- **SWB-R73 delivery-fix release, v0.5.1 (2026-11-02):** the delivery
+  fixes A1 to A5, the send refusal counters, the previous-token grace and
+  the 4 s hook timeout (#57, SPR-80, SWB-R74), with the workspace at 0.5.1
+  (#60). The operator ruled the release chain on TIN-7577 (comment
+  `d59d35a1`: "cut it as v0.5.1 with the same release chain as v0.5.0");
+  R-C435 pre-authorizes a digest that two clean builds of the merge
+  reproduce. The two clean builds ran on a lab build host, linux x86_64 on
+  the pinned Nix toolchain (R-C416). The approved source is
+  `154cfb19f4242a0c995249c153dcb7bf887d3a35` (the #60 merge, the last
+  change to a protected input) at
+  `sha256:77e004b2a0a93b44b1555239066856621c4f00e604e66b272b22dd94f94256f5`,
+  published through the release workflow under the signed `v0.5.1` tag.
+  The source is a GitHub merge commit signed by `B5690EEEBB952194`. A
+  v0.5.0 client and a v0.5.1 broker work together in either pairing, with
+  the limits CHANGELOG [0.5.1] lists, and the live broker moves in a later
+  window. SWB-R71 v0.5.0 stays published; this record authorizes no other
+  image.
 - **SWB-R54 state custody (2026-09-27):** TIN-5105 is blahaj-operator-owned
   dedicated OpenTofu state commissioning. Backend, separate identity/carrier,
   backup, lock contention/release and scratch restore receipts must precede
@@ -1010,6 +1027,9 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R69 | 2026-10-27 | Operator ruling (Jess, narrate seat interview), Linear TIN-4655 comment `7e292300`; agent-switchboard #54 | Accept #54's three design choices: re-registering a live bound id needs its current token; a binding lapses when its session ends or after 6 h idle, which is how a lost token file is recovered, and a lapse is permanent; the per-sender rate limit (burst 20, 30 per minute, configurable) also applies to unbound senders, as a guard against a looping client. |
 | SWB-R70 | 2026-10-27 | same | Land #54 (head 8ebddff) by admin merge with a recorded release-check waiver, as for #50. Fork PRs skip CI; the local gate receipt covers it (bazel //:check 11/11, cargo test 157, clippy, fmt, spec-dhall and gitleaks). |
 | SWB-R71 | 2026-10-27 | same; SWB-R66; R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | After #54 merges, cut v0.5.0 with the same chain as v0.4.0. Approve the v0.5.0 sender-binding release: signed source cfff7913 (the #55 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:05738e97…` (4579-byte manifest), from two matching clean sting builds of that merge. Recorded in `approved-broker.json`; the signed v0.5.0 tag publishes only this digest, through `release.yml`. The lab seat then pins and delivers it, as with lab#3064. |
+| SWB-R72 | 2026-10-28 | Operator ruling (Jess, narrate seat chat), Linear TIN-4655 comment `231951ec`: "admin merges are ratified, go for it" | The narrate seat may admin-merge the v0.5.0 release chain PRs (the #56 record PR and the receipt PR), each with a release-check waiver comment. #56 merged as eada83ae at head 0d20f16. |
+| SWB-R73 | 2026-10-28 | Operator ruling (Jess, narrate seat chat), Linear TIN-7577 comment `d59d35a1`; SWB-R72; release-check waiver for #60 (TIN-7577 comment `36ec5126`); R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | Once #57 is built and reviewed, cut it as v0.5.1 with the same chain as v0.5.0. Approve the v0.5.1 delivery-fix release: signed source 154cfb19 (the #60 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:77e004b2…` (4579-byte manifest), from two matching clean builds of that merge on a lab build host. Recorded in `approved-broker.json`; the signed v0.5.1 tag publishes only this digest, through `release.yml`. The live broker moves to v0.5.1 in a later window. |
+| SWB-R74 | 2026-10-28 | SPR-80 (Jess, Sprint 4 interview, Linear TIN-7125 comment `2ff3e637`): v0.5.1 carries the delivery fixes A1 to A5, among them "`send --in-reply-to` acks"; the body defect report and fix on #57 (TIN-7577 comments `e2d6b6f5` and `30c50f22`); #57 landed under the release-check waiver in TIN-7577 comment `da8f8a83` | A message body keeps newline and tab. The store drops every CR and every other control character, and the 16 KiB limit counts the cleaned body. A `messages.body_lines` marker keeps a `--msg-id` retry of a body that v0.5.0 stored flat a replay. `swb send --in-reply-to` and the full-mode `send` tool acknowledge the original by default, as `reply` does; `--no-ack` keeps it open. Envelope v3 keeps its keys. Review item F7 of #57 asked for this row. |
 
 Estate rulings this design depends on:
 
