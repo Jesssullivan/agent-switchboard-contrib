@@ -1,7 +1,8 @@
 #!/bin/sh
 # Fail-open Claude Code hook wrapper for `swb hook claude <event>`.
 #
-# Contract (SWB-R10 as amended 2026-11-02, TIN-7577 comment 2f1439dc:
+# Contract (SWB-R10 as amended 2026-11-02, TIN-7577 comment 2f1439dc for
+# the 3.5 s bound and TIN-4655 comment 204ebf82 for the 4 s timeout:
 # 4 s timeout, always exit 0): this script always
 # exits 0 and never blocks the session. A missing `swb`, an unset SWB_BROKER_URL, a slow or unreachable
 # broker, or any `swb` failure results in no output and exit 0. Claude Code

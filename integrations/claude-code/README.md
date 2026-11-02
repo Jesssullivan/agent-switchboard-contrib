@@ -128,7 +128,8 @@ a dead or blackholed broker costs at most 4 s and never blocks a prompt or a
 stop. (Claude Code blocks only on exit 2 for these events; nothing here
 returns it.) The 3.5 s bound gives a bound register and its one retry the
 full 1.5 s request deadline each. SWB-R10 set 2 s and a 1.8 s bound until
-Jess raised the bound (TIN-7577 comment `2f1439dc`). `SessionEnd` hooks
+Jess raised the bound (TIN-7577 comment `2f1439dc`) and the timeout
+(TIN-4655 comment `204ebf82`). `SessionEnd` hooks
 share a 1.5 s budget by default; the 4 s timeout raises it to 4 s.
 
 `swb hook` reads `session_id` from the hook's stdin and the rest of the

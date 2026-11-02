@@ -487,8 +487,15 @@ One JSON line per mutation on broker stdout:
  "span_id":"<16 hex>","body":"…"}
 ```
 
-- `op` ∈ {`send`, `notify`, `fetch`, `ack`, `expire`, `register`, `ended`,
-  `claim`, `release`, `handoff`, `reconcile`}.
+- `op` ∈ {`send`, `notify`, `fetch`, `ack`, `expire`, `register`,
+  `register_grace`, `ended`, `claim`, `release`, `handoff`, `reconcile`,
+  `send_refused`}.
+- `register_grace` (v0.5.1) replaces `register` for a register that a
+  previous-token grace answered, and adds `grace`, 1 or 2 (TIN-7577,
+  review H2 of #57). It carries no token.
+- `send_refused` (v0.5.1) records a send the rate limit refused. It is a
+  refusal, not a mutation, and carries only `ts`, `code`, the harness kind,
+  `retry_after` and the route (REFERENCE).
 - `body` is present only on `send`, only once ACL A is enforced live
   (SWB-R33: TIN-4670 has applied it in `Jesssullivan/tailnet-acl` and a raw
   Loki read from a non-admin tailnet node is refused), at most 16 KiB (Loki

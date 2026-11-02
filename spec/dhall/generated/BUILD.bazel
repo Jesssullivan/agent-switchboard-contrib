@@ -3,5 +3,5 @@ package(default_visibility = ["//visibility:public"])
 # The rendered Broker.dhall constants. `just spec-dhall` ties this file to
 # Broker.dhall, //crates/swb-store:swb_store_test ties it to the store's
 # constants (review G6 of #57, TIN-7577), and //crates/swb:swb_test ties it
-# to the hook bounds (TIN-7577 comment 2f1439dc).
+# to the hook bounds (TIN-7577 comment 2f1439dc, TIN-4655 comment 204ebf82).
 exports_files(["broker-constants.json"])

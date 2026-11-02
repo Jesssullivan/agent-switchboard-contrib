@@ -117,9 +117,11 @@ in  { rulings = [ "SWB-R09", "SWB-R10", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229
       -- limit_ms, which leaves room for a bound register and its one retry
       -- (TIN-7577 comment 3955641b), each with the full request_deadline_ms.
       -- The harness kills a hook after harness_timeout_seconds, the hook
-      -- entries' "timeout", which must stay above limit_ms. The swb crate
-      -- keeps its own literals (HOOK_LIMIT, LIMIT and swb-broker's
-      -- HOOK_TIMEOUT_MS), and a swb test ties them to the rendered JSON.
+      -- entries' "timeout", which must stay above limit_ms. It is 4 (Jess,
+      -- "Yes, 4 second timeout (Recommended)", TIN-4655 comment 204ebf82).
+      -- The swb crate keeps its own literals (HOOK_LIMIT, LIMIT and
+      -- swb-broker's HOOK_TIMEOUT_MS), and a swb test ties them to the
+      -- rendered JSON.
       { request_deadline_ms = 1500
       , limit_ms = 3500
       , harness_timeout_seconds = 4
