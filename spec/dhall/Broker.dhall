@@ -39,7 +39,7 @@ let LeaseState =
       -- peers() classification in swb-store: ended wins, then age bands.
       < live | idle | gone | ended >
 
-in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655", "R-C944", "R-C950", "SWB-R61", "SWB-R66", "SWB-R67", "SWB-R68" ]
+in  { rulings = [ "SWB-R09", "SWB-R10", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655", "R-C944", "R-C950", "SWB-R61", "SWB-R66", "SWB-R67", "SWB-R68" ]
     , session =
       { lease_seconds = 900
       , live_max_age_seconds = 900
@@ -109,6 +109,20 @@ in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655"
         [ "send", "inbox", "ack", "claim", "release", "handoff", "end", "register" ]
       , send_burst_default = 20
       , send_refill_per_minute_default = 30
+      }
+    , hook =
+      -- SWB-R10: a harness hook never blocks the harness and always exits 0.
+      -- Amended 2026-11-02 (Jess, "Raise to 3.5 seconds (Recommended)",
+      -- TIN-7577 comment 2f1439dc): `swb hook` bounds its own work at
+      -- limit_ms, which leaves room for a bound register and its one retry
+      -- (TIN-7577 comment 3955641b), each with the full request_deadline_ms.
+      -- The harness kills a hook after harness_timeout_seconds, the hook
+      -- entries' "timeout", which must stay above limit_ms. The swb crate
+      -- keeps its own literals (HOOK_LIMIT, LIMIT and swb-broker's
+      -- HOOK_TIMEOUT_MS), and a swb test ties them to the rendered JSON.
+      { request_deadline_ms = 1500
+      , limit_ms = 3500
+      , harness_timeout_seconds = 4
       }
     , claim =
       { lease_default_hours = 4

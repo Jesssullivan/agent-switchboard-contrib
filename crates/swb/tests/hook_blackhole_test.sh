@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SWB-R10 / R-C949 (TIN-6688): a harness hook against a blackholed broker
-# returns within 2 s and exits 0, with no output.
+# returns within 4 s and exits 0, with no output. SWB-R10's budget was 2 s;
+# it is 4 s since the hook bound rose to 3.5 s (TIN-7577 comment 2f1439dc).
 #
 # The broker address is 192.0.2.1:9 (RFC 5737 TEST-NET-1, never routed), so
 # a SYN gets no answer and connect() waits until the client's own deadline.
@@ -12,13 +13,13 @@
 # case holds stdin open with no EOF, which deterministically exercises the
 # hook's own bound on its stdin read.
 #
-# Timing margin: the SWB-R10 ceiling is 2 s and the hook's own bound is
-# HOOK_LIMIT = 1800 ms (crates/swb/src/main.rs), leaving about 200 ms for
-# fork/exec of env, sh and swb (1866 ms worst case measured on sting, so the
-# margin is thin on a CPU-capped runner). A case that exits 0 with no output
-# but overshoots 2 s is run once more, and a second overshoot fails. That
-# retry also covers a hook that hangs for a bounded time and then exits 0
-# (say at 2.5 s): it fails only if it overshoots twice. A case that exits
+# Timing margin: the SWB-R10 ceiling is 4 s and the hook's own bound is
+# HOOK_LIMIT = 3500 ms (crates/swb/src/main.rs), leaving about 500 ms for
+# fork/exec of env, sh and swb (66 ms over the bound was the worst case
+# measured on sting with the 1800 ms bound). A case that exits 0 with no
+# output but overshoots 4 s is run once more, and a second overshoot fails.
+# That retry also covers a hook that hangs for a bounded time and then
+# exits 0 (say at 4.5 s): it fails only if it overshoots twice. A case that exits
 # non-zero or prints fails on its first run. There is no per-case timeout: a
 # hook that never returns is caught by Bazel's timeout for the whole target
 # (size "small", 60 s) as a TIMEOUT, not as a FAIL line for that case.
@@ -39,7 +40,7 @@ wrapper="$2"
 [ -x "$swb" ] || { echo "not executable: $swb" >&2; exit 1; }
 [ -f "$wrapper" ] || { echo "missing wrapper: $wrapper" >&2; exit 1; }
 
-budget_us=2000000
+budget_us=4000000
 # A closed-stdin case that reached the blackhole waits on connect for most of
 # HOOK_LIMIT; one that failed at once (no route) returns in a few ms.
 blackhole_min_us=1000000
@@ -134,17 +135,17 @@ run_case "swb-hook.sh UserPromptSubmit (stdin never closes)" open \
 [ -f "$token_file" ] || { echo "FAIL seeded end token was removed without a broker answer"; failures=$((failures + 1)); }
 
 if [ "$failures" -ne 0 ]; then
-  echo "$failures case(s) exceeded the 2 s budget, exited non-zero or printed output" >&2
+  echo "$failures case(s) exceeded the 4 s budget, exited non-zero or printed output" >&2
   exit 1
 fi
 if [ "$blackholed" -eq 0 ]; then
   # Every closed-stdin case returned in under 1 s: connect failed at once, so
   # the blackhole path did not run. Not a contract break, and not evidence.
-  echo "NO-ROUTE: all hook cases returned exit 0 within 2 s, but no closed-stdin case waited on connect; the blackhole path did not run"
+  echo "NO-ROUTE: all hook cases returned exit 0 within 4 s, but no closed-stdin case waited on connect; the blackhole path did not run"
   if [ "${SWB_HOOK_REQUIRE_BLACKHOLE:-0}" = "1" ]; then
     echo "SWB_HOOK_REQUIRE_BLACKHOLE=1: a NO-ROUTE run is not accepted" >&2
     exit 1
   fi
   exit 0
 fi
-echo "all hook cases returned exit 0 within 2 s against a blackholed broker ($blackholed closed-stdin cases waited on connect)"
+echo "all hook cases returned exit 0 within 4 s against a blackholed broker ($blackholed closed-stdin cases waited on connect)"

@@ -64,6 +64,15 @@ and the lock files move to 0.5.1 in the release bump.
   record, so the grace never outlives a downgrade. A v0.5.0 client gets
   the same answers, and this client's one retry gets a 401 from a v0.5.0
   broker, as any stale token does.
+- `swb hook` bounds its work at 3.5 seconds instead of 1.8, so a bound
+  register and its one retry each get the full 1.5 second deadline
+  (SWB-R10 as amended, Jess, "Raise to 3.5 seconds", TIN-7577 comment
+  `2f1439dc`). The hook entries in `integrations/claude-code` set
+  `"timeout": 4` instead of 2, and the wrapper's backstop is `timeout 4`.
+  A hook entry rendered elsewhere, such as lab's Home Manager module,
+  needs the same change, or the harness still stops the hook at 2
+  seconds, before the retry ends. A dead or blackholed broker now costs a
+  hook up to 4 seconds.
 - The store's `Clock` gains `monotonic_millis`. `ManualClock` gains
   `step_wall_back`, which moves only its wall reading.
 
@@ -167,10 +176,6 @@ and the lock files move to 0.5.1 in the release bump.
 - A channel walk that starts again rereads up to 4 pages it already
   emitted, and each read counts a delivery and writes a `fetch` line. An
   inbox read that counts no delivery would remove that cost.
-- The hook runs under a 1.8 second bound and a register's deadline is 1.5
-  seconds, so the hook's register retry gets only about 0.3 seconds. The
-  next hook inside the 60 seconds, or `swb whoami --register`, recovers
-  instead.
 - A first bind whose reply is lost has no previous token to recover with,
   so it waits for the 6 hour lapse, as in v0.5.0. So does a reply lost
   just before a broker restart, or on the first rotation after a

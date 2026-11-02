@@ -61,8 +61,9 @@ register on.
 
 The `swb` client retries a bound register once, with the token it holds,
 after the reply misses its deadline (`whoami --register`, `doctor
---register` and the hook). The hook runs under a 1.8 second bound, so its
-retry has only what is left of that. An unbound register is not retried.
+--register` and the hook). The hook runs under a 3.5 second bound, so the
+register and its retry each get the full 1.5 second deadline (TIN-7577
+comment `2f1439dc`). An unbound register is not retried.
 
 For a bound session the end token has the same grace: for 60 seconds the
 end token a rotation replaced still ends the session. Only the token the

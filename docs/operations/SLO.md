@@ -24,7 +24,8 @@ contractual remedy attaches to any indicator.
 - Measurement starts at the first scrape after the P1b functional exits pass.
   R-C263 sets no minimum amount of data. The targets interview decides
   whether it has enough.
-- Hooks are non-blocking by design (SWB-R10: 2 s timeout, always exit 0) and
+- Hooks are non-blocking by design (SWB-R10: 4 s timeout since 2026-11-02,
+  always exit 0) and
   fall back to the degraded-mode ladder in ADR-0001. A hook that times out
   never received an accepted send, so it is not a lost message; it shows up
   in availability and latency instead.
@@ -156,7 +157,8 @@ for acks or expiries.
 
 - **Probe definition:** from a tailnet vantage outside the broker's own pod
   and node, at a proposed 30 s cadence (not ruled), `GET http://<issued-MagicDNS>:8080/v1/peers` with no
-  `me` parameter, a 2 s timeout (the SWB-R10 hook budget) and the exact Host
+  `me` parameter, a 2 s timeout (the SWB-R10 hook budget when this was
+  written) and the exact Host
   header the route allowlists. Success is HTTP 200 with a JSON body that has
   a `peers` array.
   - Omitting `me` makes this passive discovery: it renews no lease and

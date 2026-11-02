@@ -32,6 +32,11 @@
       "holder_has_one_claim_per_subject"
     ]
   },
+  "hook": {
+    "harness_timeout_seconds": 4,
+    "limit_ms": 3500,
+    "request_deadline_ms": 1500
+  },
   "message": {
     "artifacts_max": 20,
     "body_max_bytes": 16384,
@@ -57,6 +62,7 @@
   },
   "rulings": [
     "SWB-R09",
+    "SWB-R10",
     "SWB-R14",
     "SWB-R16",
     "SWB-R46",

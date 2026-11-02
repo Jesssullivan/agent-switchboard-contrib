@@ -6,7 +6,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/swb-hook.sh SessionStart",
-            "timeout": 2
+            "timeout": 4
           }
         ]
       }
@@ -17,7 +17,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/swb-hook.sh UserPromptSubmit",
-            "timeout": 2
+            "timeout": 4
           }
         ]
       }
@@ -28,7 +28,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/swb-hook.sh Stop",
-            "timeout": 2
+            "timeout": 4
           }
         ]
       }
@@ -39,7 +39,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/swb-hook.sh SessionEnd",
-            "timeout": 2
+            "timeout": 4
           }
         ]
       }

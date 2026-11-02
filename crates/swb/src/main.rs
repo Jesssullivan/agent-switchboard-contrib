@@ -59,8 +59,17 @@ commands:
 options:
   -h, --help                print this help
   -V, --version             print the version";
+/// The deadline of one broker request.
 const LIMIT: Duration = Duration::from_millis(1500);
-const HOOK_LIMIT: Duration = Duration::from_millis(1800);
+/// The bound on all of `swb hook`'s work: its stdin read and its broker
+/// calls. SWB-R10 as amended 2026-11-02 (Jess, "Raise to 3.5 seconds
+/// (Recommended)", TIN-7577 comment `2f1439dc`): it was 1.8 seconds, which
+/// left a bound register's one retry (comment `3955641b`) about 0.3
+/// seconds. At 3.5 seconds the register and its retry each get the full
+/// [`LIMIT`]. The hook entries' harness timeout,
+/// [`swb_broker::HOOK_TIMEOUT_MS`], stays above it, and
+/// `spec/dhall/Broker.dhall` states all three values.
+const HOOK_LIMIT: Duration = Duration::from_millis(3500);
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 // A valid envelope can contain a 16 KiB body and 40 KiB of artifact paths;
 // JSON escaping can enlarge the latter up to sixfold. Use one-message pages.
@@ -1921,6 +1930,37 @@ fn serve_test_clock(path: &str, listen: &str, metrics: &str) -> ExitCode {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    /// SWB-R10 as amended (TIN-7577 comment 2f1439dc): the request
+    /// deadline, the hook bound and the harness timeout match
+    /// `spec/dhall/Broker.dhall`, a bound register and its one retry fit
+    /// inside the hook bound with full deadlines, and the hook bound fits
+    /// inside the harness timeout.
+    #[test]
+    fn the_dhall_hook_constants_match_the_client() {
+        let constants: Value = serde_json::from_str(include_str!(
+            "../../../spec/dhall/generated/broker-constants.json"
+        ))
+        .unwrap();
+        let hook = &constants["hook"];
+        assert_eq!(
+            hook["request_deadline_ms"],
+            json!(LIMIT.as_millis()),
+            "Broker.dhall and LIMIT disagree"
+        );
+        assert_eq!(
+            hook["limit_ms"],
+            json!(HOOK_LIMIT.as_millis()),
+            "Broker.dhall and HOOK_LIMIT disagree"
+        );
+        assert_eq!(
+            hook["harness_timeout_seconds"],
+            json!(swb_broker::HOOK_TIMEOUT_MS / 1000),
+            "Broker.dhall and HOOK_TIMEOUT_MS disagree"
+        );
+        assert!(2 * LIMIT <= HOOK_LIMIT, "the retry gets a full deadline");
+        assert!(HOOK_LIMIT < Duration::from_millis(swb_broker::HOOK_TIMEOUT_MS));
+    }
 
     #[test]
     fn explicit_broker_round_trip_and_session_identity() {

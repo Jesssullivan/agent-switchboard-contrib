@@ -276,8 +276,10 @@ registered once on the tailnet so that new harness instances spawn nothing.
     tailnet node is refused (SWB-R33, "Once ACL A is enforced live
     (Recommended)"). The line schema and the audit's reader scope are in
     [ADR-0002](0002-lgtm-plane.md).
-- **Failure behaviour (SWB-R10):** hooks time out after 2 s and always exit 0.
-  The broker being down never blocks a harness.
+- **Failure behaviour (SWB-R10):** hooks time out after 4 s and always exit 0
+  (2 s until the 2026-11-02 amendment). `swb hook` bounds its own work at
+  3.5 s, so a bound register and its one retry each get the 1.5 s request
+  deadline. The broker being down never blocks a harness.
 
 ### MCP tools (12 on `main`)
 
@@ -881,7 +883,8 @@ that stops, restarts or scales a process is performed by the operator
     - with the broker down (the operator scales it to zero), sessions start
       normally and the skill falls back; and with the broker's address
       blackholed (packets dropped, not refused — a NetworkPolicy or host
-      rule the operator applies) every hook still returns within 2 s and
+      rule the operator applies) every hook still returns within the
+      SWB-R10 timeout (2 s then, 4 s since 2026-11-02) and
       exits 0 (critique fix: a fast refusal does not prove the timeout);
     - the registry URL matches the live hostname, proven by a live probe
       receipt from a seat, because a hermetic test cannot see the tailnet
@@ -968,7 +971,7 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R07 | 2026-09-25 | same | Delivery pace: "phased, design doc first." |
 | SWB-R08 | 2026-09-25 | same | Repo: "`xoxd-ai/agent-switchboard`, forked as `Jesssullivan/agent-switchboard`." |
 | SWB-R09 | 2026-09-25 | TIN-4655 comment `67611936` (P0 round one) | "Retention: acked 7 d, unacked 30 d; TTL 72 h (max 14 d)." *Addendum 2026-09-25 (SWB-R25):* broker retention only; Tempo and Loki keep 7 d. |
-| SWB-R10 | 2026-09-25 | same | "Non-blocking hooks: 2 s timeout, always exit 0." |
+| SWB-R10 | 2026-09-25; amended 2026-11-02 | same. Amendment: operator ruling (Jess, "Raise to 3.5 seconds (Recommended)", TIN-7577 comment `2f1439dc`) | "Non-blocking hooks: 2 s timeout, always exit 0." *Amended 2026-11-02:* `swb hook` bounds its own work at 3.5 s instead of 1.8 s, so a bound register's one retry gets a full request deadline. The hook entries' timeout rises from 2 s to 4 s to stay above that bound. Hooks still always exit 0. |
 | SWB-R11 | 2026-09-25 | same | "Registry targets claude_code, codex and opencode (Kimi inherits); VS Code is excluded." |
 | SWB-R12 | 2026-09-25 | same | "Junie reaches the broker through the mcp-mux `tracker` group, never `mux`." |
 | SWB-R13 | 2026-09-25 | same | "Allow private forks; fork PRs pass `ci-ok` as \"gated in merge queue\", with full CI on `merge_group`." |

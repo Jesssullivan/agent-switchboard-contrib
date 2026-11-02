@@ -35,6 +35,7 @@ rust_test(
         normal_dev = True,
         proc_macro_dev = True,
     ),
+    compile_data = ["//spec/dhall/generated:broker-constants.json"],
     crate = ":swb",
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
@@ -42,7 +43,8 @@ rust_test(
 )
 
 # SWB-R10 / R-C949 (TIN-6688): the compiled hook, directly and through the
-# Claude Code wrapper, against a blackholed broker returns exit 0 within 2 s.
+# Claude Code wrapper, against a blackholed broker returns exit 0 within the
+# 4 s harness timeout (SWB-R10 as amended, TIN-7577 comment 2f1439dc).
 sh_test(
     name = "hook_blackhole_test",
     size = "small",

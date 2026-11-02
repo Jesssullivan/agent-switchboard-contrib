@@ -47,7 +47,11 @@ use swb_store::{
     SEND_REFILL_PER_MINUTE_DEFAULT, SendLimit, Store, StoreError,
 };
 
-pub const HOOK_TIMEOUT_MS: u64 = 2_000;
+/// The harness hook timeout (SWB-R10), the hook entries' `"timeout"`.
+/// Amended 2026-11-02 from 2 seconds to 4 (Jess, "Raise to 3.5 seconds
+/// (Recommended)", TIN-7577 comment `2f1439dc`), so it stays above the
+/// 3.5 second bound of `swb hook`. `spec/dhall/Broker.dhall` states it.
+pub const HOOK_TIMEOUT_MS: u64 = 4_000;
 /// Production retention interval. The store no longer prunes inside `send`
 /// or the 250 ms inbox long-poll (R-C944).
 pub const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
