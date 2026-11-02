@@ -29,10 +29,12 @@ and the lock files move to 0.5.1 in the release bump.
   refused with `unknown envelope field`, as any unknown key is.
 - `swb send --in-reply-to` now acknowledges the original by default. A
   script that used it to keep that message open must add `--no-ack`.
-- A v0.5.0 client against a v0.5.1 broker gets two extra keys it ignores:
-  `next_after` on `inbox` and `recipient_state` on `send`. The wider
+- A v0.5.0 client against a v0.5.1 broker gets three extra keys it
+  ignores: `next_after` on `inbox`, `recipient_state` on `send` and
+  `registered_seq` on `peers` rows listed with `proc_start`. The wider
   `proc_start` filter fixes A4 for v0.5.0 channels as soon as the broker
-  upgrades.
+  upgrades. A v0.5.0 channel still picks its row by `last_seen`, so the
+  same-second tie below stays open for it until the client upgrades.
 - A v0.5.1 client against a v0.5.0 or older broker: the channel sends
   `after` only when the head page carried `next_after`, so it never sends
   one there, and A1 stays open until the broker upgrades. A2 and A3 work
@@ -74,6 +76,23 @@ and the lock files move to 0.5.1 in the release bump.
 - **A5, send to a dead recipient.** A send now reports `recipient_state`,
   and the clients warn when the recipient is not live. SPR-80 rules a
   warning: the send still succeeds.
+- **A5, `live` for a restarted session's old id** (review F1 of #57). An
+  unbound session that restarts under a new pid leaves its old row inside
+  the 15 minute lease, so a send to the old id said `live` while nobody
+  read it. `recipient_state` is now `superseded` when another pid of the
+  same harness, host and session id registered after the id sent to and
+  no live binding reads the key. The clients warn that the mail may go
+  unread. A live twin process may still read the id, so the warning does
+  not say it is unread.
+- **The channel kept an older session row on a same-second tie** (review
+  F2 of #57, also in v0.5.0). `swb channel` chose among its process's
+  rows by `last_seen`, then by agent id, and its own inbox reads renewed
+  the row it chose. A re-register under a new session id in the same
+  clock second as a channel read could leave the channel reading the old
+  id, so mail to the new id stayed queued with no delivery. `peers` rows
+  listed with `proc_start` now carry `registered_seq`, and the channel
+  picks the newest registration. Against an older broker it falls back
+  to `last_seen`.
 - **Bodies lost their line breaks** (TIN-7577 comment `e2d6b6f5`). The
   store removed every control character from a body, newline and tab
   included, although the channel frame keeps both. The store now keeps

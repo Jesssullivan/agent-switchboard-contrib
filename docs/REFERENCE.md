@@ -102,7 +102,7 @@ a POST with a JSON body (`Content-Type: application/json`).
 | --- | --- | --- |
 | `POST /v1/register` | `{harness, host, pid, session_id, proc_start, bind?, session_token?}` | returns `{agent_id, lease_seconds, end_token, bound}`, plus `session_token` when bound |
 | `POST /v1/end` | `{me, end_token, session_token?}` | any other end token answers `{"state":"unknown"}` and ends nothing |
-| `POST /v1/peers` | `{me?, all?, host?, limit?, cursor?, proc_start?}` | `me` renews that session's lease; `proc_start` keeps only registrations that used it, then one row per session among them (v0.5.1) |
+| `POST /v1/peers` | `{me?, all?, host?, limit?, cursor?, proc_start?}` | `me` renews that session's lease; `proc_start` keeps only registrations that used it, then one row per session among them, and each row then adds `registered_seq`, the registration order (v0.5.1) |
 | `GET /v1/peers` | `?all=&host=&limit=&cursor=` | passive listing; changes nothing |
 | `POST /v1/send` | `{from, to, ticket, body, …, session_token?}` (envelope v3) | `ticket` is `TIN-<digits>` or `none`; a body is at most 16 KiB and keeps newline and tab, while CR and other control characters are removed (v0.5.1); an empty sender bucket answers 429; an invalid send or an idempotent retry spends no bucket token; the result adds `recipient_state` (v0.5.1); a 429 carries `retry_after` and a `Retry-After` header when the bucket refills (v0.5.1) |
 | `POST /v1/inbox` | `{me, limit, wait_seconds, after?, session_token?}` | long-poll; oldest first in arrival order; a full page carries `next_after` (v0.5.1) |
@@ -133,9 +133,14 @@ any state. Any other id answers 400 `invalid_argument` with
 for mail past it.
 
 A `send` result adds `recipient_state` from v0.5.1. It is `live`, `idle`,
-`gone`, `ended` or `unregistered`, and says whether anyone reads the
-recipient's mail now. A live binding of the recipient's harness, host
-and session id counts for every pid of it. The send succeeds in every
+`gone`, `ended`, `superseded` or `unregistered`, and says whether anyone
+reads the recipient's mail now. A live binding of the recipient's harness,
+host and session id counts for every pid of it. Without one, `superseded`
+means another pid of that harness, host and session id registered after
+the id sent to, so a restarted session no longer reads it. A live twin
+process of the session may still read it, so `superseded` says the mail
+may go unread, not that it will. A client that does not know a state
+treats it as no warning. The send succeeds in every
 state, and the message waits in its mailbox until it expires. The stored
 and delivered envelope never carry the field, and envelope v3 does not
 list it: a submitted envelope with it answers `unknown envelope field`.

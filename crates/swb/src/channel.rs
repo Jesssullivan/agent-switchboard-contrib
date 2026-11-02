@@ -291,15 +291,24 @@ fn registered_row(lookup: Lookup) -> Result<Option<String>, String> {
         })
         .filter_map(|row| {
             let id = text(row, "agent_id").filter(|id| valid_agent_id(id))?;
+            // Review F2 of #57: the newest registration wins. Its own inbox
+            // reads renew the row the channel picked, so a pick by
+            // `last_seen` alone could keep an older session id after a
+            // same-second re-register. A v0.5.1 broker lists
+            // `registered_seq` under this filter. An older one does not, so
+            // `last_seen` then decides as before.
             (id.split(':').nth(2) == Some(pid.as_str())).then(|| {
                 (
+                    row.get("registered_seq")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
                     row.get("last_seen").and_then(Value::as_i64).unwrap_or(0),
                     id,
                 )
             })
         })
         .max()
-        .map(|(_, id)| id))
+        .map(|(_, _, id)| id))
 }
 
 fn me_or_err(lookup: Lookup) -> Result<String, String> {
@@ -1833,6 +1842,36 @@ mod tests {
         assert_eq!(request_json(&requests[1])["cursor"], "claude:neo:77:stale");
         assert!(requests[2].starts_with("POST /v1/inbox HTTP/1.1"));
         assert_eq!(request_json(&requests[2])["me"], "claude:neo:77:new");
+    }
+
+    /// Review F2 of #57: two rows of this process share a `last_seen`
+    /// second. The greater session id sorts last, but the newer
+    /// registration wins by `registered_seq`. Without `registered_seq` (an
+    /// older broker) `last_seen` and then the id decide, as before.
+    #[test]
+    fn identity_picks_the_newest_registration_on_a_same_second_tie() {
+        let peers = r#"{"peers":[
+            {"agent_id":"claude:neo:77:aaa-new","harness":"claude","host":"neo","last_seen":40,"state":"live","registered_seq":12},
+            {"agent_id":"claude:neo:77:zzz-old","harness":"claude","host":"neo","last_seen":40,"state":"live","registered_seq":11}
+        ]}"#;
+        let older = r#"{"peers":[
+            {"agent_id":"claude:neo:77:aaa-new","harness":"claude","host":"neo","last_seen":40,"state":"live"},
+            {"agent_id":"claude:neo:77:zzz-old","harness":"claude","host":"neo","last_seen":40,"state":"live"}
+        ]}"#;
+        for (listing, want) in [
+            (peers, "claude:neo:77:aaa-new"),
+            (older, "claude:neo:77:zzz-old"),
+        ] {
+            let (url, server) = mock(vec![(200, "application/json", listing)]);
+            let lookup = lookup_of(&[
+                ("SWB_BROKER_URL", &url),
+                ("SWB_HOST", "neo"),
+                ("SWB_SESSION_PID", "77"),
+                ("SWB_PROC_START", "p1"),
+            ]);
+            assert_eq!(resolve_me(&lookup).unwrap().as_deref(), Some(want));
+            server.join().unwrap();
+        }
     }
 
     #[test]

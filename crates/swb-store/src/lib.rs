@@ -218,8 +218,8 @@ pub struct SendOutcome {
     pub envelope: Value,
     pub created: bool,
     /// Where mail to the recipient stands when the send commits: `live`,
-    /// `idle`, `gone`, `ended` or `unregistered` (A5, TIN-7577). A send
-    /// result carries it; the stored envelope never does.
+    /// `idle`, `gone`, `ended`, `superseded` or `unregistered` (A5,
+    /// TIN-7577). A send result carries it; the stored envelope never does.
     pub recipient_state: &'static str,
 }
 
@@ -239,7 +239,8 @@ pub struct PeersQuery<'a> {
     pub cursor: Option<&'a str>,
     /// Only registrations that used this `proc_start`, then one row per
     /// harness, host and session id among them (A4, TIN-7577). The caller
-    /// supplies it; listings still never return it.
+    /// supplies it; listings still never return it. Rows listed with it
+    /// carry `registered_seq`, the store's registration order (F2).
     pub proc_start: Option<&'a str>,
 }
 
@@ -437,24 +438,55 @@ fn is_live_binding(row: &BindingRow, now: i64) -> bool {
 /// Where mail to `recipient` stands (A5, TIN-7577). A live binding of its
 /// delivery key reads mail for every pid of that key, so the binding's own
 /// lease counts. Otherwise the recipient's own row decides, and an id with
-/// no row is `unregistered`. Read-only: it never marks a lapsed binding.
+/// no row is `unregistered`. An unended row that another agent id of the
+/// same harness, host and session id registered after is `superseded`: the
+/// session restarted under a new pid, so its live lease no longer shows
+/// that anyone reads this id (review F1 of #57). Read-only: it never marks
+/// a lapsed binding.
 fn recipient_state_of(db: &Connection, recipient: &str, now: i64) -> StoreResult<&'static str> {
     if let Some(row) = latest_key_row(db, recipient)?
         && is_live_binding(&row, now)
     {
         return Ok(lease_state(row.4, false, now));
     }
-    let row: Option<(i64, i64)> = db
+    let row: Option<(i64, i64, String, String, Option<String>, i64)> = db
         .query_row(
-            "SELECT last_seen, ended FROM sessions WHERE agent_id=?1",
+            "SELECT last_seen, ended, harness, host, session_id, registered_seq
+             FROM sessions WHERE agent_id=?1",
             [recipient],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .optional()
         .map_err(sql_err)?;
-    Ok(row.map_or("unregistered", |(seen, ended)| {
-        lease_state(seen, ended != 0, now)
-    }))
+    let Some((seen, ended, harness, host, session, seq)) = row else {
+        return Ok("unregistered");
+    };
+    if ended != 0 {
+        return Ok("ended");
+    }
+    let session = session.unwrap_or_else(|| session_of(recipient).to_owned());
+    let newer: Option<i64> = db
+        .query_row(
+            "SELECT 1 FROM sessions WHERE harness=?1 AND host=?2 AND session_id=?3
+               AND agent_id!=?4 AND registered_seq>?5 LIMIT 1",
+            params![harness, host, session, recipient, seq],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql_err)?;
+    if newer.is_some() {
+        return Ok("superseded");
+    }
+    Ok(lease_state(seen, false, now))
 }
 fn lease_state(seen: i64, ended: bool, now: i64) -> &'static str {
     if ended {
@@ -1068,11 +1100,11 @@ impl Store {
                 // one-row-per-session dedupe, so two live processes of one
                 // session each find their own row.
                 "WITH latest AS (
-                   SELECT agent_id,harness,host,last_seen,ended,bound,
+                   SELECT agent_id,harness,host,last_seen,ended,bound,registered_seq,
                      ROW_NUMBER() OVER (PARTITION BY harness,host,COALESCE(session_id,agent_id)
                                         ORDER BY registered_seq DESC, agent_id DESC) AS pos
                    FROM sessions WHERE (?7 IS NULL OR proc_start=?7))
-                 SELECT agent_id,harness,host,last_seen,ended,bound FROM latest
+                 SELECT agent_id,harness,host,last_seen,ended,bound,registered_seq FROM latest
                  WHERE pos=1 AND (?1 IS NULL OR host=?1) AND (?2 IS NULL OR agent_id>?2)
                    AND (?3 OR (ended=0 AND last_seen>=?4-?5))
                  ORDER BY agent_id LIMIT ?6",
@@ -1095,11 +1127,18 @@ impl Store {
                     let state = lease_state(seen, ended != 0, now);
                     // SWB-R68: a row is bound while its binding is live.
                     let bound = r.get::<_, i64>(5)? == 1 && matches!(state, "live" | "idle");
-                    Ok(
-                        json!({"agent_id":r.get::<_,String>(0)?,"harness":r.get::<_,String>(1)?,
+                    let mut row = json!({"agent_id":r.get::<_,String>(0)?,"harness":r.get::<_,String>(1)?,
                         "host":r.get::<_,String>(2)?,"last_seen":seen,
-                        "state":state,"bound":bound}),
-                    )
+                        "state":state,"bound":bound});
+                    // Review F2 of #57: a caller that names its own
+                    // proc_start also gets the registration order, so it
+                    // can pick its newest row when two share a last_seen
+                    // second. Rows listed without the filter stay as they
+                    // were.
+                    if query.proc_start.is_some() {
+                        row["registered_seq"] = json!(r.get::<_, i64>(6)?);
+                    }
+                    Ok(row)
                 },
             )
             .map_err(sql_err)?;
@@ -2757,6 +2796,90 @@ mod tests {
         assert!(messages.iter().all(|m| m.get("recipient_state").is_none()));
     }
 
+    /// Review F1 of #57: an unbound session that restarts under a new pid
+    /// leaves its old row inside the lease. Mail to the old id is
+    /// `superseded`, not `live`, in the same clock second too. A
+    /// re-register of the old pid makes it the newest row again.
+    #[test]
+    fn send_reports_superseded_for_an_older_pid_of_the_same_session() {
+        let (s, _clock) = clocked();
+        let old = "claude:host-b:51:s";
+        let new = "claude:host-b:52:s";
+        let send = |to: &str| {
+            s.send(&json!({"from":"pi:host-a:1:a","to":to,"ticket":"none","body":"x"}))
+                .unwrap()
+                .recipient_state
+        };
+        reg(&s, "claude", "host-b", 51, "s", "p51");
+        assert_eq!(send(old), "live");
+        reg(&s, "claude", "host-b", 52, "s", "p52");
+        assert_eq!(send(old), "superseded");
+        assert_eq!(send(new), "live");
+        // Another session id, harness or host does not supersede.
+        reg(&s, "claude", "host-b", 53, "other", "p53");
+        reg(&s, "codex", "host-b", 54, "s", "p54");
+        reg(&s, "claude", "host-c", 55, "s", "p55");
+        assert_eq!(send(new), "live");
+        // The old pid registers again and is the newest row.
+        reg(&s, "claude", "host-b", 51, "s", "p51");
+        assert_eq!(send(old), "live");
+        assert_eq!(send(new), "superseded");
+        // An ended row stays `ended`.
+        let ended = reg(&s, "claude", "host-b", 52, "s", "p52");
+        s.end(new, ended["end_token"].as_str().unwrap()).unwrap();
+        assert_eq!(send(new), "ended");
+        assert_eq!(send(old), "superseded");
+    }
+
+    /// Review F1 of #57, bound control: a live binding of the key reads
+    /// mail for every pid of it, so the older pid stays `live`.
+    #[test]
+    fn send_to_an_older_pid_of_a_live_binding_stays_live() {
+        let s = Store::memory().unwrap();
+        let first = bind(&s, "hermes", "host-b", 51, "svc", None).unwrap();
+        bind(&s, "hermes", "host-b", 52, "svc", Some(&token_of(&first))).unwrap();
+        let sent = s
+            .send(&json!({"from":"pi:host-a:1:a","to":"hermes:host-b:51:svc",
+                "ticket":"none","body":"x"}))
+            .unwrap();
+        assert_eq!(sent.recipient_state, "live");
+    }
+
+    /// Review F2 of #57: one process re-registers under a new session id in
+    /// the same clock second. Both rows share `last_seen`, so a filtered
+    /// listing carries `registered_seq` and the new row's is greater. An
+    /// unfiltered listing does not carry it.
+    #[test]
+    fn peers_with_proc_start_carry_registered_seq_for_a_same_second_tie() {
+        let (s, _clock) = clocked();
+        reg(&s, "claude", "host-b", 7, "zzz-old", "p7");
+        reg(&s, "claude", "host-b", 7, "aaa-new", "p7");
+        let page = s
+            .peers(&PeersQuery {
+                all: true,
+                proc_start: Some("p7"),
+                ..PeersQuery::default()
+            })
+            .unwrap();
+        let rows = page["peers"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let seq = |id: &str| {
+            rows.iter().find(|r| r["agent_id"] == id).unwrap()["registered_seq"]
+                .as_i64()
+                .unwrap()
+        };
+        assert_eq!(rows[0]["last_seen"], rows[1]["last_seen"]);
+        assert!(seq("claude:host-b:7:aaa-new") > seq("claude:host-b:7:zzz-old"));
+        let plain = s.peers(&all()).unwrap();
+        assert!(
+            plain["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r.get("registered_seq").is_none())
+        );
+    }
+
     /// TIN-7577: a body keeps its newlines and tabs through send, inbox
     /// and thread. CRLF becomes LF; a lone CR and every other control
     /// character are dropped.
@@ -2906,8 +3029,9 @@ mod tests {
                 .recipient_state
         };
         assert_eq!(state(&old), "live");
-        // A bound row without a token nonce is no binding to the inbox gate,
-        // so the old pid's own row decides.
+        // A bound row without a token nonce is no binding to the inbox gate.
+        // The old pid's own row is then older than pid 200's, so it is
+        // superseded (review F1 of #57), not idle.
         s.0.lock()
             .unwrap()
             .execute(
@@ -2915,7 +3039,7 @@ mod tests {
                 [&old],
             )
             .unwrap();
-        assert_eq!(state(&old), "idle");
+        assert_eq!(state(&old), "superseded");
         // An unbound session that went quiet stays gone, and another pid
         // of it with no row is unregistered.
         reg(&s, "pi", "host-b", 2, "b", "p");

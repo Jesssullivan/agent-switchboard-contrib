@@ -95,7 +95,8 @@ v0.5.1 (TIN-7577) fixes message delivery and counts send refusals. What
 each change reveals:
 
 - **`recipient_state`.** A `send` result says whether the recipient is
-  live, idle, gone, ended or unregistered. This is new disclosure. It
+  live, idle, gone, ended, superseded or unregistered. This is new
+  disclosure. It
   answers for the exact id sent to, an older pid of a session included,
   which default `peers` hides behind the session's latest row. It also
   shows whether that id's harness, host and session id hold a live
@@ -108,7 +109,15 @@ each change reveals:
   about another sender.
 - **The `peers` proc_start filter.** It now matches any registration row
   with that stamp, not only the latest row of a session. The stamp has
-  granted nothing since v0.3.0, and listings still never return it.
+  granted nothing since v0.3.0, and listings still never return it. Rows
+  listed with it carry `registered_seq`, the store-wide registration
+  counter at that row's latest register. It orders registrations and
+  reveals roughly how many registrations the broker has taken. Only a
+  caller that already holds the stamp gets it.
+- **`superseded`.** `recipient_state` says when a newer pid of the
+  recipient's harness, host and session id registered after the id sent
+  to. Default `peers` already shows that newer row as the session's
+  latest one.
 - **`inbox` `after`.** A cursor resolves only against the caller's own
   mailbox, by its delivery key when the id is bound. Another mailbox's id
   answers `unknown after`, the same answer as an id that never existed,

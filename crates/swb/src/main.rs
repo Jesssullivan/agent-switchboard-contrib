@@ -836,14 +836,20 @@ fn send_cmd(lookup: Lookup, args: &SendArgs, body: &str) -> Result<Value, String
     Ok(sent)
 }
 
-/// One line when a send result says nobody is reading the recipient's mail
-/// now (A5, TIN-7577). `live`, a missing `recipient_state` (a v0.5.0 or
+/// One line when a send result says nobody may be reading the recipient's
+/// mail now (A5, TIN-7577). `live`, a missing `recipient_state` (a v0.5.0 or
 /// older broker) and an unknown value give none. The send still stands.
 fn recipient_warning(sent: &Value) -> Option<String> {
     let what = match sent.get("recipient_state").and_then(Value::as_str)? {
         "idle" => "has made no switchboard call for more than 15 minutes",
         "gone" => "has made no switchboard call for more than 6 hours",
         "ended" => "has ended",
+        // Review F1 of #57: a newer pid of the same session registered. A
+        // live twin may still read this id, so this does not say unread.
+        "superseded" => {
+            "has a newer registration of its session under another pid, so this id \
+             may no longer be read: check `swb peers`"
+        }
         "unregistered" => "is not registered: check the id with `swb peers --all`",
         _ => return None,
     };
@@ -2473,6 +2479,7 @@ mod tests {
             ("idle", "for more than 15 minutes"),
             ("gone", "for more than 6 hours"),
             ("ended", "has ended"),
+            ("superseded", "newer registration of its session"),
             ("unregistered", "swb peers --all"),
         ] {
             let warning =
