@@ -28,7 +28,7 @@ new agent id.
 | ID | Ruling |
 | --- | --- |
 | SWB-R66 | This ADR is accepted and ships as v0.5.0. Binding stays opt-in. Acceptance includes the spoof test: a send with `from` set to a bound id and no token fails. It amends SWB-R05 and SWB-R14 as described here, and `authority` stays `peer`. |
-| SWB-R67 | A bound client keeps its token in a 0600 file and rotates it on every re-register. |
+| SWB-R67 | A bound client keeps its token in a 0600 file and rotates it on every re-register. *Amended 2026-11-02* (Jess, "Short grace for old token", TIN-7577 comment `41c4704d`, review F4 of #57): after a rotation, the previous token stays valid for a short grace of about 60 seconds, so a reply lost to a timeout cannot lock the session out until the 6 hour lapse. Two tokens are valid during that window. |
 | SWB-R68 | `swb peers` shows whether an id is bound. |
 
 The ruling left the bucket size and refill rate to the implementing PR. The
@@ -54,6 +54,14 @@ defaults below are that choice.
    - A new registration of a bound key, with any pid and with or without
      `bind`, must present the current token. It keeps the binding and
      rotates the token, which invalidates the old one.
+   - *Amended 2026-11-02 (SWB-R67 as amended, TIN-7577 comment
+     `41c4704d`, v0.5.1):* the old token stays valid for 60 seconds after
+     the rotation (`SESSION_TOKEN_GRACE_SECONDS`, fixed in the store and
+     not configurable). Every operation above and a new registration
+     accept it for the binding's current agent id. Only the token the
+     latest rotation replaced counts: a token two rotations old is
+     refused, and so is the previous token once the 60 seconds end. A
+     first bind, or a bind after a lapse, has no previous token.
    - An id whose key has no live binding behaves as in v0.4.0, and a token
      it presents is ignored.
    - `peers`, `claims`, `heartbeat` and `thread` take no token.

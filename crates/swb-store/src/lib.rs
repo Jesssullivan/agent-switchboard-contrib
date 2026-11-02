@@ -18,6 +18,12 @@
 //! registration of the same (harness, host, session id) must present it, and
 //! inbox delivery keys on (harness, host, session id) so a restarted service
 //! keeps its unread mail. An unbound id behaves as in v0.4.0.
+//!
+//! v0.5.1 (SWB-R67 as amended by Jess's ruling "Short grace for old
+//! token", TIN-7577 comment `41c4704d`): after a re-register rotates a bound
+//! key's token, the token it replaced stays valid for
+//! [`SESSION_TOKEN_GRACE_SECONDS`], so a client whose register reply was
+//! lost can still act and register again.
 
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -54,6 +60,16 @@ pub const PEERS_MAX_LIMIT: u32 = 200;
 pub const END_TOKEN_HEX_LEN: usize = 64;
 /// Hex length of a session token (an HMAC-SHA256, ADR-0003).
 pub const SESSION_TOKEN_HEX_LEN: usize = 64;
+/// How long a bound key's previous session token stays valid after a
+/// re-register rotates it: 60 seconds, the "about 60 seconds" of the
+/// ruling that amends SWB-R67 (Jess, "Short grace for old token", TIN-7577
+/// comment `41c4704d`). A client whose register reply was lost to a
+/// deadline still holds that token, and within the grace it can act as the
+/// binding and register again to get the current one. Only the token that
+/// the latest rotation replaced counts, never an older one, and only until
+/// the grace ends. The value is fixed here: no setting or environment
+/// variable changes it, so it cannot be raised without a new ruling.
+pub const SESSION_TOKEN_GRACE_SECONDS: i64 = 60;
 
 pub fn effective_ttl_hours(requested: Option<u32>) -> u32 {
     requested
@@ -408,6 +424,10 @@ fn unauthorized(message: &str) -> StoreError {
 struct Binding {
     agent_id: String,
     nonce: Vec<u8>,
+    /// The agent id and nonce of the token the latest rotation replaced,
+    /// while [`SESSION_TOKEN_GRACE_SECONDS`] has not run out since it
+    /// (SWB-R67 as amended, TIN-7577 comment `41c4704d`).
+    previous: Option<(String, Vec<u8>)>,
 }
 /// A key's latest session row: agent id, nonce, bound, ended, last_seen.
 type BindingRow = (String, Option<Vec<u8>>, i64, i64, i64);
@@ -592,6 +612,29 @@ impl Store {
             (
                 "bound",
                 "ALTER TABLE sessions ADD COLUMN bound INTEGER NOT NULL DEFAULT 0",
+            ),
+            // v0.5.1 (SWB-R67 as amended, TIN-7577 comment `41c4704d`): the
+            // binding's previous token, kept as the agent id and nonce it
+            // was derived from, when the rotation ran, and the
+            // `registered_seq` of the register that rotated it. A broker
+            // that does not know these columns (v0.5.0 after a downgrade)
+            // changes `registered_seq` on its next register of the row, so
+            // the stale record no longer matches and grants nothing.
+            (
+                "prev_token_agent_id",
+                "ALTER TABLE sessions ADD COLUMN prev_token_agent_id TEXT",
+            ),
+            (
+                "prev_token_nonce",
+                "ALTER TABLE sessions ADD COLUMN prev_token_nonce BLOB",
+            ),
+            (
+                "prev_token_rotated_at",
+                "ALTER TABLE sessions ADD COLUMN prev_token_rotated_at INTEGER",
+            ),
+            (
+                "prev_token_registered_seq",
+                "ALTER TABLE sessions ADD COLUMN prev_token_registered_seq INTEGER",
             ),
         ] {
             if !columns.iter().any(|c| c == column) {
@@ -802,7 +845,12 @@ impl Store {
         Ok(match latest_key_row(db, agent_id)? {
             Some(row) if is_live_binding(&row, now) => {
                 let (agent_id, nonce, ..) = row;
-                nonce.map(|nonce| Binding { agent_id, nonce })
+                let previous = Self::previous_in_grace(db, &agent_id, now)?;
+                nonce.map(|nonce| Binding {
+                    agent_id,
+                    nonce,
+                    previous,
+                })
             }
             Some((agent_id, _, 1, _, _)) => {
                 db.execute("UPDATE sessions SET bound=0 WHERE agent_id=?1", [&agent_id])
@@ -812,7 +860,48 @@ impl Store {
             _ => None,
         })
     }
-    /// Whether `presented` is the session token of `binding`.
+    /// The token the latest rotation of `agent_id`'s binding replaced, as
+    /// the agent id and nonce it was derived from, while it is in its grace
+    /// (SWB-R67 as amended, TIN-7577 comment `41c4704d`). The record must
+    /// come from the row's latest register, so a register by a broker that
+    /// does not keep it voids it, and the grace runs for
+    /// [`SESSION_TOKEN_GRACE_SECONDS`] from the rotation. A clock that
+    /// stepped back before the rotation also voids it.
+    fn previous_in_grace(
+        db: &Connection,
+        agent_id: &str,
+        now: i64,
+    ) -> StoreResult<Option<(String, Vec<u8>)>> {
+        type Previous = (
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+        );
+        let row: Option<Previous> = db
+            .query_row(
+                "SELECT prev_token_agent_id, prev_token_nonce, prev_token_rotated_at,
+                        prev_token_registered_seq, registered_seq
+                 FROM sessions WHERE agent_id=?1",
+                [agent_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        Ok(match row {
+            Some((Some(prev_agent), Some(prev_nonce), Some(at), Some(seq), current))
+                if seq == current && (0..SESSION_TOKEN_GRACE_SECONDS).contains(&(now - at)) =>
+            {
+                Some((prev_agent, prev_nonce))
+            }
+            _ => None,
+        })
+    }
+    /// Whether `presented` is the session token of `binding`: its current
+    /// token, or the one its latest rotation replaced while that one is in
+    /// its grace. A token two rotations old, or one never issued, never
+    /// matches.
     fn token_matches(db: &Connection, binding: &Binding, presented: &str) -> StoreResult<bool> {
         if presented.len() != SESSION_TOKEN_HEX_LEN {
             return Ok(false);
@@ -820,18 +909,27 @@ impl Store {
         let Some(bytes) = unhex(presented) else {
             return Ok(false);
         };
-        Ok(
-            Self::session_token_mac(db, &binding.agent_id, &binding.nonce)?
+        if Self::session_token_mac(db, &binding.agent_id, &binding.nonce)?
+            .verify_slice(&bytes)
+            .is_ok()
+        {
+            return Ok(true);
+        }
+        Ok(match &binding.previous {
+            Some((agent_id, nonce)) => Self::session_token_mac(db, agent_id, nonce)?
                 .verify_slice(&bytes)
                 .is_ok(),
-        )
+            None => false,
+        })
     }
     /// Sender binding (ADR-0003, SWB-R66): may a request act as `agent_id`?
     ///
     /// An id whose delivery key has no live binding needs nothing, as in
     /// v0.4.0, and a token it presents is ignored. While the key is bound,
     /// only the binding's own agent id may act, and only with the session
-    /// token its latest registration returned. Every refusal is
+    /// token its latest registration returned, or for
+    /// [`SESSION_TOKEN_GRACE_SECONDS`] after a rotation, the token that
+    /// rotation replaced (SWB-R67 as amended). Every refusal is
     /// [`ErrorKind::Unauthorized`]. An invalid id passes here so the
     /// operation itself reports it. [`Store::send_as`] (for `from`),
     /// [`Store::inbox_as`], [`Store::ack_as`], [`Store::claim_as`],
@@ -923,6 +1021,14 @@ impl Store {
     /// pid, with or without `bind`) must present the current token as
     /// `session_token`, keeps the binding and rotates the token. Every
     /// result says `bound`.
+    ///
+    /// SWB-R67 as amended (Jess, "Short grace for old token", TIN-7577
+    /// comment `41c4704d`): the rotation records the token it replaced, and
+    /// for [`SESSION_TOKEN_GRACE_SECONDS`] that token is accepted too, here
+    /// and by every operation that needs the session token. A register that
+    /// presents it rotates again, and the token it replaces is then the one
+    /// the caller never received, so a token two rotations old never works.
+    /// A first bind, or a bind after a lapse, records no previous token.
     pub fn register(&self, input: &Value) -> StoreResult<Value> {
         let harness = field(input, "harness")?;
         if !valid_harness(harness) {
@@ -968,6 +1074,16 @@ impl Store {
             }
         }
         let bound = bind || held.is_some();
+        // The token this register replaces: always the binding's current
+        // one, whichever valid token was presented.
+        let (prev_agent, prev_nonce, prev_at) = match &held {
+            Some(binding) => (
+                Some(binding.agent_id.clone()),
+                Some(binding.nonce.clone()),
+                Some(now),
+            ),
+            None => (None, None, None),
+        };
         let nonce = random_bytes::<16>()?.to_vec();
         tx.execute("INSERT INTO counters(name,value) VALUES('registrations',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
         let seq: i64 = tx
@@ -977,11 +1093,16 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(sql_err)?;
-        tx.execute("INSERT INTO sessions(agent_id,harness,host,proc_start,last_seen,session_id,registered_seq,token_nonce,bound) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+        let prev_seq = prev_at.map(|_| seq);
+        tx.execute("INSERT INTO sessions(agent_id,harness,host,proc_start,last_seen,session_id,registered_seq,token_nonce,bound,
+                      prev_token_agent_id,prev_token_nonce,prev_token_rotated_at,prev_token_registered_seq)
+                    VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                     ON CONFLICT(agent_id) DO UPDATE SET proc_start=excluded.proc_start,last_seen=excluded.last_seen,ended=0,
                       session_id=excluded.session_id,registered_seq=excluded.registered_seq,token_nonce=excluded.token_nonce,
-                      bound=excluded.bound",
-            params![id,harness,host,proc_start,now,session_id,seq,nonce,bound]).map_err(sql_err)?;
+                      bound=excluded.bound,prev_token_agent_id=excluded.prev_token_agent_id,
+                      prev_token_nonce=excluded.prev_token_nonce,prev_token_rotated_at=excluded.prev_token_rotated_at,
+                      prev_token_registered_seq=excluded.prev_token_registered_seq",
+            params![id,harness,host,proc_start,now,session_id,seq,nonce,bound,prev_agent,prev_nonce,prev_at,prev_seq]).map_err(sql_err)?;
         // The newest registration of a key is the only row that may carry its
         // binding, so an earlier pid's row can never become bound again.
         tx.execute(
@@ -1960,8 +2081,10 @@ mod tests {
                 .kind,
             ErrorKind::Unauthorized
         );
-        // SWB-R67: every re-register by the holder rotates the token, and the
-        // old one stops working. Registering without bind keeps the binding.
+        // SWB-R67: every re-register by the holder rotates the token.
+        // Registering without bind keeps the binding. As amended (TIN-7577
+        // comment 41c4704d) the old token keeps working for the grace;
+        // the clocked tests below cover its end.
         let again = s
             .register(
                 &json!({"harness":"hermes","host":"sting","pid":100,"session_id":"svc",
@@ -1971,10 +2094,7 @@ mod tests {
         assert_eq!(again["bound"], true);
         let rotated = token_of(&again);
         assert_ne!(rotated, token);
-        assert_eq!(
-            s.authorize(me, Some(&token)).unwrap_err(),
-            "invalid session token"
-        );
+        s.authorize(me, Some(&token)).unwrap();
         s.authorize(me, Some(&rotated)).unwrap();
         // Another session id on the same host is its own, unbound key.
         s.authorize("hermes:sting:100:other", None).unwrap();
@@ -2108,6 +2228,210 @@ mod tests {
         assert_eq!(s.peers(&all()).unwrap()["peers"][0]["bound"], false);
         let taken = reg(&s, "hermes", "sting", 100, "svc", "start-100");
         assert_eq!(taken["bound"], false);
+    }
+
+    /// Re-register a bound key as `pid` presenting `token`, the way the
+    /// client does with the token it saved.
+    fn rotate(s: &Store, pid: u32, token: &str) -> StoreResult<Value> {
+        s.register(
+            &json!({"harness":"hermes","host":"sting","pid":pid,"session_id":"svc",
+            "proc_start":format!("start-{pid}"),"session_token":token}),
+        )
+    }
+
+    /// The register result keys, so a v0.5.0 client sees the same shape.
+    fn keys(v: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Review F4 of #57, SWB-R67 as amended (TIN-7577 comment 41c4704d):
+    /// the broker commits a rotation and the reply is lost to the client
+    /// deadline, so the client still holds the old token. Within the grace
+    /// it can read, send, and register again to get the current token, by
+    /// the same pid or by a restarted one.
+    #[test]
+    fn a_lost_register_reply_recovers_within_the_token_grace() {
+        let grace = u32::try_from(SESSION_TOKEN_GRACE_SECONDS).unwrap();
+        for new_pid in [100, 200] {
+            let (s, clock) = clocked();
+            let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+            let old_id = first["agent_id"].as_str().unwrap().to_owned();
+            let held = token_of(&first);
+            // The rotation commits; its reply never reaches the client.
+            let lost = rotate(&s, new_pid, &held).unwrap();
+            assert_eq!(
+                keys(&lost),
+                [
+                    "agent_id",
+                    "bound",
+                    "end_token",
+                    "lease_seconds",
+                    "session_token"
+                ]
+            );
+            let me = lost["agent_id"].as_str().unwrap().to_owned();
+            assert_ne!(token_of(&lost), held);
+            clock.advance(grace - 1);
+            // The saved token still acts as the binding inside the grace.
+            s.authorize(&me, Some(&held)).unwrap();
+            s.inbox_as(&me, 10, Some(&held)).unwrap();
+            s.send_as(
+                &json!({"from":me,"to":"claude:honey:1:a","ticket":"none","body":"b"}),
+                Some(&held),
+            )
+            .unwrap();
+            // A restarted pid's old id stays superseded, token or not.
+            if me != old_id {
+                assert_eq!(
+                    s.authorize(&old_id, Some(&held)).unwrap_err(),
+                    "agent id superseded by a bound registration of its session"
+                );
+            }
+            // Registering again with it recovers the current token.
+            let recovered = rotate(&s, new_pid, &held).unwrap();
+            assert_eq!(recovered["bound"], true);
+            let current = token_of(&recovered);
+            s.authorize(&me, Some(&current)).unwrap();
+            // The token the client held is now two rotations old.
+            assert_eq!(
+                s.authorize(&me, Some(&held)).unwrap_err(),
+                "invalid session token"
+            );
+        }
+    }
+
+    /// SWB-R67 as amended: the previous token is accepted until the grace
+    /// ends and refused from then on, for every operation and for register.
+    #[test]
+    fn the_previous_token_is_refused_after_the_grace() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let old = token_of(&first);
+        let current = token_of(&rotate(&s, 100, &old).unwrap());
+        clock.advance(u32::try_from(SESSION_TOKEN_GRACE_SECONDS).unwrap() - 1);
+        s.authorize(&me, Some(&old)).unwrap();
+        clock.advance(1);
+        assert_eq!(
+            s.authorize(&me, Some(&old)).unwrap_err(),
+            "invalid session token"
+        );
+        assert_eq!(
+            s.inbox_as(&me, 10, Some(&old)).unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+        assert_eq!(rotate(&s, 100, &old).unwrap_err(), "invalid session token");
+        // The binding and its current token are untouched.
+        s.authorize(&me, Some(&current)).unwrap();
+        assert_eq!(s.peers(&all()).unwrap()["peers"][0]["bound"], true);
+    }
+
+    /// SWB-R67 as amended: only the token the latest rotation replaced is
+    /// accepted. A token two rotations old, or one never issued, is refused
+    /// even inside the grace.
+    #[test]
+    fn a_token_two_rotations_old_is_refused() {
+        let (s, _clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let t0 = token_of(&first);
+        let t1 = token_of(&rotate(&s, 100, &t0).unwrap());
+        let t2 = token_of(&rotate(&s, 100, &t1).unwrap());
+        assert_eq!(
+            s.authorize(&me, Some(&t0)).unwrap_err(),
+            "invalid session token"
+        );
+        assert_eq!(
+            s.inbox_as(&me, 10, Some(&t0)).unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+        assert_eq!(rotate(&s, 100, &t0).unwrap_err(), "invalid session token");
+        for never in ["0".repeat(64), "f".repeat(64)] {
+            assert_eq!(
+                s.authorize(&me, Some(&never)).unwrap_err(),
+                "invalid session token"
+            );
+        }
+        // The immediately previous token and the current one both work.
+        s.authorize(&me, Some(&t1)).unwrap();
+        s.authorize(&me, Some(&t2)).unwrap();
+        // A register with the previous token rotates again, and the token it
+        // replaces is t2, so t1 is now two rotations old.
+        let t3 = token_of(&rotate(&s, 100, &t1).unwrap());
+        assert_eq!(
+            s.authorize(&me, Some(&t1)).unwrap_err(),
+            "invalid session token"
+        );
+        s.authorize(&me, Some(&t2)).unwrap();
+        s.authorize(&me, Some(&t3)).unwrap();
+        // Ending the session lapses the binding; a new bind records no
+        // previous token, so nothing from before the lapse works again.
+        let last = rotate(&s, 100, &t3).unwrap();
+        let t4 = token_of(&last);
+        s.end_as(&me, last["end_token"].as_str().unwrap(), Some(&t4))
+            .unwrap();
+        let rebound = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        for old in [&t3, &t4] {
+            assert_eq!(
+                s.authorize(&me, Some(old)).unwrap_err(),
+                "invalid session token"
+            );
+        }
+        s.authorize(&me, Some(&token_of(&rebound))).unwrap();
+    }
+
+    /// A broker without the grace record (v0.5.0 after a downgrade) updates
+    /// the row's nonce and registered_seq but not the record. The stale
+    /// record then grants nothing.
+    #[test]
+    fn a_register_that_keeps_no_grace_record_voids_it() {
+        let (s, _clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let t0 = token_of(&first);
+        rotate(&s, 100, &t0).unwrap();
+        s.authorize(&me, Some(&t0)).unwrap();
+        s.0.lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET registered_seq=registered_seq+1, token_nonce=?2 WHERE agent_id=?1",
+                params![me, vec![7u8; 16]],
+            )
+            .unwrap();
+        assert_eq!(
+            s.authorize(&me, Some(&t0)).unwrap_err(),
+            "invalid session token"
+        );
+    }
+
+    /// The grace touches only bound keys. An unbound id needs no token,
+    /// ignores one, gets no session token, and its end token still rotates
+    /// on every register with no grace.
+    #[test]
+    fn the_unbound_path_is_unchanged_by_the_token_grace() {
+        let (s, _clock) = clocked();
+        let first = reg(&s, "claude", "honey", 1, "a", "1");
+        assert_eq!(
+            keys(&first),
+            ["agent_id", "bound", "end_token", "lease_seconds"]
+        );
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let again = reg(&s, "claude", "honey", 1, "a", "1");
+        assert_eq!(again["bound"], false);
+        assert!(again.get("session_token").is_none());
+        s.authorize(&me, None).unwrap();
+        s.authorize(&me, Some(&"0".repeat(64))).unwrap();
+        s.inbox(&me, 10).unwrap();
+        assert_eq!(
+            s.end(&me, first["end_token"].as_str().unwrap()).unwrap()["state"],
+            "unknown"
+        );
+        assert_eq!(
+            s.end(&me, again["end_token"].as_str().unwrap()).unwrap()["state"],
+            "ended"
+        );
     }
 
     /// Review of #54: a lapse is permanent. A tokenless call after the lapse

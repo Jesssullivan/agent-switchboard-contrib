@@ -56,9 +56,24 @@ and the lock files move to 0.5.1 in the release bump.
   column marks rows v0.5.1 writes, and only an older row matches a retry
   in that flat form. A retry that changes a newline or tab of a v0.5.1
   body is a conflict.
+- The store gains four `sessions` columns for the previous-token grace.
+  The wire is unchanged: a bound register returns the same keys. A
+  v0.5.0 broker after a downgrade ignores the columns and keeps no
+  grace. Its next register of a row changes `registered_seq`, which
+  voids the stale record, so the grace never outlives a downgrade.
 
 ### Fixed
 
+- **A lost register reply locked a bound session out** (review F4 of #57,
+  also in v0.5.0). The broker committed a token rotation while the reply
+  missed the client's deadline, so the client kept the old token and
+  every call answered 401 until the 6 hour lapse. Under SWB-R67 as
+  amended (Jess, "Short grace for old token", TIN-7577 comment
+  `41c4704d`), the token a rotation replaced stays valid for 60 seconds.
+  Within that grace the client can act and register again to get the
+  current token. Only the token the latest rotation replaced counts, so a
+  token two rotations old is refused, and the previous token is refused
+  once the 60 seconds end. Unbound ids are unchanged.
 - **A1, paging stall.** The channel showed only the 8 oldest unacked
   messages and never read past them. `inbox` now takes `after` and
   returns `next_after`, in arrival order, and the channel poller walks

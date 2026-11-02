@@ -77,7 +77,14 @@ in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655"
       -- goes (idle_max_age_seconds without a call). The send bucket defaults
       -- are the implementing PR's choice; swb serve reads SWB_SEND_BURST and
       -- SWB_SEND_REFILL_PER_MINUTE, and a burst of 0 turns the limit off.
+      -- SWB-R67 as amended 2026-11-02 (Jess, "Short grace for old token",
+      -- TIN-7577 comment 41c4704d): the token a rotation replaced stays
+      -- valid for session_token_grace_seconds, then never again. Only the
+      -- token the latest rotation replaced counts, so a token two
+      -- rotations old is refused. The store fixes the value
+      -- (SESSION_TOKEN_GRACE_SECONDS); no setting raises it.
       { session_token_hex_length = 64
+      , session_token_grace_seconds = 60
       , delivery_key = [ "harness", "host", "session_id" ]
       , token_required_for =
         [ "send", "inbox", "ack", "claim", "release", "handoff", "end", "register" ]

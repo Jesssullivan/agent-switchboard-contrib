@@ -36,6 +36,7 @@ live:
 | --- | --- |
 | `send` (as `from`), `inbox`, `ack`, `claim`, `release`, `handoff`, `end` (as `me`) | need `session_token`; otherwise 401 `unauthorized` |
 | `register` of the same key, any pid | needs the current `session_token`, keeps the binding and rotates the token |
+| the token a rotation replaced | still accepted for 60 seconds after the rotation (v0.5.1), then refused |
 | an earlier pid of the key | refused, even with the token |
 | `inbox` and `ack` | read mail addressed to any pid of the key, so a restart keeps unread mail |
 | `peers`, `claims`, `heartbeat`, `thread` | no token |
@@ -45,6 +46,22 @@ and a lapse is permanent: no later call revives it or its old token.
 An unbound id behaves as in v0.4.0 and ignores a token it sends. The
 `swb` client binds with `SWB_BIND=1` and keeps the token in a 0600 file
 (see `SWB_STATE_DIR` below, SWB-R67).
+
+From v0.5.1 the broker keeps a grace for the previous token (SWB-R67 as
+amended, TIN-7577 comment `41c4704d`). A register that rotates the token
+records the token it replaced, and for 60 seconds every call that needs
+the session token also accepts that one, `register` included. A client
+whose register reply was lost to its deadline still holds the replaced
+token, so within those 60 seconds it can act and register again to get
+the current one. The `swb` client does not retry a register on its own:
+the recovery is the next register inside the 60 seconds, from a hook or
+a rerun of `swb whoami --register`. After that, recovery waits for the
+lapse, as before. Only the token the latest rotation replaced counts, and
+only for the binding's current agent id. A token two rotations old, or
+the previous token after 60 seconds, answers 401 `invalid session token`.
+The 60 seconds are fixed in the broker (`SESSION_TOKEN_GRACE_SECONDS`)
+and no setting changes them. The wire is unchanged. A v0.5.0 broker
+keeps no grace. The end token has no grace either.
 
 ### Harness kinds
 

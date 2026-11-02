@@ -145,7 +145,9 @@ the full text. ADR-0002 carries the phase scope and host order
   pointer, which receivers check before acting (SWB-R14).
 - Sender binding is opt-in (SWB-R66). For a bound id, `send`, `inbox`,
   `ack`, `claim`, `release`, `handoff`, `end` and a new `register` of its
-  key need the session token, and every register rotates it (SWB-R67). An
+  key need the session token, and every register rotates it (SWB-R67). The
+  replaced token stays valid for 60 seconds and then never again (SWB-R67
+  as amended, TIN-7577 comment `41c4704d`). An
   unbound id stays self-asserted (SWB-R05). Binding never changes
   `authority`, which stays `peer`.
 - SWB-R02, verbatim: "Self-registration is authoritative; the broker writes

@@ -2796,11 +2796,24 @@ mod tests {
         let new = second["session_token"].as_str().unwrap();
         assert_ne!(new, old);
         let with = |token: &str| json!({"me":BOUND_ID,"session_token":token}).to_string();
+        // SWB-R67 as amended (TIN-7577 comment 41c4704d): the replaced token
+        // still works for the grace, so a client whose reply was lost
+        // recovers. The store tests cover the end of the grace.
         let (status, _) = status_and_json(call(&app, "POST", "/v1/inbox", &with(&old)).await).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::OK);
         let (status, _) = status_and_json(call(&app, "POST", "/v1/inbox", &with(new)).await).await;
         assert_eq!(status, StatusCode::OK);
-        // The old token cannot register again either.
+        // A register with it rotates again, so it is then two rotations old
+        // and refused, for every call and for register.
+        let (status, third) =
+            status_and_json(call(&app, "POST", "/v1/register", &again.to_string()).await).await;
+        assert_eq!(status, StatusCode::OK, "{third}");
+        let newest = third["session_token"].as_str().unwrap();
+        let (status, _) = status_and_json(call(&app, "POST", "/v1/inbox", &with(&old)).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) =
+            status_and_json(call(&app, "POST", "/v1/inbox", &with(newest)).await).await;
+        assert_eq!(status, StatusCode::OK);
         let (status, _) =
             status_and_json(call(&app, "POST", "/v1/register", &again.to_string()).await).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);

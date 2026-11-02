@@ -45,6 +45,11 @@ binding is live:
 - A new `register` of the same key, from any pid, needs the current token,
   and every register rotates it. Nobody can take a live binding over by
   registering again.
+- From v0.5.1 the token a rotation replaced stays valid for 60 seconds
+  (SWB-R67 as amended, TIN-7577 comment `41c4704d`), so a client whose
+  register reply was lost can still act and register again. Only that one
+  previous token counts, and only for the binding's current agent id. A
+  token two rotations old is refused.
 - `peers` rows say `bound`.
 
 A binding lapses when its session ends or after 6 hours without a call;
@@ -69,7 +74,8 @@ Residuals of binding:
 
 - The session token is a bearer secret. Anyone who can read the 0600 file,
   or a model context that received an MCP `register` result, can act as
-  the bound id until the next register rotates it.
+  the bound id until the next register rotates it, and for 60 seconds
+  after that (v0.5.1). During those 60 seconds two tokens are valid.
 - `thread`, `heartbeat`, `peers` and `claims` need no token. Anyone can
   read a bound id's threads and refresh its lease, which also delays the
   6-hour lapse.
