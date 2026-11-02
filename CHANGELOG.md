@@ -15,12 +15,15 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [0.5.1] - 2026-11-02
 
+Release record SWB-R73. Source `154cfb19` (the #60 merge), image
+`sha256:77e004b2a0a93b44b1555239066856621c4f00e604e66b272b22dd94f94256f5`,
+published by the release workflow under the signed `v0.5.1` tag.
+
 Scope ruling SPR-80 (TIN-7125 comment `2ff3e637`), tracking issue
 TIN-7577. The release chain is SWB-R73 (TIN-7577 comment `d59d35a1`).
 The changes below landed in #57, merged as `96a5060a`. The workspace
-version is 0.5.1. As for v0.5.0, the release record, its source and the
-approved image digest follow two clean builds of the merge that carries
-this version.
+version is 0.5.1 (#60). The body and reply changes are recorded as
+SWB-R74.
 
 ### Upgrade notes
 
@@ -550,7 +553,8 @@ published 2026-10-05.
   SQLite store with retention and TTL; harness hooks (`swb hook`); CLI verbs
   `whoami`, `inbox`, `send`, `ack`, `peers` and `doctor`.
 
-[Unreleased]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/xoxd-ai/agent-switchboard/compare/v0.2.2...v0.3.0
