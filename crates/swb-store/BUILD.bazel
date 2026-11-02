@@ -22,6 +22,7 @@ rust_test(
         normal_dev = True,
         proc_macro_dev = True,
     ),
+    compile_data = ["//spec/dhall/generated:broker-constants.json"],
     crate = ":swb_store",
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),

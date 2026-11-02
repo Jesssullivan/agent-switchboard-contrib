@@ -412,21 +412,21 @@ fn agent_id_desc() -> String {
     )
 }
 const ULID_DESC: &str = "Canonical 26-character Crockford base32 ULID";
-const SESSION_TOKEN_DESC: &str = "The session_token the latest register of a bound session returned (ADR-0003). Required while the acting id is bound; ignored for an unbound id. Never repeat it";
+const SESSION_TOKEN_DESC: &str = "The session_token the latest register of a bound session returned (ADR-0003), or for 60 seconds after a rotation the one it replaced. Required while the acting id is bound; ignored for an unbound id. Never repeat it";
 const SUBJECT_DESC: &str = "What is claimed: a ticket (TIN-4655), a path (lab:nix/hosts/sting.nix) or another token in [A-Za-z0-9._:/#@+-], at most 256 bytes";
 
 fn tools() -> Vec<Tool> {
     let agent_id = agent_id_desc();
     [
-        ("register", "Register (or re-register) a self-asserted agent session. Returns agent_id, lease_seconds, end_token and bound. Every register mints a new end_token and invalidates earlier ones. With bind true it also binds the session's harness, host and session id and returns a session_token, which send, inbox, ack, claim, release, handoff and end then need; while that binding is live, registering the same session again (any pid) needs the current session_token and rotates it. Over MCP both tokens are part of this result and so enter the caller's context; an adapter should keep them and strip them before the model sees them. Never repeat them.", json!({"type":"object","required":["harness","host","pid","session_id","proc_start"],"properties":{
+        ("register", "Register (or re-register) a self-asserted agent session. Returns agent_id, lease_seconds, end_token and bound. Every register mints a new end_token and invalidates earlier ones, except the grace register below. With bind true it also binds the session's harness, host and session id and returns a session_token, which send, inbox, ack, claim, release, handoff and end then need; while that binding is live, registering the same session again (any pid) needs the current session_token and rotates both tokens. For 60 seconds after a rotation the session_token it replaced still works: a register from the same agent id that presents it returns the current session_token and end_token and mints nothing, so after a timeout, retry once with the token you hold. A token that a grace register returned gets no such grace when it is next replaced. Over MCP both tokens are part of this result and so enter the caller's context; an adapter should keep them and strip them before the model sees them. Never repeat them.", json!({"type":"object","required":["harness","host","pid","session_id","proc_start"],"properties":{
             "harness":{"type":"string","enum":HARNESS_KINDS,"description":"The harness kind"},
             "host":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"Short host name"},
             "pid":{"type":"integer","minimum":1,"description":"The harness launcher's process id"},
             "session_id":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"The harness's own session id"},
             "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Opaque process start stamp. peers never returns it; a caller may filter peers on its own."},
             "bind":{"type":"boolean","description":"Bind this harness, host and session id to the caller (ADR-0003, default false). A binding lasts until end or 6 h without a call"},
-            "session_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The current session_token, required to register a session whose binding is live"}}})),
-        ("end", "End this session. Needs the end_token its latest register returned; any other token answers state unknown and ends nothing.", json!({"type":"object","required":["me","end_token"],"properties":{
+            "session_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The current session_token, required to register a session whose binding is live; for 60 seconds after a rotation, the one it replaced returns the current tokens"}}})),
+        ("end", "End this session. Needs the end_token its latest register returned, or for a bound session, for 60 seconds after a rotation, the one it replaced; any other token answers state unknown and ends nothing.", json!({"type":"object","required":["me","end_token"],"properties":{
             "me":{"type":"string","description":agent_id},
             "end_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The end_token register returned"},
             "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
@@ -2803,20 +2803,53 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (status, _) = status_and_json(call(&app, "POST", "/v1/inbox", &with(new)).await).await;
         assert_eq!(status, StatusCode::OK);
-        // A register with it rotates again, so it is then two rotations old
-        // and refused, for every call and for register.
+        // TIN-7577 comment ff9be66f: a register with it returns the current
+        // token and mints nothing, the same keys as any register.
         let (status, third) =
             status_and_json(call(&app, "POST", "/v1/register", &again.to_string()).await).await;
         assert_eq!(status, StatusCode::OK, "{third}");
-        let newest = third["session_token"].as_str().unwrap();
-        let (status, _) = status_and_json(call(&app, "POST", "/v1/inbox", &with(&old)).await).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(third, second);
+        // The token the grace handed out gets no grace of its own, so the
+        // next rotation refuses both older tokens at once.
+        let mut current: Value = serde_json::from_str(BOUND_REGISTER).unwrap();
+        current["session_token"] = json!(new);
+        let (status, fourth) =
+            status_and_json(call(&app, "POST", "/v1/register", &current.to_string()).await).await;
+        assert_eq!(status, StatusCode::OK, "{fourth}");
+        let newest = fourth["session_token"].as_str().unwrap();
+        for stale in [old.as_str(), new] {
+            let (status, _) =
+                status_and_json(call(&app, "POST", "/v1/inbox", &with(stale)).await).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
         let (status, _) =
             status_and_json(call(&app, "POST", "/v1/inbox", &with(newest)).await).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) =
             status_and_json(call(&app, "POST", "/v1/register", &again.to_string()).await).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Review G2 of #57: two registers that present one saved token at once
+    /// both succeed with the same answer, so the client's token file ends up
+    /// current whichever reply it writes last.
+    #[tokio::test]
+    async fn concurrent_registers_with_one_saved_token_get_one_answer() {
+        let store = Arc::new(Store::memory().unwrap());
+        let app = router(Arc::clone(&store), vec!["localhost".into()]);
+        let first = json_of(call(&app, "POST", "/v1/register", BOUND_REGISTER).await).await;
+        let mut again: Value = serde_json::from_str(BOUND_REGISTER).unwrap();
+        again["session_token"] = first["session_token"].clone();
+        let body = again.to_string();
+        let (one, two) = tokio::join!(
+            call(&app, "POST", "/v1/register", &body),
+            call(&app, "POST", "/v1/register", &body)
+        );
+        let (one, two) = (status_and_json(one).await, status_and_json(two).await);
+        assert_eq!(one.0, StatusCode::OK, "{}", one.1);
+        assert_eq!(two.0, StatusCode::OK, "{}", two.1);
+        assert_eq!(one.1, two.1);
+        assert_ne!(one.1["session_token"], first["session_token"]);
     }
 
     #[tokio::test]

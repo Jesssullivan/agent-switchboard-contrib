@@ -435,7 +435,7 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
-        Self::gate(&tx, me, session_token, now)?;
+        self.gate(&tx, me, session_token, now)?;
         refresh(&tx, me, now)?;
 
         // Accepting a handoff: the offer must be open, addressed to me, and
@@ -613,7 +613,7 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
-        Self::gate(&tx, me, session_token, now)?;
+        self.gate(&tx, me, session_token, now)?;
         let row: Option<(String, String, String, i64)> = tx
             .query_row(
                 "SELECT holder, subject, state, expires_at FROM claims WHERE claim_id=?1",
@@ -696,7 +696,7 @@ impl Store {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err)?;
-        Self::gate(&tx, me, session_token, now)?;
+        self.gate(&tx, me, session_token, now)?;
         refresh(&tx, me, now)?;
         let source: Option<(String, bool)> = tx
             .query_row(
