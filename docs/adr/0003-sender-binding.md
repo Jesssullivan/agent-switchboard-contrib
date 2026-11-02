@@ -28,7 +28,7 @@ new agent id.
 | ID | Ruling |
 | --- | --- |
 | SWB-R66 | This ADR is accepted and ships as v0.5.0. Binding stays opt-in. Acceptance includes the spoof test: a send with `from` set to a bound id and no token fails. It amends SWB-R05 and SWB-R14 as described here, and `authority` stays `peer`. |
-| SWB-R67 | A bound client keeps its token in a 0600 file and rotates it on every re-register. *Amended 2026-11-02* (Jess, "Short grace for old token", TIN-7577 comment `41c4704d`, review F4 of #57): after a rotation, the previous token stays valid for a short grace of about 60 seconds, so a reply lost to a timeout cannot lock the session out until the 6 hour lapse. Two tokens are valid during that window. |
+| SWB-R67 | A bound client keeps its token in a 0600 file and rotates it on every re-register. *Amended 2026-11-02* (Jess, "Short grace for old token", TIN-7577 comment `41c4704d`, review F4 of #57): after a rotation, the previous token stays valid for a short grace of about 60 seconds, so a reply lost to a timeout cannot lock the session out until the 6 hour lapse. Two tokens are valid during that window. *Refined 2026-11-02* (Jess, "Client retries once", "Same 60s grace" and "Grace returns current token", TIN-7577 comments `3955641b` and `ff9be66f`, review G1 to G6 of #57): a register that presents the previous token inside the grace returns the current session and end tokens and mints nothing, so no chain of graces can form; a token the grace returned gets no grace of its own; the end token has the same grace; the client retries a bound register once after a deadline. |
 | SWB-R68 | `swb peers` shows whether an id is bound. |
 
 The ruling left the bucket size and refill rate to the implementing PR. The
@@ -62,6 +62,17 @@ defaults below are that choice.
      latest rotation replaced counts: a token two rotations old is
      refused, and so is the previous token once the 60 seconds end. A
      first bind, or a bind after a lapse, has no previous token.
+   - *Refined 2026-11-02 (TIN-7577 comments `3955641b` and `ff9be66f`,
+     review G1 to G6 of #57):* a registration that presents the previous
+     token from the binding's current agent id returns the current session
+     and end tokens, mints nothing and rotates nothing. From another agent
+     id it is refused. A token handed out this way gets no grace when it is
+     next replaced, so two holders cannot keep each other's tokens alive.
+     The end token has the same grace for a bound session. The grace ends
+     on the wall clock or on the broker's monotonic clock, whichever
+     reaches 60 seconds first; the monotonic part lives in the broker
+     process, so a restart ends every grace. The client retries a bound
+     register once after a deadline, with the token it holds.
    - An id whose key has no live binding behaves as in v0.4.0, and a token
      it presents is ignored.
    - `peers`, `claims`, `heartbeat` and `thread` take no token.

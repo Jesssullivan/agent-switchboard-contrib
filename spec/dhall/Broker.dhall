@@ -46,7 +46,11 @@ in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655"
       , idle_max_age_seconds = 21600
       , states = [ LeaseState.live, LeaseState.idle, LeaseState.gone, LeaseState.ended ]
       , -- R-C944 (v0.3.0): register returns a 64-hex end token; end accepts
-        -- nothing else. Every register rotates it and invalidates the old one.
+        -- nothing else. Every register rotates it and invalidates the old one,
+        -- except for a bound session as amended under binding below: a
+        -- register inside the grace returns the current end token, and the
+        -- replaced one still ends the session for
+        -- binding.session_token_grace_seconds.
         end_token_hex_length = 64
       }
     , peers =
@@ -81,8 +85,15 @@ in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655"
       -- TIN-7577 comment 41c4704d): the token a rotation replaced stays
       -- valid for session_token_grace_seconds, then never again. Only the
       -- token the latest rotation replaced counts, so a token two
-      -- rotations old is refused. The store fixes the value
-      -- (SESSION_TOKEN_GRACE_SECONDS); no setting raises it.
+      -- rotations old is refused. Refined the same day ("Grace returns
+      -- current token", comment ff9be66f): a register with the replaced
+      -- token returns the current session and end tokens and mints
+      -- nothing, and a token the grace returned gets no grace of its own.
+      -- The end token has the same grace (comment 3955641b). The grace ends
+      -- on the wall or the monotonic clock, whichever is first, and a
+      -- broker restart ends it. The store fixes the value
+      -- (SESSION_TOKEN_GRACE_SECONDS), a swb-store test ties it to the
+      -- rendered broker-constants.json, and no setting raises it.
       { session_token_hex_length = 64
       , session_token_grace_seconds = 60
       , delivery_key = [ "harness", "host", "session_id" ]

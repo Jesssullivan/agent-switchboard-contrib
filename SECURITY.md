@@ -43,13 +43,30 @@ binding is live:
   answer 401 `unauthorized` and change nothing. A spoofed `send` from a
   bound id therefore fails.
 - A new `register` of the same key, from any pid, needs the current token,
-  and every register rotates it. Nobody can take a live binding over by
-  registering again.
+  and every such register rotates it. Only a holder of the current token
+  can take a live binding over by registering again.
 - From v0.5.1 the token a rotation replaced stays valid for 60 seconds
-  (SWB-R67 as amended, TIN-7577 comment `41c4704d`), so a client whose
-  register reply was lost can still act and register again. Only that one
-  previous token counts, and only for the binding's current agent id. A
-  token two rotations old is refused.
+  (SWB-R67 as amended, TIN-7577 comments `41c4704d` and `ff9be66f`). In
+  that window it can act as the bound id, and a `register` with it from
+  the binding's own agent id returns the current session token and end
+  token and mints nothing. So a client whose register reply was lost
+  recovers, and two registers that present one saved token get one
+  answer. The replaced token cannot move the binding to another pid, a
+  token two rotations old is refused, and so is the replaced token after
+  60 seconds. A bound session's end token has the same grace: for 60
+  seconds the end token a rotation replaced still ends the session. An
+  unbound session's end token has no grace.
+- A token the grace handed out gets no grace when it is next replaced.
+  So a rotation still shuts out a second holder: once the client
+  registers again, the other holder's token is refused at once, and two
+  holders cannot keep each other's tokens alive.
+- The 60 seconds run on the wall clock and on a monotonic clock in the
+  broker process, and the grace ends at whichever reaches 60 first. A wall
+  clock that steps back cannot lengthen it. The monotonic part is held in
+  memory only, so a broker restart ends every grace and the replaced
+  token is then refused: the grace fails closed. No key or token is stored for
+  the grace: the broker derives the current tokens again from the key it
+  already holds.
 - `peers` rows say `bound`.
 
 A binding lapses when its session ends or after 6 hours without a call;
@@ -75,7 +92,19 @@ Residuals of binding:
 - The session token is a bearer secret. Anyone who can read the 0600 file,
   or a model context that received an MCP `register` result, can act as
   the bound id until the next register rotates it, and for 60 seconds
-  after that (v0.5.1). During those 60 seconds two tokens are valid.
+  after that (v0.5.1). During those 60 seconds two tokens are valid, and
+  a register with the replaced one fetches the current one. A holder who
+  fetches it this way holds the same token as the client, so either of
+  them can then register and take the binding, and the other is refused
+  from that register on with no grace. A rotation removes a leaked token
+  for good once its holder has not registered within 60 seconds of it,
+  or once the client registers after the holder fetched the current one.
+- The grace costs lockouts in two cases, each until the 6-hour lapse: a
+  register reply lost just before a broker restart, and a reply lost on
+  the first rotation after a register that the grace answered.
+- A caller with a wrong token can tell that the binding rotated within the
+  last 60 seconds from the time a refusal takes. `peers` already shows
+  `registered_seq`, so this reveals little.
 - `thread`, `heartbeat`, `peers` and `claims` need no token. Anyone can
   read a bound id's threads and refresh its lease, which also delays the
   6-hour lapse.
