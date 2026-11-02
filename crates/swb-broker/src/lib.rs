@@ -412,21 +412,21 @@ fn agent_id_desc() -> String {
     )
 }
 const ULID_DESC: &str = "Canonical 26-character Crockford base32 ULID";
-const SESSION_TOKEN_DESC: &str = "The session_token the latest register of a bound session returned (ADR-0003), or for 60 seconds after a rotation the one it replaced. Required while the acting id is bound; ignored for an unbound id. Never repeat it";
+const SESSION_TOKEN_DESC: &str = "The session_token the latest register of a bound session returned (ADR-0003), or for 60 seconds after a rotation the one it replaced, unless the chain of graces is spent: a token a grace register returned has one more grace, and a token returned in that second grace has none. Required while the acting id is bound; ignored for an unbound id. Never repeat it";
 const SUBJECT_DESC: &str = "What is claimed: a ticket (TIN-4655), a path (lab:nix/hosts/sting.nix) or another token in [A-Za-z0-9._:/#@+-], at most 256 bytes";
 
 fn tools() -> Vec<Tool> {
     let agent_id = agent_id_desc();
     [
-        ("register", "Register (or re-register) a self-asserted agent session. Returns agent_id, lease_seconds, end_token and bound. Every register mints a new end_token and invalidates earlier ones, except the grace register below. With bind true it also binds the session's harness, host and session id and returns a session_token, which send, inbox, ack, claim, release, handoff and end then need; while that binding is live, registering the same session again (any pid) needs the current session_token and rotates both tokens. For 60 seconds after a rotation the session_token it replaced still works: a register from the same agent id that presents it returns the current session_token and end_token and mints nothing, so after a timeout, retry once with the token you hold. A token that a grace register returned gets no such grace when it is next replaced. Over MCP both tokens are part of this result and so enter the caller's context; an adapter should keep them and strip them before the model sees them. Never repeat them.", json!({"type":"object","required":["harness","host","pid","session_id","proc_start"],"properties":{
+        ("register", "Register (or re-register) a self-asserted agent session. Returns agent_id, lease_seconds, end_token and bound. Every register mints a new end_token and invalidates earlier ones, except the grace register below. With bind true it also binds the session's harness, host and session id and returns a session_token, which send, inbox, ack, claim, release, handoff and end then need; while that binding is live, registering the same session again (any pid) needs the current session_token and rotates both tokens. For 60 seconds after a rotation the session_token it replaced still works: a register from the same agent id that presents it returns the current session_token and end_token and mints nothing, so after a timeout, retry once with the token you hold. A token that a grace register returned gets this grace once more when it is next replaced, and a token returned in that second grace gets none, so after two lost replies in a row the third locks the session out until its binding lapses. Over MCP both tokens are part of this result and so enter the caller's context; an adapter should keep them and strip them before the model sees them. Never repeat them.", json!({"type":"object","required":["harness","host","pid","session_id","proc_start"],"properties":{
             "harness":{"type":"string","enum":HARNESS_KINDS,"description":"The harness kind"},
             "host":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"Short host name"},
             "pid":{"type":"integer","minimum":1,"description":"The harness launcher's process id"},
             "session_id":{"type":"string","pattern":"^[A-Za-z0-9._-]+$","description":"The harness's own session id"},
             "proc_start":{"type":"string","minLength":1,"maxLength":256,"description":"Opaque process start stamp. peers never returns it; a caller may filter peers on its own."},
             "bind":{"type":"boolean","description":"Bind this harness, host and session id to the caller (ADR-0003, default false). A binding lasts until end or 6 h without a call"},
-            "session_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The current session_token, required to register a session whose binding is live; for 60 seconds after a rotation, the one it replaced returns the current tokens"}}})),
-        ("end", "End this session. Needs the end_token its latest register returned, or for a bound session, for 60 seconds after a rotation, the one it replaced; any other token answers state unknown and ends nothing.", json!({"type":"object","required":["me","end_token"],"properties":{
+            "session_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The current session_token, required to register a session whose binding is live; for 60 seconds after a rotation that gave it a grace, the one it replaced returns the current tokens"}}})),
+        ("end", "End this session. Needs the end_token its latest register returned, or for a bound session, while the session_token replaced with it is in its grace, the one it replaced; any other token answers state unknown and ends nothing.", json!({"type":"object","required":["me","end_token"],"properties":{
             "me":{"type":"string","description":agent_id},
             "end_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"The end_token register returned"},
             "session_token":{"type":"string","description":SESSION_TOKEN_DESC}}})),
@@ -2809,21 +2809,37 @@ mod tests {
             status_and_json(call(&app, "POST", "/v1/register", &again.to_string()).await).await;
         assert_eq!(status, StatusCode::OK, "{third}");
         assert_eq!(third, second);
-        // The token the grace handed out gets no grace of its own, so the
-        // next rotation refuses both older tokens at once.
+        // The token the grace handed out gets one more grace of its own
+        // (TIN-7577 comment 2f1439dc): the next rotation refuses the oldest
+        // token at once and keeps the handed-out one for the second grace.
         let mut current: Value = serde_json::from_str(BOUND_REGISTER).unwrap();
         current["session_token"] = json!(new);
         let (status, fourth) =
             status_and_json(call(&app, "POST", "/v1/register", &current.to_string()).await).await;
         assert_eq!(status, StatusCode::OK, "{fourth}");
-        let newest = fourth["session_token"].as_str().unwrap();
-        for stale in [old.as_str(), new] {
+        let newest = fourth["session_token"].as_str().unwrap().to_owned();
+        let (status, _) = status_and_json(call(&app, "POST", "/v1/inbox", &with(&old)).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = status_and_json(call(&app, "POST", "/v1/inbox", &with(new)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, fifth) =
+            status_and_json(call(&app, "POST", "/v1/register", &current.to_string()).await).await;
+        assert_eq!(status, StatusCode::OK, "{fifth}");
+        assert_eq!(fifth, fourth);
+        // The second grace handed out `newest`, so the chain is spent: the
+        // next rotation refuses every older token at once.
+        current["session_token"] = json!(newest);
+        let (status, sixth) =
+            status_and_json(call(&app, "POST", "/v1/register", &current.to_string()).await).await;
+        assert_eq!(status, StatusCode::OK, "{sixth}");
+        for stale in [old.as_str(), new, newest.as_str()] {
             let (status, _) =
                 status_and_json(call(&app, "POST", "/v1/inbox", &with(stale)).await).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
         }
+        let latest = sixth["session_token"].as_str().unwrap();
         let (status, _) =
-            status_and_json(call(&app, "POST", "/v1/inbox", &with(newest)).await).await;
+            status_and_json(call(&app, "POST", "/v1/inbox", &with(latest)).await).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) =
             status_and_json(call(&app, "POST", "/v1/register", &again.to_string()).await).await;

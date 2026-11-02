@@ -25,7 +25,10 @@
 //! [`SESSION_TOKEN_GRACE_SECONDS`], so a client whose register reply was
 //! lost can still act and register again. Jess's ruling "Grace returns
 //! current token" (comment `ff9be66f`) refines it: a register with the
-//! replaced token returns the current tokens and mints nothing.
+//! replaced token returns the current tokens and mints nothing. Jess's
+//! ruling "Allow one more grace" (comment `2f1439dc`) lets a token handed
+//! back that way have one more grace of its own, and no more
+//! ([`SESSION_TOKEN_GRACE_CHAIN`]).
 
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -76,6 +79,18 @@ pub const SESSION_TOKEN_HEX_LEN: usize = 64;
 /// changes it, so it cannot be raised without a new ruling.
 /// `spec/dhall/Broker.dhall` states the same value, and a test ties the two.
 pub const SESSION_TOKEN_GRACE_SECONDS: i64 = 60;
+/// How many graces one chain of tokens gets (Jess, "Allow one more grace",
+/// TIN-7577 comment `2f1439dc`). A token the broker minted and the client
+/// received gets the first grace when it is replaced. A token a grace
+/// register handed back gets one more grace of its own when it is
+/// replaced, and a token handed back inside that second grace gets none.
+/// So two lost register replies in a row recover and a third does not,
+/// and a leaked token fetches the current one at most twice, which ends
+/// any ping-pong of two holders within two grace windows of the client's
+/// registers. A token the client receives from a register that minted it
+/// starts a new chain. `spec/dhall/Broker.dhall` states the same value,
+/// and a test ties the two.
+pub const SESSION_TOKEN_GRACE_CHAIN: i64 = 2;
 
 pub fn effective_ttl_hours(requested: Option<u32>) -> u32 {
     requested
@@ -247,6 +262,13 @@ impl ManualClock {
         let step = i64::from(seconds);
         self.wall.fetch_sub(step, Ordering::SeqCst) - step
     }
+    /// Step the wall reading forward by `seconds` while the monotonic
+    /// reading stands still, as when a host clock is corrected forwards.
+    /// Returns the new wall time.
+    pub fn step_wall_forward(&self, seconds: u32) -> i64 {
+        let step = i64::from(seconds);
+        self.wall.fetch_add(step, Ordering::SeqCst) + step
+    }
 }
 
 impl Clock for ManualClock {
@@ -280,6 +302,16 @@ pub struct Store(
     Mutex<ratelimit::Limiter>,
     Mutex<GraceHolds>,
 );
+/// What [`Store::register_outcome`] answered.
+#[derive(Debug)]
+pub struct RegisterOutcome {
+    /// The register result, the same keys as in v0.5.0.
+    pub result: Value,
+    /// `Some(1)` or `Some(2)` when a register inside that grace of the
+    /// chain returned the current tokens and minted nothing (TIN-7577
+    /// comments `ff9be66f` and `2f1439dc`); `None` when it minted them.
+    pub grace: Option<i64>,
+}
 #[derive(Debug)]
 pub struct SendOutcome {
     pub envelope: Value,
@@ -475,16 +507,19 @@ fn unauthorized(message: &str) -> StoreError {
 struct Binding {
     agent_id: String,
     nonce: Vec<u8>,
-    /// The agent id and nonce of the token the latest rotation replaced,
-    /// while [`SESSION_TOKEN_GRACE_SECONDS`] has not run out since it
-    /// (SWB-R67 as amended, TIN-7577 comments `41c4704d` and `ff9be66f`).
+    /// The token the latest rotation replaced, while
+    /// [`SESSION_TOKEN_GRACE_SECONDS`] has not run out since it (SWB-R67 as
+    /// amended, TIN-7577 comments `41c4704d` and `ff9be66f`).
     previous: Option<PreviousToken>,
-    /// Whether a register inside the grace returned the current token, so
-    /// that the next rotation records no previous token.
-    returned: bool,
+    /// Which grace, 1 or 2, handed back the current token, if a register
+    /// inside a grace returned it. The next rotation gives that token the
+    /// next grace of the chain, or none once the chain is spent
+    /// ([`SESSION_TOKEN_GRACE_CHAIN`]).
+    returned: Option<i64>,
 }
-/// The agent id and nonce a replaced session token was derived from.
-type PreviousToken = (String, Vec<u8>);
+/// A replaced session token: the agent id and nonce it was derived from,
+/// and which grace of its chain it is in, 1 or 2.
+type PreviousToken = (String, Vec<u8>, i64);
 /// Which session token of a binding a caller presented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TokenMatch {
@@ -703,13 +738,25 @@ impl Store {
             // v0.5.1 (TIN-7577 comment `ff9be66f`): the `registered_seq` of
             // the row's current token when a register inside the grace
             // returned that token instead of minting one. The next rotation
-            // then records no previous token, so a token handed out by the
-            // grace never gets a grace of its own. A register by a broker
+            // gives that token the next grace of its chain, or none once the
+            // chain is spent (comment `2f1439dc`). A register by a broker
             // that does not know the column changes `registered_seq`, so a
             // stale value never matches again.
             (
                 "token_returned_seq",
                 "ALTER TABLE sessions ADD COLUMN token_returned_seq INTEGER",
+            ),
+            // v0.5.1 (TIN-7577 comment `2f1439dc`, "Allow one more grace"):
+            // which grace of its chain the previous token is in, and which
+            // grace handed back the current token. Both count only while
+            // the seq column beside them matches `registered_seq`.
+            (
+                "prev_token_grace",
+                "ALTER TABLE sessions ADD COLUMN prev_token_grace INTEGER",
+            ),
+            (
+                "token_returned_grace",
+                "ALTER TABLE sessions ADD COLUMN token_returned_grace INTEGER",
             ),
         ] {
             if !columns.iter().any(|c| c == column) {
@@ -943,10 +990,14 @@ impl Store {
         })
     }
     /// The grace state of `agent_id`'s binding (SWB-R67 as amended, TIN-7577
-    /// comments `41c4704d` and `ff9be66f`): the token its latest rotation
-    /// replaced, as the agent id and nonce it was derived from, while that
-    /// token is in its grace, and whether a register inside the grace
-    /// returned the current token.
+    /// comments `41c4704d`, `ff9be66f` and `2f1439dc`): the token its latest
+    /// rotation replaced, as the agent id and nonce it was derived from and
+    /// the grace it is in, while that token is in its grace, and which
+    /// grace, if any, handed back the current token.
+    ///
+    /// A record written by a build that kept no grace number counts as the
+    /// first grace for the previous token and as a spent chain for a
+    /// returned one, which is what that build meant.
     ///
     /// The grace runs for [`SESSION_TOKEN_GRACE_SECONDS`] from the rotation
     /// and ends at whichever comes first of two clocks. On the wall clock,
@@ -962,7 +1013,7 @@ impl Store {
         db: &Connection,
         agent_id: &str,
         now: i64,
-    ) -> StoreResult<(Option<PreviousToken>, bool)> {
+    ) -> StoreResult<(Option<PreviousToken>, Option<i64>)> {
         type Grace = (
             Option<String>,
             Option<Vec<u8>>,
@@ -970,11 +1021,14 @@ impl Store {
             Option<i64>,
             i64,
             Option<i64>,
+            Option<i64>,
+            Option<i64>,
         );
         let row: Option<Grace> = db
             .query_row(
                 "SELECT prev_token_agent_id, prev_token_nonce, prev_token_rotated_at,
-                        prev_token_registered_seq, registered_seq, token_returned_seq
+                        prev_token_registered_seq, registered_seq, token_returned_seq,
+                        prev_token_grace, token_returned_grace
                  FROM sessions WHERE agent_id=?1",
                 [agent_id],
                 |r| {
@@ -985,22 +1039,27 @@ impl Store {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )
             .optional()
             .map_err(sql_err)?;
-        let Some((prev_agent, prev_nonce, at, seq, current, returned)) = row else {
-            return Ok((None, false));
+        let Some((prev_agent, prev_nonce, at, seq, current, returned_seq, grace, returned_grace)) =
+            row
+        else {
+            return Ok((None, None));
         };
-        let returned = returned == Some(current);
+        let returned = (returned_seq == Some(current))
+            .then(|| returned_grace.unwrap_or(SESSION_TOKEN_GRACE_CHAIN));
         let previous = match (prev_agent, prev_nonce, at, seq) {
             (Some(prev_agent), Some(prev_nonce), Some(at), Some(seq))
                 if seq == current
                     && (0..SESSION_TOKEN_GRACE_SECONDS).contains(&(now - at))
                     && self.held_in_grace(agent_id, seq)? =>
             {
-                Some((prev_agent, prev_nonce))
+                Some((prev_agent, prev_nonce, grace.unwrap_or(1)))
             }
             _ => None,
         };
@@ -1051,7 +1110,7 @@ impl Store {
             return Ok(TokenMatch::Current);
         }
         Ok(match &binding.previous {
-            Some((agent_id, nonce))
+            Some((agent_id, nonce, _))
                 if Self::session_token_mac(db, agent_id, nonce)?
                     .verify_slice(&bytes)
                     .is_ok() =>
@@ -1152,8 +1211,9 @@ impl Store {
     }
     /// Register (or re-register) a self-asserted session and return its
     /// agent id, lease and end token (R-C944). Every registration mints a
-    /// fresh token and invalidates every earlier one, so knowing a row's
-    /// `proc_start` never retrieves the token its registrant holds. A hook
+    /// fresh token and invalidates every earlier one, except a bound
+    /// session's grace register below, so knowing a row's `proc_start`
+    /// never retrieves the token its registrant holds. A hook
     /// that registers on every prompt saves the newest token each time.
     ///
     /// Sender binding (ADR-0003, SWB-R66, SWB-R67): `bind: true` binds the
@@ -1171,11 +1231,21 @@ impl Store {
     /// presents it, from the binding's current agent id, mints nothing: it
     /// returns the current session token and end token, so a client whose
     /// reply was lost recovers, and concurrent registers with one saved
-    /// token all get the same answer. A token the grace returned gets no
-    /// grace of its own when it is replaced, so two holders cannot keep
-    /// each other alive (review G1 and G2 of #57). A first bind, or a bind
-    /// after a lapse, records no previous token.
+    /// token all get the same answer (review G2 of #57). A token the grace
+    /// returned gets one more grace of its own when it is replaced, and a
+    /// token returned inside that second grace gets none (Jess, "Allow one
+    /// more grace", comment `2f1439dc`), so two holders cannot keep each
+    /// other alive for more than [`SESSION_TOKEN_GRACE_CHAIN`] graces
+    /// (review G1 and H1 of #57). A first bind, or a bind after a lapse,
+    /// records no previous token, so a lost reply to it cannot be
+    /// recovered before the binding lapses.
     pub fn register(&self, input: &Value) -> StoreResult<Value> {
+        self.register_outcome(input).map(|outcome| outcome.result)
+    }
+    /// [`Store::register`], and which grace, if any, answered it, so the
+    /// broker's audit line can tell a grace register from one that minted
+    /// tokens (review H2 of #57). The result is the same either way.
+    pub fn register_outcome(&self, input: &Value) -> StoreResult<RegisterOutcome> {
         let harness = field(input, "harness")?;
         if !valid_harness(harness) {
             return Err("invalid harness".into());
@@ -1219,16 +1289,23 @@ impl Store {
                 TokenMatch::Current => {}
                 TokenMatch::Previous if binding.agent_id == id => {
                     // Inside the grace: return the current tokens and mint
-                    // nothing (TIN-7577 comment `ff9be66f`).
+                    // nothing (TIN-7577 comment `ff9be66f`). The current
+                    // token is marked as handed back by this grace, which
+                    // decides the grace it gets when it is replaced.
+                    let grace = binding.previous.as_ref().map_or(1, |p| p.2);
                     tx.execute(
-                        "UPDATE sessions SET last_seen=?2, token_returned_seq=registered_seq WHERE agent_id=?1",
-                        params![binding.agent_id, now],
+                        "UPDATE sessions SET last_seen=?2, token_returned_seq=registered_seq,
+                                token_returned_grace=?3 WHERE agent_id=?1",
+                        params![binding.agent_id, now, grace],
                     )
                     .map_err(sql_err)?;
                     let result =
                         Self::register_result(&tx, &binding.agent_id, &binding.nonce, true)?;
                     tx.commit().map_err(sql_err)?;
-                    return Ok(result);
+                    return Ok(RegisterOutcome {
+                        result,
+                        grace: Some(grace),
+                    });
                 }
                 // The previous token recovers only the binding's own agent
                 // id; taking the binding to another pid needs the current one.
@@ -1239,15 +1316,21 @@ impl Store {
         }
         let bound = bind || held.is_some();
         // The token this register replaces is always the binding's current
-        // one. It gets a grace unless the grace itself handed it out.
-        let replaced = held.as_ref().filter(|binding| !binding.returned);
-        let (prev_agent, prev_nonce, prev_at) = match replaced {
-            Some(binding) => (
+        // one. A token the client received from a minting register gets the
+        // first grace; one a grace handed back gets the next grace of its
+        // chain, and none once the chain is spent (comment `2f1439dc`).
+        let replaced = held.as_ref().and_then(|binding| {
+            let grace = binding.returned.map_or(1, |g| g + 1);
+            (grace <= SESSION_TOKEN_GRACE_CHAIN).then_some((binding, grace))
+        });
+        let (prev_agent, prev_nonce, prev_at, prev_grace) = match replaced {
+            Some((binding, grace)) => (
                 Some(binding.agent_id.clone()),
                 Some(binding.nonce.clone()),
                 Some(now),
+                Some(grace),
             ),
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         let nonce = random_bytes::<16>()?.to_vec();
         tx.execute("INSERT INTO counters(name,value) VALUES('registrations',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[]).map_err(sql_err)?;
@@ -1260,14 +1343,16 @@ impl Store {
             .map_err(sql_err)?;
         let prev_seq = prev_at.map(|_| seq);
         tx.execute("INSERT INTO sessions(agent_id,harness,host,proc_start,last_seen,session_id,registered_seq,token_nonce,bound,
-                      prev_token_agent_id,prev_token_nonce,prev_token_rotated_at,prev_token_registered_seq,token_returned_seq)
-                    VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,NULL)
+                      prev_token_agent_id,prev_token_nonce,prev_token_rotated_at,prev_token_registered_seq,prev_token_grace,
+                      token_returned_seq,token_returned_grace)
+                    VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL)
                     ON CONFLICT(agent_id) DO UPDATE SET proc_start=excluded.proc_start,last_seen=excluded.last_seen,ended=0,
                       session_id=excluded.session_id,registered_seq=excluded.registered_seq,token_nonce=excluded.token_nonce,
                       bound=excluded.bound,prev_token_agent_id=excluded.prev_token_agent_id,
                       prev_token_nonce=excluded.prev_token_nonce,prev_token_rotated_at=excluded.prev_token_rotated_at,
-                      prev_token_registered_seq=excluded.prev_token_registered_seq,token_returned_seq=NULL",
-            params![id,harness,host,proc_start,now,session_id,seq,nonce,bound,prev_agent,prev_nonce,prev_at,prev_seq]).map_err(sql_err)?;
+                      prev_token_registered_seq=excluded.prev_token_registered_seq,prev_token_grace=excluded.prev_token_grace,
+                      token_returned_seq=NULL,token_returned_grace=NULL",
+            params![id,harness,host,proc_start,now,session_id,seq,nonce,bound,prev_agent,prev_nonce,prev_at,prev_seq,prev_grace]).map_err(sql_err)?;
         // The newest registration of a key is the only row that may carry its
         // binding, so an earlier pid's row can never become bound again.
         tx.execute(
@@ -1279,7 +1364,10 @@ impl Store {
         tx.commit().map_err(sql_err)?;
         // The monotonic half of the grace starts once the rotation commits.
         self.set_hold(&id, prev_seq)?;
-        Ok(result)
+        Ok(RegisterOutcome {
+            result,
+            grace: None,
+        })
     }
     /// A register result: the same keys whether the register minted the
     /// tokens or returned the current ones inside the grace, so the wire
@@ -1352,7 +1440,7 @@ impl Store {
         };
         if !matches
             && bound
-            && let Some((prev_agent, prev_nonce)) = self.grace_of(&tx, me, now)?.0
+            && let Some((prev_agent, prev_nonce, _)) = self.grace_of(&tx, me, now)?.0
             && prev_agent == me
         {
             matches = Self::end_token_mac(&tx, me, &prev_nonce)?
@@ -2525,11 +2613,12 @@ mod tests {
     /// client alternate registers 59 seconds apart, each saving the token
     /// its reply carries. Under 41c4704d alone each register made the other
     /// side's token the previous one, so both stayed valid for ever. Now the
-    /// leaked token only fetches the current one, and a token the grace
-    /// handed out gets no grace when the client next rotates, so the leaked
-    /// side is shut out at that register and stays out.
+    /// leaked token only fetches the current one, and a fetched token gets
+    /// one more grace and no more ("Allow one more grace", TIN-7577 comment
+    /// 2f1439dc), so the leaked side fetches twice and is then shut out for
+    /// good, while the client is never refused.
     #[test]
-    fn the_g1_ping_pong_ends_within_the_grace() {
+    fn the_g1_ping_pong_ends_after_two_graces() {
         let (s, clock) = clocked();
         let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
         let me = first["agent_id"].as_str().unwrap().to_owned();
@@ -2537,19 +2626,22 @@ mod tests {
         let mut leaked = token_of(&first);
         let mut client = token_of(&rotate(&s, 100, &leaked).unwrap());
         let mut refused_at = None;
+        let mut fetches = Vec::new();
         for round in 0..200u32 {
             clock.advance(59);
-            let (who, token) = if round % 2 == 0 {
-                (&mut leaked, "leaked")
-            } else {
-                (&mut client, "client")
-            };
-            let presented = who.clone();
-            match rotate(&s, 100, &presented) {
-                Ok(reply) => *who = token_of(&reply),
+            let leaker = round % 2 == 0;
+            let presented = if leaker { &leaked } else { &client }.clone();
+            match s.register_outcome(&json!({"harness":"hermes","host":"sting","pid":100,
+                "session_id":"svc","proc_start":"start-100","session_token":presented}))
+            {
+                Ok(outcome) if leaker => {
+                    fetches.push(outcome.grace);
+                    leaked = token_of(&outcome.result);
+                }
+                Ok(outcome) => client = token_of(&outcome.result),
                 Err(e) => {
-                    assert_eq!(e, "invalid session token", "{token} round {round}");
-                    assert_eq!(token, "leaked", "the client is never refused");
+                    assert_eq!(e, "invalid session token", "round {round}");
+                    assert!(leaker, "the client is never refused");
                     refused_at.get_or_insert(round);
                 }
             }
@@ -2562,10 +2654,194 @@ mod tests {
             }
             s.authorize(&me, Some(&client)).unwrap();
         }
-        // Round 0: the leaked t0 fetched t1. Round 1: the client rotated
-        // t1, which the grace had handed out, so t1 got no grace. Round 2:
-        // the leaked side is refused, 59 seconds after that rotation.
-        assert_eq!(refused_at, Some(2));
+        // Round 0: t0 fetched t1 in the first grace. Round 1: the client
+        // rotated t1, which a grace had handed back, so t1 got the second
+        // grace. Round 2: t1 fetched t2 in it. Round 3: the client rotated
+        // t2, which the second grace handed back, so t2 got no grace.
+        // Round 4: the leaked side is refused, and stays refused.
+        assert_eq!(fetches, [Some(1), Some(2)]);
+        assert_eq!(refused_at, Some(4));
+    }
+
+    /// The same ping-pong at its fastest: the client registers as soon as
+    /// the leaked side has fetched, and the leaked side fetches at the last
+    /// second of each grace. The leaked side is refused within two grace
+    /// windows of the first rotation, so a leaked token never lives on
+    /// indefinitely through the grace (TIN-7577 comment 2f1439dc).
+    #[test]
+    fn the_g1_ping_pong_ends_within_two_grace_windows() {
+        let grace = u32::try_from(SESSION_TOKEN_GRACE_SECONDS).unwrap();
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let mut leaked = token_of(&first);
+        let mut client = token_of(&rotate(&s, 100, &leaked).unwrap());
+        let rotated_at = clock.now();
+        let mut fetches = 0;
+        while s.authorize(&me, Some(&leaked)).is_ok() {
+            assert!(fetches < 2, "the leaked side fetched a third time");
+            clock.advance(grace - 1);
+            leaked = token_of(&rotate(&s, 100, &leaked).unwrap());
+            fetches += 1;
+            client = token_of(&rotate(&s, 100, &client).unwrap());
+        }
+        // Shut out at the client's register 118 seconds after the first
+        // rotation, and for good: no later register lets it back in.
+        assert!(clock.now() - rotated_at < 2 * SESSION_TOKEN_GRACE_SECONDS);
+        assert_eq!(fetches, 2);
+        assert_eq!(
+            rotate(&s, 100, &leaked).unwrap_err(),
+            "invalid session token"
+        );
+        clock.advance(1);
+        client = token_of(&rotate(&s, 100, &client).unwrap());
+        assert_eq!(
+            s.authorize(&me, Some(&leaked)).unwrap_err(),
+            "invalid session token"
+        );
+        s.authorize(&me, Some(&client)).unwrap();
+    }
+
+    /// A register whose reply is lost, then the client's retry with the
+    /// token it holds: the token the retry recovered, and which grace
+    /// answered it.
+    fn lose_and_retry(s: &Store, held: &str) -> StoreResult<(String, Option<i64>)> {
+        let lost = rotate(s, 100, held)?;
+        let retry = s.register_outcome(&json!({"harness":"hermes","host":"sting","pid":100,
+            "session_id":"svc","proc_start":"start-100","session_token":held}))?;
+        assert_eq!(retry.result, lost, "the retry returns the lost reply");
+        Ok((token_of(&retry.result), retry.grace))
+    }
+
+    /// H1 of review 5740636770, "Allow one more grace" (TIN-7577 comment
+    /// 2f1439dc): two register replies lost in a row both recover. The
+    /// second retry presents a token the first grace handed back, and that
+    /// token has a grace of its own.
+    #[test]
+    fn two_consecutive_lost_replies_recover() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let (t1, grace) = lose_and_retry(&s, &token_of(&first)).unwrap();
+        assert_eq!(grace, Some(1));
+        clock.advance(30);
+        let (t2, grace) = lose_and_retry(&s, &t1).unwrap();
+        assert_eq!(grace, Some(2));
+        s.authorize(&me, Some(&t2)).unwrap();
+        s.inbox_as(&me, 10, Some(&t2)).unwrap();
+        // The second grace ends 60 seconds after its rotation, as the first.
+        clock.advance(u32::try_from(SESSION_TOKEN_GRACE_SECONDS).unwrap());
+        assert_eq!(
+            s.authorize(&me, Some(&t1)).unwrap_err(),
+            "invalid session token"
+        );
+        s.authorize(&me, Some(&t2)).unwrap();
+    }
+
+    /// The chain stops after the second grace: a third register reply lost
+    /// in a row leaves the client with a token that has no grace, so its
+    /// retry is refused and the key is locked out until the binding lapses.
+    #[test]
+    fn a_third_consecutive_lost_reply_does_not_recover() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let (t1, _) = lose_and_retry(&s, &token_of(&first)).unwrap();
+        clock.advance(30);
+        let (t2, _) = lose_and_retry(&s, &t1).unwrap();
+        clock.advance(30);
+        let lost = rotate(&s, 100, &t2).unwrap();
+        assert_eq!(rotate(&s, 100, &t2).unwrap_err(), "invalid session token");
+        assert_eq!(
+            s.authorize(&me, Some(&t2)).unwrap_err(),
+            "invalid session token"
+        );
+        // Only the lost reply's token acts as the binding now.
+        s.authorize(&me, Some(&token_of(&lost))).unwrap();
+    }
+
+    /// A register that mints a token the client receives starts a new
+    /// chain, so after two recovered losses and one good register, a lost
+    /// reply recovers again in the first grace.
+    #[test]
+    fn a_register_that_mints_starts_a_new_chain() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let (t1, _) = lose_and_retry(&s, &token_of(&first)).unwrap();
+        let (t2, _) = lose_and_retry(&s, &t1).unwrap();
+        clock.advance(120);
+        let received = s
+            .register_outcome(&json!({"harness":"hermes","host":"sting","pid":100,
+                "session_id":"svc","proc_start":"start-100","session_token":t2}))
+            .unwrap();
+        assert_eq!(received.grace, None, "it minted");
+        clock.advance(120);
+        let (_, grace) = lose_and_retry(&s, &token_of(&received.result)).unwrap();
+        assert_eq!(grace, Some(1));
+    }
+
+    /// H1 of review 5740636770, probe q2: two concurrent registers with one
+    /// saved token make the second a grace register, so the token both
+    /// replies carry was handed back by a grace. Ten minutes later one lost
+    /// reply still recovers, in that token's second grace.
+    #[test]
+    fn concurrent_registers_then_one_lost_reply_recover() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let saved = token_of(&first);
+        let one = rotate(&s, 100, &saved).unwrap();
+        let two = s
+            .register_outcome(&json!({"harness":"hermes","host":"sting","pid":100,
+                "session_id":"svc","proc_start":"start-100","session_token":saved}))
+            .unwrap();
+        assert_eq!(two.result, one);
+        assert_eq!(two.grace, Some(1));
+        clock.advance(600);
+        let (recovered, grace) = lose_and_retry(&s, &token_of(&one)).unwrap();
+        assert_eq!(grace, Some(2));
+        s.authorize(&me, Some(&recovered)).unwrap();
+    }
+
+    /// A wall clock that steps forward inside the grace ends it at once:
+    /// the grace ends on whichever clock reaches 60 seconds first, so it
+    /// fails closed and the client must hold the current token.
+    #[test]
+    fn a_forward_wall_clock_step_inside_the_grace_ends_it() {
+        let (s, clock) = clocked();
+        let first = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = first["agent_id"].as_str().unwrap().to_owned();
+        let old = token_of(&first);
+        let current = token_of(&rotate(&s, 100, &old).unwrap());
+        clock.advance(10);
+        s.authorize(&me, Some(&old)).unwrap();
+        clock.step_wall_forward(120);
+        assert_eq!(
+            s.authorize(&me, Some(&old)).unwrap_err(),
+            "invalid session token"
+        );
+        assert_eq!(rotate(&s, 100, &old).unwrap_err(), "invalid session token");
+        s.authorize(&me, Some(&current)).unwrap();
+    }
+
+    /// A first bind has no previous token, so if its reply is lost the
+    /// client holds no token: every register of the key is refused until
+    /// the binding lapses after the idle limit. SECURITY.md lists this case.
+    #[test]
+    fn a_lost_reply_to_the_first_bind_locks_the_key_until_it_lapses() {
+        let (s, clock) = clocked();
+        let lost = bind(&s, "hermes", "sting", 100, "svc", None).unwrap();
+        let me = lost["agent_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            bind(&s, "hermes", "sting", 100, "svc", None).unwrap_err(),
+            "session token required"
+        );
+        clock.advance(u32::try_from(IDLE_MAX_AGE_SECONDS).unwrap() + 1);
+        s.authorize(&me, None).unwrap();
+        assert_eq!(
+            bind(&s, "hermes", "sting", 100, "svc", None).unwrap()["bound"],
+            true
+        );
     }
 
     /// Review G2 of #57: two registers that present one saved token at the
@@ -2741,6 +3017,11 @@ mod tests {
             binding["session_token_hex_length"],
             json!(SESSION_TOKEN_HEX_LEN),
             "Broker.dhall and SESSION_TOKEN_HEX_LEN disagree"
+        );
+        assert_eq!(
+            binding["session_token_grace_chain"],
+            json!(SESSION_TOKEN_GRACE_CHAIN),
+            "Broker.dhall and SESSION_TOKEN_GRACE_CHAIN disagree"
         );
         assert_eq!(
             constants["session"]["end_token_hex_length"],

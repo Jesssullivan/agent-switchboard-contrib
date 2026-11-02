@@ -48,9 +48,11 @@ in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655"
       , -- R-C944 (v0.3.0): register returns a 64-hex end token; end accepts
         -- nothing else. Every register rotates it and invalidates the old one,
         -- except for a bound session as amended under binding below: a
-        -- register inside the grace returns the current end token, and the
-        -- replaced one still ends the session for
-        -- binding.session_token_grace_seconds.
+        -- register inside a grace returns the current end token, and while
+        -- the replaced session token is in its grace, the end token
+        -- replaced with it still ends the session. A rotation that gives
+        -- the replaced token no grace (the chain is spent) gives its end
+        -- token none either.
         end_token_hex_length = 64
       }
     , peers =
@@ -88,14 +90,20 @@ in  { rulings = [ "SWB-R09", "SWB-R14", "SWB-R16", "SWB-R46", "R-C229", "R-C655"
       -- rotations old is refused. Refined the same day ("Grace returns
       -- current token", comment ff9be66f): a register with the replaced
       -- token returns the current session and end tokens and mints
-      -- nothing, and a token the grace returned gets no grace of its own.
-      -- The end token has the same grace (comment 3955641b). The grace ends
+      -- nothing. "Allow one more grace" (comment 2f1439dc): a token a grace
+      -- handed back gets one more grace of its own when it is replaced, and
+      -- a token handed back in that second grace gets none, so a chain has
+      -- session_token_grace_chain graces. A token a minting register
+      -- returned starts a new chain. The end token has the same grace
+      -- (comment 3955641b). The grace ends
       -- on the wall or the monotonic clock, whichever is first, and a
       -- broker restart ends it. The store fixes the value
-      -- (SESSION_TOKEN_GRACE_SECONDS), a swb-store test ties it to the
-      -- rendered broker-constants.json, and no setting raises it.
+      -- (SESSION_TOKEN_GRACE_SECONDS and SESSION_TOKEN_GRACE_CHAIN), a
+      -- swb-store test ties both to the rendered broker-constants.json,
+      -- and no setting raises either.
       { session_token_hex_length = 64
       , session_token_grace_seconds = 60
+      , session_token_grace_chain = 2
       , delivery_key = [ "harness", "host", "session_id" ]
       , token_required_for =
         [ "send", "inbox", "ack", "claim", "release", "handoff", "end", "register" ]
