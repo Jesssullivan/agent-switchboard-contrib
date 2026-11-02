@@ -13,12 +13,14 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
-## [0.5.1] - Unreleased
+## [0.5.1] - 2026-11-02
 
 Scope ruling SPR-80 (TIN-7125 comment `2ff3e637`), tracking issue
 TIN-7577. The release chain is SWB-R73 (TIN-7577 comment `d59d35a1`).
-Release record: filled at the cut under SWB-R73. The workspace version
-and the lock files move to 0.5.1 in the release bump.
+The changes below landed in #57, merged as `96a5060a`. The workspace
+version is 0.5.1. As for v0.5.0, the release record, its source and the
+approved image digest follow two clean builds of the merge that carries
+this version.
 
 ### Upgrade notes
 

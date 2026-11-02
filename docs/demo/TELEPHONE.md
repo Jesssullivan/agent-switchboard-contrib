@@ -9,8 +9,8 @@ shows what the broker records and exposes.
 - **Tickets:** TIN-6749 (live demo) and TIN-6750 (full features). One
   recording covers both (operator ruling, TIN-6749 comment `fa805609`).
 - **Needs:** a v0.5.1 broker and a v0.5.1 `swb` on every client. A version
-  mismatch fails silently (hooks exit 0), so check versions first. Until
-  the v0.5.1 release bump, a build of this source prints `0.5.0`, so check
+  mismatch fails silently (hooks exit 0), so check versions first. Before
+  the `v0.5.1` tag, a build of this source also prints `0.5.1`, so check
   its commit as well.
 - **Status:** this is the run sheet. The recording happens after a clean dry
   run. Dry-run hops for Codex, Junie and Pi double as P1b round-trip
