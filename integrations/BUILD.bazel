@@ -1,4 +1,10 @@
 package(default_visibility = ["//visibility:public"])
 
-# The Claude Code hook wrapper, for //crates/swb:hook_blackhole_test.
-exports_files(["claude-code/scripts/swb-hook.sh"])
+# The Claude Code hook wrapper, for //crates/swb:hook_blackhole_test, and the
+# hook files whose timeouts //crates/swb:swb_test ties to the ruled 4 s
+# (review K1 of #57, TIN-7577; TIN-4655 comment 204ebf82).
+exports_files([
+    "claude-code/examples/settings.hooks.json",
+    "claude-code/hooks/hooks.json",
+    "claude-code/scripts/swb-hook.sh",
+])

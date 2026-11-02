@@ -1931,7 +1931,8 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
-    /// SWB-R10 as amended (TIN-7577 comment 2f1439dc): the request
+    /// SWB-R10 as amended (TIN-7577 comment 2f1439dc for the bound,
+    /// TIN-4655 comment 204ebf82 for the 4 s timeout): the request
     /// deadline, the hook bound and the harness timeout match
     /// `spec/dhall/Broker.dhall`, a bound register and its one retry fit
     /// inside the hook bound with full deadlines, and the hook bound fits
@@ -1954,12 +1955,90 @@ mod tests {
             "Broker.dhall and HOOK_LIMIT disagree"
         );
         assert_eq!(
-            hook["harness_timeout_seconds"],
-            json!(swb_broker::HOOK_TIMEOUT_MS / 1000),
+            hook["harness_timeout_seconds"]
+                .as_u64()
+                .map(|seconds| seconds * 1000),
+            Some(swb_broker::HOOK_TIMEOUT_MS),
             "Broker.dhall and HOOK_TIMEOUT_MS disagree"
         );
         assert!(2 * LIMIT <= HOOK_LIMIT, "the retry gets a full deadline");
         assert!(HOOK_LIMIT < Duration::from_millis(swb_broker::HOOK_TIMEOUT_MS));
+    }
+
+    /// The ruled harness timeout of the hooks: 4 seconds (Jess, "Yes, 4
+    /// second timeout (Recommended)", TIN-4655 comment 204ebf82, SWB-R10).
+    const RULED_HOOK_TIMEOUT_MS: u64 = 4_000;
+
+    /// The `"timeout"` of every hook entry in a Claude Code hooks file, in
+    /// milliseconds, by event.
+    fn hook_entry_timeouts_ms(name: &str, text: &str) -> Vec<(String, Option<u64>)> {
+        let file: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let events = file["hooks"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name}: no hooks object"));
+        let mut timeouts = Vec::new();
+        for (event, groups) in events {
+            for group in groups.as_array().into_iter().flatten() {
+                for entry in group["hooks"].as_array().into_iter().flatten() {
+                    let ms = entry["timeout"].as_u64().map(|seconds| seconds * 1000);
+                    timeouts.push((event.clone(), ms));
+                }
+            }
+        }
+        timeouts
+    }
+
+    /// Review K1 of #57 (TIN-7577): every copy of the hook timeout is the
+    /// ruled 4 seconds. `HOOK_TIMEOUT_MS`, the plugin's `hooks.json`, the
+    /// `settings.json` example and the wrapper's `timeout` backstop each
+    /// fail this test when they drift, including back to the old 2 s.
+    #[test]
+    fn the_hook_timeouts_are_the_ruled_4_seconds() {
+        assert_eq!(
+            swb_broker::HOOK_TIMEOUT_MS,
+            RULED_HOOK_TIMEOUT_MS,
+            "HOOK_TIMEOUT_MS is not the ruled 4 s"
+        );
+        let events = ["SessionEnd", "SessionStart", "Stop", "UserPromptSubmit"];
+        for (name, text) in [
+            (
+                "hooks.json",
+                include_str!("../../../integrations/claude-code/hooks/hooks.json"),
+            ),
+            (
+                "settings.hooks.json",
+                include_str!("../../../integrations/claude-code/examples/settings.hooks.json"),
+            ),
+        ] {
+            let timeouts = hook_entry_timeouts_ms(name, text);
+            let mut seen: Vec<&str> = timeouts.iter().map(|(e, _)| e.as_str()).collect();
+            seen.sort_unstable();
+            assert_eq!(seen, events, "{name}: one entry per hook event");
+            for (event, ms) in &timeouts {
+                assert_eq!(
+                    *ms,
+                    Some(RULED_HOOK_TIMEOUT_MS),
+                    "{name} {event}: the timeout is not the ruled 4 s"
+                );
+            }
+        }
+        let wrapper = include_str!("../../../integrations/claude-code/scripts/swb-hook.sh");
+        let backstops: Vec<Option<u64>> = wrapper
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("timeout "))
+            .map(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .and_then(|seconds| seconds.parse::<u64>().ok())
+                    .map(|seconds| seconds * 1000)
+            })
+            .collect();
+        assert_eq!(
+            backstops,
+            [Some(RULED_HOOK_TIMEOUT_MS)],
+            "swb-hook.sh: the `timeout` backstop is not the ruled 4 s"
+        );
     }
 
     #[test]
