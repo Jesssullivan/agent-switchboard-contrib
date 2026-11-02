@@ -1,6 +1,6 @@
 # Scripted demo
 
-`run.sh` drives the whole message flow on `main` (v0.3.0, unreleased) with
+`run.sh` drives the whole message flow on `main` (v0.5.x) with
 scripted fake agents: no model calls, no network beyond `127.0.0.1`, no
 secrets. It covers every mode `main` has, in order:
 
@@ -24,7 +24,7 @@ SWB_BIN=/path/to/swb examples/demo/run.sh --check    # diff against docs/demo/tr
 SWB_BIN=/path/to/swb examples/demo/run.sh --record   # rewrite docs/demo/transcript.txt and demo.cast
 ```
 
-It needs bash, curl, jq, `mkfifo` and an `swb` 0.3.x binary. Brokers listen
+It needs bash, curl, jq, `mkfifo` and an `swb` 0.5.x binary. Brokers listen
 on `127.0.0.1:18181` and `:18182` (metrics `:19191`, `:19192`); move them
 with `SWB_DEMO_PORT_BASE`. The script refuses to start if any of those ports
 already answers, and treats a broker as up only while its own process is
