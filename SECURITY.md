@@ -112,8 +112,9 @@ each change reveals:
   granted nothing since v0.3.0, and listings still never return it. Rows
   listed with it carry `registered_seq`, the store-wide registration
   counter at that row's latest register. It orders registrations and
-  reveals roughly how many registrations the broker has taken. Only a
-  caller that already holds the stamp gets it.
+  reveals roughly how many registrations the broker has taken. Any
+  client can read it: a client that registers a session with its own
+  stamp reads the counter from its own row.
 - **`superseded`.** `recipient_state` says when a newer pid of the
   recipient's harness, host and session id registered after the id sent
   to. Default `peers` already shows that newer row as the session's

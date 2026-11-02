@@ -139,7 +139,9 @@ host and session id counts for every pid of it. Without one, `superseded`
 means another pid of that harness, host and session id registered after
 the id sent to, so a restarted session no longer reads it. A live twin
 process of the session may still read it, so `superseded` says the mail
-may go unread, not that it will. A client that does not know a state
+may go unread, not that it will. The newer row counts even when it has
+ended, so an ended newer pid still marks the older pid `superseded`
+until the older pid registers again. A client that does not know a state
 treats it as no warning. The send succeeds in every
 state, and the message waits in its mailbox until it expires. The stored
 and delivered envelope never carry the field, and envelope v3 does not

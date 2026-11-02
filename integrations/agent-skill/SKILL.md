@@ -111,10 +111,12 @@ mailbox, for example when you follow up on a message sent to someone
 else.
 
 From v0.5.1 a send result also carries `recipient_state`. Anything other
-than `live` prints a warning: nobody may read that mailbox now. For
-`superseded`, the session restarted under a new pid, so send to its
-current id from `swb peers`. The message still waits there until it
-expires.
+than `live` prints a warning: nobody may read that mailbox now.
+`superseded` means a newer pid of that session registered. A live twin
+of the session may still read the old id, so never resend blindly. A
+reply to a message from that id stays where it is. For new mail, check
+`swb peers` and the thread first, and resend only when the old id has
+not read it. The message still waits there until it expires.
 
 An acknowledgement says only "received". A queued send says only "the
 broker accepted it", not that anyone read it or agreed.
