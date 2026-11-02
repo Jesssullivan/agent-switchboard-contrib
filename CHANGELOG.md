@@ -56,7 +56,7 @@ and the lock files move to 0.5.1 in the release bump.
   column marks rows v0.5.1 writes, and only an older row matches a retry
   in that flat form. A retry that changes a newline or tab of a v0.5.1
   body is a conflict.
-- The store gains five `sessions` columns for the previous-token grace.
+- The store gains seven `sessions` columns for the previous-token grace.
   The wire is unchanged: a bound register returns the same keys,
   whether it minted the tokens or returned the current ones. A v0.5.0
   broker after a downgrade ignores the columns and keeps no grace. Its
@@ -74,7 +74,9 @@ and the lock files move to 0.5.1 in the release bump.
   seconds, before the retry ends. A dead or blackholed broker now costs a
   hook up to 4 seconds.
 - The store's `Clock` gains `monotonic_millis`. `ManualClock` gains
-  `step_wall_back`, which moves only its wall reading.
+  `step_wall_back` and `step_wall_forward`, which move only its wall
+  reading. `Store` gains `register_outcome`, which also says which grace
+  answered a register.
 
 ### Fixed
 
@@ -91,10 +93,10 @@ and the lock files move to 0.5.1 in the release bump.
 - **The grace let two holders keep each other alive** (review G1 to G6 of
   #57). Under "Grace returns current token" (TIN-7577 comment
   `ff9be66f`), a register with the previous token returns the current
-  session and end tokens and mints nothing, so no chain of graces can
-  form and concurrent registers with one saved token get one answer. A
-  token the grace returned gets no grace when it is next replaced, so a
-  second holder is refused from the client's next register on. The
+  session and end tokens and mints nothing, so no unbounded chain of
+  graces can form and concurrent registers with one saved token get one
+  answer. The chain is bounded at 2 graces (next entry), so a second
+  holder is refused within two of the client's registers. The
   previous token cannot move the binding to another pid. The end token
   has the same grace for a bound session (comment `3955641b`). The grace
   ends at 60 seconds on the wall clock or on a monotonic clock held in
@@ -104,6 +106,17 @@ and the lock files move to 0.5.1 in the release bump.
   holds. A swb-store test ties `Broker.dhall`'s grace and token length to
   the store constants. The MCP `register` and `end` text, `Broker.dhall`
   and SECURITY.md now state these properties.
+- **One lost reply after a grace answer locked a bound session out**
+  (review H1 of #57). A token the grace handed back had no grace of its
+  own, so a reply lost on the next rotation, or after two concurrent
+  registers, cost the 6 hour lapse. Under "Allow one more grace" (TIN-7577
+  comment `2f1439dc`), a token a grace handed back gets one more grace
+  when it is replaced, and a token handed back in that second grace gets
+  none (`SESSION_TOKEN_GRACE_CHAIN`, 2). Two lost replies in a row now
+  recover, and a third does not. A leaked token can fetch the current
+  one in at most 2 graces, so a ping-pong of two holders ends within 2
+  grace windows of the client's registers. `Broker.dhall` states the
+  chain length and a swb-store test ties it.
 - **A1, paging stall.** The channel showed only the 8 oldest unacked
   messages and never read past them. `inbox` now takes `after` and
   returns `next_after`, in arrival order, and the channel poller walks
@@ -180,8 +193,10 @@ and the lock files move to 0.5.1 in the release bump.
   inbox read that counts no delivery would remove that cost.
 - A first bind whose reply is lost has no previous token to recover with,
   so it waits for the 6 hour lapse, as in v0.5.0. So does a reply lost
-  just before a broker restart, or on the first rotation after a
-  register that the grace answered.
+  just before a broker restart, a third reply lost in a row, a lost reply
+  not followed by a register within 60 seconds, and a lost reply while
+  a forward wall clock step ends the grace early. SECURITY.md lists these
+  cases.
 
 ## [0.5.0] - 2026-10-27
 

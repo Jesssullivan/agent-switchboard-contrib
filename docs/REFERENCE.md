@@ -36,7 +36,7 @@ live:
 | --- | --- |
 | `send` (as `from`), `inbox`, `ack`, `claim`, `release`, `handoff`, `end` (as `me`) | need `session_token`; otherwise 401 `unauthorized` |
 | `register` of the same key, any pid | needs the current `session_token`, keeps the binding and rotates the token |
-| the token a rotation replaced | still accepted for 60 seconds after the rotation (v0.5.1), then refused; a `register` with it returns the current tokens and mints nothing |
+| the token a rotation replaced | still accepted for 60 seconds after the rotation (v0.5.1) unless its chain of 2 graces is spent, then refused; a `register` with it returns the current tokens and mints nothing |
 | an earlier pid of the key | refused, even with the token |
 | `inbox` and `ack` | read mail addressed to any pid of the key, so a restart keeps unread mail |
 | `peers`, `claims`, `heartbeat`, `thread` | no token |
@@ -48,16 +48,20 @@ An unbound id behaves as in v0.4.0 and ignores a token it sends. The
 (see `SWB_STATE_DIR` below, SWB-R67).
 
 From v0.5.1 the broker keeps a grace for the previous token (SWB-R67 as
-amended, TIN-7577 comments `41c4704d`, `3955641b` and `ff9be66f`). A
+amended, TIN-7577 comments `41c4704d`, `3955641b`, `ff9be66f` and
+`2f1439dc`). A
 register that rotates the token records the token it replaced, and for 60
 seconds every call that needs the session token also accepts that one.
 A `register` that presents it, from the binding's own agent id, returns
 the current `session_token` and `end_token` and mints nothing. So a client
 whose register reply was lost to its deadline recovers the tokens that
 reply carried, and two registers that present one saved token get the
-same answer. A token the grace returned gets no grace when it is next
-replaced, so a second holder of a token is refused from the client's next
-register on.
+same answer. A token a grace returned gets one more grace when it is
+next replaced, and a token returned in that second grace gets none
+(`SESSION_TOKEN_GRACE_CHAIN`, 2). So two register replies lost in a row
+recover and a third does not, and a second holder of a token is refused
+from the client's second register after its first fetch on. A register
+that mints a token the client receives starts a new chain.
 
 The `swb` client retries a bound register once, with the token it holds,
 after the reply misses its deadline (`whoami --register`, `doctor
@@ -65,17 +69,20 @@ after the reply misses its deadline (`whoami --register`, `doctor
 register and its retry each get the full 1.5 second deadline (TIN-7577
 comment `2f1439dc`). An unbound register is not retried.
 
-For a bound session the end token has the same grace: for 60 seconds the
-end token a rotation replaced still ends the session. Only the token the
+For a bound session the end token has the same grace: while the session
+token a rotation replaced is in its grace, the end token replaced with it
+still ends the session. Only the token the
 latest rotation replaced counts. A token two rotations old, the previous
 token after 60 seconds, or the previous token presented for another pid,
 answers 401 `invalid session token`. The 60 seconds are fixed in the
 broker (`SESSION_TOKEN_GRACE_SECONDS`) and no setting changes them. They
 run on the wall clock and on a monotonic clock, and the grace ends at
-whichever reaches 60 first, so a wall clock step back cannot lengthen it.
-The monotonic part is held in the broker process only: a broker restart
-ends every grace, and a client whose reply was lost just before it waits
-for the lapse. The wire is unchanged. A v0.5.0 broker keeps no grace, and
+whichever reaches 60 first, so a wall clock step back cannot lengthen it
+and a step forward ends it at once. The monotonic part is held in the
+broker process only: a broker restart ends every grace, and a client
+whose reply was lost just before it waits for the lapse. So does a client
+whose first bind reply was lost, because a first bind has no previous
+token. The wire is unchanged. A v0.5.0 broker keeps no grace, and
 an unbound id's end token has no grace.
 
 ### Harness kinds

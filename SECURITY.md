@@ -42,31 +42,47 @@ binding is live:
   `handoff` and `end` with it as `me`, need the token. Without it they
   answer 401 `unauthorized` and change nothing. A spoofed `send` from a
   bound id therefore fails.
-- A new `register` of the same key, from any pid, needs the current token,
-  and every such register rotates it. Only a holder of the current token
-  can take a live binding over by registering again.
+- A new `register` of the same key, from any pid, needs the current token
+  and rotates it. The grace register below is the one exception: it
+  needs the token the latest rotation replaced and rotates nothing. Only a
+  holder of the current token can take a live binding over by
+  registering again.
 - From v0.5.1 the token a rotation replaced stays valid for 60 seconds
   (SWB-R67 as amended, TIN-7577 comments `41c4704d` and `ff9be66f`). In
   that window it can act as the bound id, and a `register` with it from
   the binding's own agent id returns the current session token and end
-  token and mints nothing. So a client whose register reply was lost
-  recovers, and two registers that present one saved token get one
-  answer. The replaced token cannot move the binding to another pid, a
-  token two rotations old is refused, and so is the replaced token after
-  60 seconds. A bound session's end token has the same grace: for 60
-  seconds the end token a rotation replaced still ends the session. An
+  token and mints nothing. This is the grace register. So a client whose
+  register reply was lost recovers, and two registers that present one
+  saved token get one answer. The replaced token cannot move the binding
+  to another pid, a token two rotations old is refused, and so is the
+  replaced token after 60 seconds. A bound session's end token has the
+  same grace: while the session token a rotation replaced is in its
+  grace, the end token replaced with it still ends the session. An
   unbound session's end token has no grace.
-- A token the grace handed out gets no grace when it is next replaced.
-  So a rotation still shuts out a second holder: once the client
-  registers again, the other holder's token is refused at once, and two
-  holders cannot keep each other's tokens alive.
+- The graces form a chain of at most 2 (TIN-7577 comment `2f1439dc`,
+  "Allow one more grace"). A token the client received from a register
+  that minted it gets the first grace when it is replaced. A token a grace
+  register handed back gets one more grace when it is replaced, and a
+  token handed back inside that second grace gets none. So two register
+  replies lost in a row recover, and a third does not. A register that
+  mints a token the client receives starts a new chain.
+- So a rotation still shuts out a second holder within two of the
+  client's registers. A holder of a replaced token can fetch the current
+  token in the first grace and again in the second. When the client next
+  registers, the token the second grace handed out is refused at once.
+  Two holders cannot keep each other's tokens alive for longer than 2
+  grace windows of the client's registers.
 - The 60 seconds run on the wall clock and on a monotonic clock in the
   broker process, and the grace ends at whichever reaches 60 first. A wall
-  clock that steps back cannot lengthen it. The monotonic part is held in
-  memory only, so a broker restart ends every grace and the replaced
-  token is then refused: the grace fails closed. No key or token is stored for
-  the grace: the broker derives the current tokens again from the key it
-  already holds.
+  clock that steps back cannot lengthen it, and one that steps forward
+  ends it at once. The monotonic part is held in memory only, so a broker
+  restart ends every grace and the replaced token is then refused: the
+  grace fails closed. No token is stored for the grace. The broker derives
+  the current tokens again from its two token keys, `session_token_key`
+  and `end_token_key`, and the row's nonce.
+- A register that a grace answered writes the audit line
+  `register_grace` with the grace that answered it, not `register`, so an
+  operator can see a fetch of the current token.
 - `peers` rows say `bound`.
 
 A binding lapses when its session ends or after 6 hours without a call;
@@ -94,14 +110,32 @@ Residuals of binding:
   the bound id until the next register rotates it, and for 60 seconds
   after that (v0.5.1). During those 60 seconds two tokens are valid, and
   a register with the replaced one fetches the current one. A holder who
-  fetches it this way holds the same token as the client, so either of
-  them can then register and take the binding, and the other is refused
-  from that register on with no grace. A rotation removes a leaked token
-  for good once its holder has not registered within 60 seconds of it,
-  or once the client registers after the holder fetched the current one.
-- The grace costs lockouts in two cases, each until the 6-hour lapse: a
-  register reply lost just before a broker restart, and a reply lost on
-  the first rotation after a register that the grace answered.
+  fetches the current token keeps it until the client next registers,
+  however long that takes. It holds the same token as the client, so
+  either of them can then register and take the binding. If the chain is
+  not spent, the other has one more grace to fetch the new token, and
+  after the next register it is refused. A rotation removes a leaked token for good once its
+  holder has not registered within 60 seconds of it, or once the client
+  has registered twice after the holder's first fetch.
+- The grace still leaves these lockouts, each until the 6-hour lapse:
+  - A first bind whose reply is lost. The client holds no token, and a
+    first bind records no previous token.
+  - A register reply lost just before a broker restart, which ends every
+    grace.
+  - A third register reply lost in a row: a reply lost on a rotation
+    whose replaced token the second grace had handed back. Two concurrent
+    registers that present one saved token count as one grace answer, so
+    after them one lost reply still recovers and a second in a row does
+    not.
+  - A lost reply that the client does not follow with a register within
+    60 seconds, for example when its one retry also misses the deadline
+    and no hook runs in time.
+  - A wall clock step forward inside the grace, which ends it at once.
+    This fails closed, as intended.
+- The broker keeps `session_token_key`, `end_token_key` and every row's
+  token nonce in its SQLite database. Read access to the database file
+  therefore yields every live session and end token, as it has since
+  v0.5.0. The grace does not change this.
 - A caller with a wrong token can tell that the binding rotated within the
   last 60 seconds from the time a refusal takes. `peers` already shows
   `registered_seq`, so this reveals little.

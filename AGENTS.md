@@ -148,8 +148,9 @@ the full text. ADR-0002 carries the phase scope and host order
   key need the session token, and every register rotates it (SWB-R67). The
   replaced token stays valid for 60 seconds and then never again (SWB-R67
   as amended, TIN-7577 comment `41c4704d`). A register with it returns the
-  current tokens and mints nothing, and a token the grace returned gets no
-  grace of its own (TIN-7577 comment `ff9be66f`). An
+  current tokens and mints nothing (TIN-7577 comment `ff9be66f`). A token
+  the grace returned gets one more grace of its own, and the chain stops
+  there (TIN-7577 comment `2f1439dc`). An
   unbound id stays self-asserted (SWB-R05). Binding never changes
   `authority`, which stays `peer`.
 - SWB-R02, verbatim: "Self-registration is authoritative; the broker writes
