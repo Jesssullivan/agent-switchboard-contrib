@@ -1701,8 +1701,10 @@ fn notice(me: &str, sender: &str, ticket: &str) -> String {
 const AGY: &str = "agy";
 /// agy's answer that changes nothing.
 const AGY_EMPTY: &str = "{}";
-/// The most unread messages the digest counts one by one; past it the count
-/// reads `<n>+`.
+/// The most unread messages the digest counts one by one. The walk stops
+/// when it has counted this many and the count reads `<n>+`, a lower bound,
+/// so exactly 50 unread also reads `50+`: telling 50 from 51 would fetch a
+/// 51st message, which bumps its delivery count, to print one digit.
 const AGY_DIGEST_MAX: usize = 50;
 /// The most sender ids the digest names; the rest read `+N more`.
 const AGY_DIGEST_IDS: usize = 3;
@@ -1773,13 +1775,28 @@ fn agy_digest(count: usize, capped: bool, senders: &[String]) -> String {
     format!("swb: {count}{plus} unread from {ids}. Ask me to read them.")
 }
 
+/// A walk's answer: the unread count, whether the walk stopped short of the
+/// end of the mailbox, and the distinct senders in arrival order.
+type AgyUnread = (usize, bool, Vec<String>);
+
+/// Whether an inbox page may start `elapsed` into the hook: a full request
+/// deadline and 100 ms of margin must still fit inside [`HOOK_LIMIT`].
+fn agy_fits(elapsed: Duration) -> bool {
+    elapsed + LIMIT + Duration::from_millis(100) <= HOOK_LIMIT
+}
+
 /// Walks `me`'s unread mail one page at a time and returns the count, whether
 /// it stopped short of the end, and the distinct senders in arrival order.
 /// A page starts only while a full request deadline still fits inside the
 /// hook bound measured from `start`. `None` when not even the first page
 /// answered.
-fn agy_unread(lookup: Lookup, me: &str, start: Instant) -> Option<(usize, bool, Vec<String>)> {
-    let fits = || start.elapsed() + LIMIT + Duration::from_millis(100) <= HOOK_LIMIT;
+fn agy_unread(lookup: Lookup, me: &str, start: Instant) -> Option<AgyUnread> {
+    agy_walk(lookup, me, || agy_fits(start.elapsed()))
+}
+
+/// The walk behind [`agy_unread`]. `fits` is asked before each page and a
+/// page starts only while it answers true; tests pass a simulated clock.
+fn agy_walk(lookup: Lookup, me: &str, fits: impl Fn() -> bool) -> Option<AgyUnread> {
     let mut count = 0;
     let mut senders: Vec<String> = Vec::new();
     let mut after: Option<String> = None;
@@ -2698,12 +2715,135 @@ mod tests {
         assert_eq!(out.as_deref(), Some("{}"));
     }
 
-    /// A walk that has used up the hook bound starts no inbox page.
+    /// A broker whose mailbox holds `full` unread messages, one per page:
+    /// it answers every inbox request with the next full page, then with
+    /// empty pages, until the returned flag is set. The handle returns
+    /// every request it read.
+    fn agy_mailbox(
+        full: usize,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<Vec<String>>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        listener.set_nonblocking(true).unwrap();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = done.clone();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop.load(Ordering::SeqCst) {
+                            return seen;
+                        }
+                        assert!(Instant::now() < deadline, "the walk never finished");
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                };
+                seen.push(read_request(&mut stream));
+                let n = seen.len() - 1;
+                let body = if n < full {
+                    let id = format!("01J9ZQ3Y8T6V2W4X5Y6Z7A{n:04}");
+                    json!({"messages":[{
+                        "msg_id":id,"from":format!("p{n}:h:1:s"),"to":AGY_ME,
+                        "ticket":"none","subject":"s","body":"b","authority":"peer",
+                        "delivery_count":1
+                    }],"next_after":id})
+                    .to_string()
+                } else {
+                    AGY_EMPTY_PAGE.to_owned()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (url, done, server)
+    }
+
+    /// Runs [`agy_walk`] against `agy_mailbox(full)` and returns its answer
+    /// and the inbox requests the broker saw.
+    fn agy_walk_against(full: usize, fits: impl Fn() -> bool) -> (Option<AgyUnread>, Vec<String>) {
+        let (url, done, server) = agy_mailbox(full);
+        let walked = agy_walk(&agy_env(&url), AGY_ME, fits);
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let requests = server.join().unwrap();
+        assert!(requests.iter().all(|r| path_of(r) == "/v1/inbox"));
+        (walked, requests)
+    }
+
+    /// The page budget: a page starts only while a full request deadline
+    /// and 100 ms of margin fit inside the hook bound.
+    #[test]
+    fn agy_fits_leaves_a_full_deadline() {
+        let last = HOOK_LIMIT - LIMIT - Duration::from_millis(100);
+        assert!(agy_fits(Duration::ZERO));
+        assert!(agy_fits(last));
+        assert!(!agy_fits(last + Duration::from_millis(1)));
+        assert!(!agy_fits(HOOK_LIMIT));
+    }
+
+    /// With the hook bound already spent, the walk sends no inbox request
+    /// although the broker holds full pages, so pre-invocation prints `{}`.
     #[test]
     fn agy_walk_starts_no_page_past_the_bound() {
-        let late = Instant::now() - HOOK_LIMIT;
-        let none = lookup_of(&[]);
-        assert_eq!(agy_unread(&none, AGY_ME, late), None);
+        let (walked, requests) = agy_walk_against(60, || agy_fits(HOOK_LIMIT));
+        assert_eq!(walked, None);
+        assert!(requests.is_empty(), "{} inbox requests", requests.len());
+    }
+
+    /// Time runs out partway: on a clock that moves 400 ms per page, pages
+    /// start at 0, 400, 800, 1200 and 1600 ms, and the sixth, due at
+    /// 2000 ms, would end past the bound. The digest keeps `5+`.
+    #[test]
+    fn agy_walk_stops_partway_when_time_runs_out() {
+        let pages = std::cell::Cell::new(0u32);
+        let clock = || {
+            let elapsed = Duration::from_millis(400) * pages.get();
+            pages.set(pages.get() + 1);
+            agy_fits(elapsed)
+        };
+        let (walked, requests) = agy_walk_against(60, clock);
+        let (count, capped, senders) = walked.unwrap();
+        assert_eq!((count, capped), (5, true));
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            agy_digest(count, capped, &senders),
+            "swb: 5+ unread from p0:h:1:s, p1:h:1:s, p2:h:1:s +2 more. Ask me to read them."
+        );
+    }
+
+    /// With more than 50 unread and time to spare, the walk stops after 50
+    /// inbox requests and reads `50+`.
+    #[test]
+    fn agy_walk_stops_at_the_cap() {
+        let (walked, requests) = agy_walk_against(60, || true);
+        let (count, capped, senders) = walked.unwrap();
+        assert_eq!((count, capped), (AGY_DIGEST_MAX, true));
+        assert_eq!(requests.len(), AGY_DIGEST_MAX);
+        assert_eq!(senders.len(), AGY_DIGEST_MAX);
+        assert!(agy_digest(count, capped, &senders).starts_with("swb: 50+ unread from "));
+    }
+
+    /// Exactly 50 unread also reads `50+`: the walk stops at the cap
+    /// without fetching a 51st page, so `50+` is a lower bound.
+    #[test]
+    fn agy_walk_reads_exactly_fifty_as_a_lower_bound() {
+        let (walked, requests) = agy_walk_against(AGY_DIGEST_MAX, || true);
+        assert_eq!(requests.len(), AGY_DIGEST_MAX);
+        let (count, capped, _) = walked.unwrap();
+        assert_eq!((count, capped), (AGY_DIGEST_MAX, true));
     }
 
     /// TIN-7577: a multi-line body reaches `swb inbox` and `swb thread`
@@ -2848,30 +2988,7 @@ mod tests {
                         Err(e) => panic!("accept: {e}"),
                     }
                 };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0u8; 4096];
-                    let n = stream.read(&mut chunk).unwrap();
-                    assert!(n > 0, "client closed early");
-                    request.extend_from_slice(&chunk[..n]);
-                    if let Some(split) = request.windows(4).position(|b| b == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&request[..split]).to_string();
-                        let length: usize = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("Content-Length: "))
-                            .unwrap()
-                            .parse()
-                            .unwrap();
-                        if request.len() >= split + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                seen.push(String::from_utf8_lossy(&request).into_owned());
+                seen.push(read_request(&mut stream));
                 write!(
                     stream,
                     "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2882,6 +2999,33 @@ mod tests {
             seen
         });
         (url, server)
+    }
+
+    /// Reads one HTTP request, head and body, from an accepted connection.
+    fn read_request(stream: &mut TcpStream) -> String {
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0, "client closed early");
+            request.extend_from_slice(&chunk[..n]);
+            if let Some(split) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&request[..split]).to_string();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if request.len() >= split + 4 + length {
+                    return String::from_utf8_lossy(&request).into_owned();
+                }
+            }
+        }
     }
 
     pub(crate) fn request_json(request: &str) -> Value {
@@ -3552,30 +3696,7 @@ mod tests {
             let mut seen = Vec::new();
             for step in plan {
                 let mut stream = accept(Duration::from_secs(5)).expect("request never came");
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0u8; 4096];
-                    let n = stream.read(&mut chunk).unwrap();
-                    assert!(n > 0, "client closed early");
-                    request.extend_from_slice(&chunk[..n]);
-                    if let Some(split) = request.windows(4).position(|b| b == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&request[..split]).to_string();
-                        let length: usize = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("Content-Length: "))
-                            .unwrap()
-                            .parse()
-                            .unwrap();
-                        if request.len() >= split + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                seen.push(String::from_utf8_lossy(&request).into_owned());
+                seen.push(read_request(&mut stream));
                 match step {
                     None => std::thread::sleep(LIMIT + Duration::from_millis(300)),
                     Some(body) => write!(
