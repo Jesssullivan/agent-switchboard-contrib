@@ -318,7 +318,7 @@ tokens and strip them before the model sees them.
 
 ## CLI verbs
 
-`serve`, `hook <harness> <event>`, `whoami [--register]` (plain `whoami`
+`serve`, `hook <harness> <event>`, `hook agy <session-start|pre-invocation|stop>`, `whoami [--register]` (plain `whoami`
 makes no broker call), `inbox [--after ULID]`,
 `send <to> <ticket> [--ruling ID] [--operator-directed] [--in-reply-to ULID]
 [--thread ULID] [--msg-id ULID] [--no-ack] < body`, `ack <msg_id>`,
@@ -462,6 +462,19 @@ notice to the session's context when it has unread mail. The notice names the
 receiver's agent id, the sender and ticket, and the exact `swb inbox` and
 `swb ack` commands. Claude Code reads it from the `hookSpecificOutput` JSON;
 with `SWB_HOOK_FORMAT=text` the hook prints the same notice as plain text.
+
+agy runs `swb hook agy <session-start|pre-invocation|stop>` (SWB-R76). The
+argument selects this path, so an inherited `SWB_HARNESS` does not change it,
+and the session id is the payload's `conversationId`, then `session_id`.
+session-start registers and prints nothing. pre-invocation registers and,
+when mail is waiting, prints `{"injectSteps":[{"ephemeralMessage":"swb: <n>
+unread from <ids>. Ask me to read them."}]}`: a count, at most three sender ids
+and then `+N more`, never a body, subject or ticket. A count cut short by the
+hook bound reads `<n>+`. With no mail or on an error it prints `{}`. stop only
+heartbeats and prints `{}`; an agy session ends when its lease lapses. The
+pre-invocation walk fetches each unread message once, which counts a delivery
+on it, as `swb inbox` does. The `injectSteps` keys come from Google's agy
+documentation and are unproven until a real agy session reads them.
 
 ## Known gaps
 

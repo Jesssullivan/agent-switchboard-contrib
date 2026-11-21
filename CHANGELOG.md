@@ -27,8 +27,12 @@ registry tag; the approved digest and its publication receipt are in
   `swb_store::HARNESS_KINDS` and the envelope v3 `agent_id` pattern. Under
   SWB-R75 (TIN-4655 comment `29c25fd9`, "Full peer") an agy session is
   listed by `peers`, receives mail, holds claims and can be a handoff
-  target. Push stays Claude-only. The `swb hook agy` verbs and the unread
-  digest are not in this change (TIN-7375).
+  target. Push stays Claude-only.
+- `swb hook agy <session-start|pre-invocation|stop>` (SWB-R76, TIN-4655
+  comment `0c2bfb83`, TIN-7375). pre-invocation prints a count-only unread
+  digest as agy `injectSteps` JSON; stop only heartbeats, and an agy session
+  ends when its lease lapses. The agy output keys are unproven until a real
+  agy session reads them.
 
 ## [0.5.1] - 2026-11-02
 
