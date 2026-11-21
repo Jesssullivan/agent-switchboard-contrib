@@ -34,6 +34,13 @@ registry tag; the approved digest and its publication receipt are in
   ends when its lease lapses. The agy output keys are unproven until a real
   agy session reads them.
 
+### Fixed
+
+- `swb hook agy` and `swb hook claude` no longer panic when the harness has
+  closed its end of the stdout pipe. The agy path exited 101 and the claude
+  path printed a panic line to stderr. Both now ignore the write error and
+  exit 0, as SWB-R10 requires (TIN-7375).
+
 ## [0.5.1] - 2026-11-02
 
 Release record SWB-R73. Source `154cfb19` (the #60 merge), image
