@@ -33,6 +33,11 @@ registry tag; the approved digest and its publication receipt are in
   digest as agy `injectSteps` JSON; stop only heartbeats, and an agy session
   ends when its lease lapses. The agy output keys are unproven until a real
   agy session reads them.
+- `swb hook agy` also accepts the Claude Code event names (SWB-R77, Jess,
+  "Release; map the names", 2026-11-21, TIN-7375): `SessionStart` runs
+  session-start, `UserPromptSubmit` runs pre-invocation and `Stop` runs
+  stop. `SessionEnd` and agy's own `PreInvocation` stay unknown verbs and
+  print nothing.
 
 ### Fixed
 

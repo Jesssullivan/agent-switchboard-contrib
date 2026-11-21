@@ -38,7 +38,10 @@
 # move them onto the claude path. session-start prints nothing; pre-invocation
 # and stop print exactly `{}`, on a register error and on the hook's own
 # bound alike. The claude path would print nothing for these verbs, so the
-# `{}` also proves the argument chose the agy path.
+# `{}` also proves the argument chose the agy path. Under SWB-R77 the
+# Claude Code names SessionStart, UserPromptSubmit and Stop select the same
+# verbs; SessionEnd and agy's own PreInvocation stay unknown and print
+# nothing.
 #
 # Arguments after the second (for example the fixture driver's
 # --test-threads=1, which Bazel passes to every test) are ignored.
@@ -185,22 +188,28 @@ run_case "swb-hook.sh UserPromptSubmit (stdin never closes)" open \
   env PATH="$scratch/bin:$PATH" sh "$wrapper" UserPromptSubmit
 # agy (SWB-R76), with an inherited SWB_HARNESS=claude the argument overrides.
 case_payload="$agy_payload"
-for verb in session-start pre-invocation stop; do
+# SWB-R77: the Claude Code names SessionStart, UserPromptSubmit and Stop
+# select the same three verbs and answer the same way.
+for verb in session-start pre-invocation stop SessionStart UserPromptSubmit Stop; do
   case "$verb" in
-    session-start) case_expect="" ;;
+    session-start | SessionStart) case_expect="" ;;
     *) case_expect="{}" ;;
   esac
   run_case "swb hook agy $verb" closed env SWB_HARNESS=claude "$swb" hook agy "$verb"
 done
 # The bound runs out with stdin still open: pre-invocation and stop answer {}.
-for verb in pre-invocation stop; do
+for verb in pre-invocation stop UserPromptSubmit Stop; do
   case_expect="{}"
   run_case "swb hook agy $verb (stdin never closes)" open \
     env SWB_HARNESS=claude "$swb" hook agy "$verb"
 done
+# agy has no SessionEnd, and agy's own PreInvocation spelling stays
+# unmapped under SWB-R77: both are unknown verbs and print nothing.
 case_expect=""
-run_case "swb hook agy PreInvocation (unknown verb)" closed \
-  env SWB_HARNESS=claude "$swb" hook agy PreInvocation
+for verb in PreInvocation SessionEnd; do
+  run_case "swb hook agy $verb (unknown verb)" closed \
+    env SWB_HARNESS=claude "$swb" hook agy "$verb"
+done
 # Broken pipe (TIN-7375): the stdout reader is gone before the hook writes.
 # stdin stays open for 1 s, so `true` has exited before the hook reads EOF
 # and prints. The hook must still exit 0 and must not panic; before the fix
