@@ -13,6 +13,23 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Upgrade the broker and every client together.** A v0.5.1 broker
+  answers `invalid harness` to a `register` with kind `agy` and refuses any
+  agent id that names one. A v0.5.1 client refuses those ids too.
+- A validator pinned to the older copy of
+  `schemas/envelope-v3.schema.json` rejects `agy`. Refresh the copy.
+
+### Added
+
+- Harness kind `agy` (Google Antigravity), appended to
+  `swb_store::HARNESS_KINDS` and the envelope v3 `agent_id` pattern. Under
+  SWB-R75 (TIN-4655 comment `29c25fd9`, "Full peer") an agy session is
+  listed by `peers`, receives mail, holds claims and can be a handoff
+  target. Push stays Claude-only. The `swb hook agy` verbs and the unread
+  digest are not in this change (TIN-7375).
+
 ## [0.5.1] - 2026-11-02
 
 Release record SWB-R73. Source `154cfb19` (the #60 merge), image

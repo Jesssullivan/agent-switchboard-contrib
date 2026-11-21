@@ -150,6 +150,16 @@ registered once on the tailnet so that new harness instances spawn nothing.
     `swb whoami --register` and renews its lease, or through its own
     client. A v0.3.0 broker or client refuses both kinds, so they ship
     with the next release of broker and clients together.
+  - *Added 2026-11-21 (SWB-R75, TIN-4655 comment `29c25fd9`):* harness
+    kind `agy`, Google Antigravity, appended to the same list. It is a full
+    peer: it is listed by `peers`, receives mail, can hold a claim and can
+    be a handoff target, like a Claude or Codex session. The broker has no
+    dispatchable flag and no selector, so adding the kind is the whole
+    broker change. Push stays Claude-only and the full-mode `send` tool
+    still refuses `operator_directed`, as for SWB-R63. agy's own hook verbs
+    and its unread digest are later work. A v0.5.1 broker or client refuses
+    the kind, so it ships with the next release of broker and clients
+    together.
 - **Lease:**
   - Heartbeat sources: the Claude/Kimi hooks (SessionStart, UserPromptSubmit,
     Stop) and every tool call. Codex heartbeats through tool calls only,
@@ -1030,6 +1040,7 @@ receipts (TIN-4655 comments `6274ecbd` and `fd195b08`) and their PRs.
 | SWB-R72 | 2026-10-28 | Operator ruling (Jess, narrate seat chat), Linear TIN-4655 comment `231951ec`: "admin merges are ratified, go for it" | The narrate seat may admin-merge the v0.5.0 release chain PRs (the #56 record PR and the receipt PR), each with a release-check waiver comment. #56 merged as eada83ae at head 0d20f16. |
 | SWB-R73 | 2026-10-28 | Operator ruling (Jess, narrate seat chat), Linear TIN-7577 comment `d59d35a1`; SWB-R72; release-check waiver for #60 (TIN-7577 comment `36ec5126`); R-C435 (TIN-5770 comment `d3d90700`): "Pre-authorize if reproducible (Recommended)"; R-C416 | Once #57 is built and reviewed, cut it as v0.5.1 with the same chain as v0.5.0. Approve the v0.5.1 delivery-fix release: signed source 154cfb19 (the #60 merge; GitHub merge key B5690EEEBB952194) at digest `sha256:77e004b2…` (4579-byte manifest), from two matching clean builds of that merge on a lab build host. Recorded in `approved-broker.json`; the signed v0.5.1 tag publishes only this digest, through `release.yml`. The live broker moves to v0.5.1 in a later window. |
 | SWB-R74 | 2026-10-28 | SPR-80 (Jess, Sprint 4 interview, Linear TIN-7125 comment `2ff3e637`): v0.5.1 carries the delivery fixes A1 to A5, among them "`send --in-reply-to` acks"; the body defect report and fix on #57 (TIN-7577 comments `e2d6b6f5` and `30c50f22`); #57 landed under the release-check waiver in TIN-7577 comment `da8f8a83` | A message body keeps newline and tab. The store drops every CR and every other control character, and the 16 KiB limit counts the cleaned body. A `messages.body_lines` marker keeps a `--msg-id` retry of a body that v0.5.0 stored flat a replay. `swb send --in-reply-to` and the full-mode `send` tool acknowledge the original by default, as `reply` does; `--no-ack` keeps it open. Envelope v3 keeps its keys. Review item F7 of #57 asked for this row. |
+| SWB-R75 | 2026-11-21 | Operator ruling (Jess, interview in the CADE-1 seat), Linear TIN-4655 comment `29c25fd9`: "Full peer"; precedent SWB-R63; tracking issue TIN-7375 | Harness kind `agy` (Google Antigravity) joins the identity list, appended last to `HARNESS_KINDS` and the envelope v3 `agent_id` pattern. agy is a full peer: listed by `peers`, it receives mail and an unread count at each prompt, and it can hold a claim and be a handoff target, like Claude and Codex sessions. It is never `dispatchable:false`. This supersedes the earlier "Deliver as mail" answer for agy. The SWB-R63 carry-overs apply: push stays Claude-only, and a non-Claude kind may not send `operator_directed`. The `swb hook agy` verbs and the count-only digest follow in their own change. The kind ships in the next release of broker and clients together; a v0.5.1 broker refuses it. |
 
 Estate rulings this design depends on:
 

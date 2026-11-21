@@ -356,9 +356,14 @@ fn field<'a>(v: &'a Value, key: &str) -> StoreResult<&'a str> {
 ///
 /// - `kimi` is Claude Code running on a Kimi model (lab `kimi-claude.sh`);
 /// - `kimicode` is the official Kimi Code CLI;
-/// - `hermes` is a Hermes agent.
-pub const HARNESS_KINDS: [&str; 8] = [
-    "claude", "kimi", "codex", "junie", "opencode", "pi", "hermes", "kimicode",
+/// - `hermes` is a Hermes agent;
+/// - `agy` is Google Antigravity, a full peer under SWB-R75 (TIN-4655
+///   comment `29c25fd9`).
+///
+/// Append new kinds at the end: the send rate limiter counts refusals by
+/// position in this list.
+pub const HARNESS_KINDS: [&str; 9] = [
+    "claude", "kimi", "codex", "junie", "opencode", "pi", "hermes", "kimicode", "agy",
 ];
 
 /// Whether `harness` is one of [`HARNESS_KINDS`].
@@ -2245,7 +2250,16 @@ mod tests {
         assert_eq!(kinds, expected);
         // `kimi` stays Claude Code on Kimi; near misses are not kinds.
         assert!(!valid_harness(""));
-        for bad in ["kimi-code", "Hermes", "kimi_code", "hermes-agent"] {
+        for bad in [
+            "kimi-code",
+            "Hermes",
+            "kimi_code",
+            "hermes-agent",
+            "AGY",
+            "Agy",
+            "antigravity",
+            "agy-cli",
+        ] {
             assert!(!valid_harness(bad), "{bad}");
             let refused = s.register(&json!({"harness":bad,"host":"host-a","pid":9,
                 "session_id":"s-1","proc_start":"start-1"}));
