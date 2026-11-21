@@ -33,6 +33,13 @@
 #
 # Cases: the compiled `swb hook claude <event>` directly, and the Claude Code
 # wrapper `integrations/claude-code/scripts/swb-hook.sh`, for every event.
+# The agy cases (SWB-R76) run `swb hook agy <verb>` with an agy payload
+# (`conversationId`) and an inherited SWB_HARNESS=claude, which must not
+# move them onto the claude path. session-start prints nothing; pre-invocation
+# and stop print exactly `{}`, on a register error and on the hook's own
+# bound alike. The claude path would print nothing for these verbs, so the
+# `{}` also proves the argument chose the agy path.
+#
 # Arguments after the second (for example the fixture driver's
 # --test-threads=1, which Bazel passes to every test) are ignored.
 #
@@ -97,6 +104,12 @@ session_token_file="$bound_state/bindings/claude:blackhole-test:blackhole-sessio
 printf '%064d' 0 >"$session_token_file"
 chmod 600 "$session_token_file"
 
+claude_payload='{"session_id":"blackhole-session","hook_event_name":"x"}'
+agy_payload='{"conversationId":"blackhole-conversation","invocationNum":0}'
+# The stdin payload and the exact expected stdout of the next case.
+case_payload="$claude_payload"
+case_expect=""
+
 failures=0
 blackholed=0
 bound_cases=0
@@ -120,12 +133,19 @@ attempt() {
     kill "$holder" 2>/dev/null || true
     wait "$holder" 2>/dev/null || true
   else
-    printf '%s' '{"session_id":"blackhole-session","hook_event_name":"x"}' \
+    printf '%s' "$case_payload" \
       | "$@" >"$out" 2>/dev/null || case_status=$?
   fi
   end="$(now_us)"
   case_elapsed=$((end - start))
   case_bytes="$(wc -c <"$out" | tr -d ' ')"
+  # Exact stdout: empty, or the expected text and one line break.
+  case_match=0
+  if [ -z "$case_expect" ]; then
+    [ "$case_bytes" -eq 0 ] && case_match=1
+  elif [ "$(cat "$out")" = "$case_expect" ] && [ "$case_bytes" -eq $((${#case_expect} + 1)) ]; then
+    case_match=1
+  fi
 }
 
 run_case() {
@@ -133,12 +153,12 @@ run_case() {
   shift 2
   local verdict=ok
   attempt "$stdin_mode" "$@"
-  if [ "$case_status" -eq 0 ] && [ "$case_bytes" -eq 0 ] && [ "$case_elapsed" -ge "$budget_us" ]; then
+  if [ "$case_status" -eq 0 ] && [ "$case_match" -eq 1 ] && [ "$case_elapsed" -ge "$budget_us" ]; then
     printf 'RETRY %-47s exit=%d elapsed_ms=%d (timing only; once)\n' \
       "$name" "$case_status" $((case_elapsed / 1000))
     attempt "$stdin_mode" "$@"
   fi
-  if [ "$case_status" -ne 0 ] || [ "$case_elapsed" -ge "$budget_us" ] || [ "$case_bytes" -ne 0 ]; then
+  if [ "$case_status" -ne 0 ] || [ "$case_elapsed" -ge "$budget_us" ] || [ "$case_match" -ne 1 ]; then
     verdict=FAIL
   elif [ "$blackholed" -ne 0 ] && [ "$case_elapsed" -lt "$case_min_us" ]; then
     # The earlier closed-stdin cases reached the blackhole, so this one
@@ -163,6 +183,26 @@ done
 run_case "swb hook claude SessionStart (stdin never closes)" open "$swb" hook claude SessionStart
 run_case "swb-hook.sh UserPromptSubmit (stdin never closes)" open \
   env PATH="$scratch/bin:$PATH" sh "$wrapper" UserPromptSubmit
+# agy (SWB-R76), with an inherited SWB_HARNESS=claude the argument overrides.
+case_payload="$agy_payload"
+for verb in session-start pre-invocation stop; do
+  case "$verb" in
+    session-start) case_expect="" ;;
+    *) case_expect="{}" ;;
+  esac
+  run_case "swb hook agy $verb" closed env SWB_HARNESS=claude "$swb" hook agy "$verb"
+done
+# The bound runs out with stdin still open: pre-invocation and stop answer {}.
+for verb in pre-invocation stop; do
+  case_expect="{}"
+  run_case "swb hook agy $verb (stdin never closes)" open \
+    env SWB_HARNESS=claude "$swb" hook agy "$verb"
+done
+case_expect=""
+run_case "swb hook agy PreInvocation (unknown verb)" closed \
+  env SWB_HARNESS=claude "$swb" hook agy PreInvocation
+case_payload="$claude_payload"
+case_expect=""
 # The bound cases run last, after the unbound closed-stdin cases have shown
 # whether the blackhole path runs here.
 case_min_us=$bound_min_us
@@ -179,7 +219,7 @@ case_min_us=0
 [ -f "$session_token_file" ] || { echo "FAIL seeded session token was removed without a broker answer"; failures=$((failures + 1)); }
 
 if [ "$failures" -ne 0 ]; then
-  echo "$failures case(s) exceeded the 4 s budget, exited non-zero, printed output or cut the bound retry" >&2
+  echo "$failures case(s) exceeded the 4 s budget, exited non-zero, printed the wrong output or cut the bound retry" >&2
   exit 1
 fi
 if [ "$blackholed" -eq 0 ]; then

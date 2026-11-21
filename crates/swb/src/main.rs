@@ -24,6 +24,9 @@ commands:
   hook <harness> <event>    harness hook for SessionStart, UserPromptSubmit, Stop or
                             SessionEnd; reads the hook JSON on stdin and always exits 0;
                             SWB_HOOK_FORMAT=text prints the unread-mail notice as plain text
+  hook agy <session-start|pre-invocation|stop>
+                            agy hook: pre-invocation prints a count-only unread digest,
+                            stop only heartbeats; always exits 0
   whoami [--register]       print this session's agent id from the SWB_* environment;
                             --register also registers it and saves its end token;
                             with SWB_BIND=1 it binds the session and saves its
@@ -1684,6 +1687,208 @@ fn notice(me: &str, sender: &str, ticket: &str) -> String {
     )
 }
 
+// ---- agy hooks (SWB-R76) ----------------------------------------------------
+//
+// agy (Google Antigravity) runs `swb hook agy <verb>` for its SessionStart,
+// PreInvocation and Stop events. Its event names collide with Claude Code's,
+// so the agy path is chosen by the harness argument alone, never by the
+// event spelling and never by an inherited `SWB_HARNESS`. agy's Stop fires
+// after every turn and agy has no SessionEnd, so Stop only heartbeats and an
+// agy session ends when its lease lapses (Jess, "Lease lapse", TIN-4655
+// comment `0c2bfb83`).
+
+/// The harness argument that selects the agy hook path.
+const AGY: &str = "agy";
+/// agy's answer that changes nothing.
+const AGY_EMPTY: &str = "{}";
+/// The most unread messages the digest counts one by one. The walk stops
+/// when it has counted this many and the count reads `<n>+`, a lower bound,
+/// so exactly 50 unread also reads `50+`: telling 50 from 51 would fetch a
+/// 51st message, which bumps its delivery count, to print one digit.
+const AGY_DIGEST_MAX: usize = 50;
+/// The most sender ids the digest names; the rest read `+N more`.
+const AGY_DIGEST_IDS: usize = 3;
+
+/// The agy hook verbs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgyEvent {
+    SessionStart,
+    PreInvocation,
+    Stop,
+}
+
+impl AgyEvent {
+    fn parse(verb: &str) -> Option<Self> {
+        match verb {
+            "session-start" => Some(Self::SessionStart),
+            "pre-invocation" => Some(Self::PreInvocation),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+
+    /// What the hook prints when its work fails or misses [`HOOK_LIMIT`]:
+    /// `{}` for pre-invocation and stop, nothing for session-start.
+    fn fallback(self) -> Option<String> {
+        match self {
+            Self::SessionStart => None,
+            Self::PreInvocation | Self::Stop => Some(AGY_EMPTY.to_owned()),
+        }
+    }
+}
+
+/// The session id from an agy hook payload: `conversationId`, then
+/// `session_id`. An empty string counts as missing.
+fn agy_session_id(input: &Value) -> Option<&str> {
+    ["conversationId", "session_id"]
+        .into_iter()
+        .find_map(|key| {
+            input
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+}
+
+/// agy's PreInvocation answer for one digest line. The `injectSteps` and
+/// `ephemeralMessage` keys come from Google's agy hooks documentation and
+/// are unproven until a real agy session reads them; this is the one place
+/// to correct them.
+fn agy_output(digest: &str) -> String {
+    json!({"injectSteps":[{"ephemeralMessage":digest}]}).to_string()
+}
+
+/// The count-only digest line: how many unread messages and from whom,
+/// never a body, subject, ticket or command. `capped` marks a count that
+/// stopped short of the end of the mailbox.
+fn agy_digest(count: usize, capped: bool, senders: &[String]) -> String {
+    let mut ids = senders
+        .iter()
+        .take(AGY_DIGEST_IDS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if senders.len() > AGY_DIGEST_IDS {
+        ids.push_str(&format!(" +{} more", senders.len() - AGY_DIGEST_IDS));
+    }
+    let plus = if capped { "+" } else { "" };
+    format!("swb: {count}{plus} unread from {ids}. Ask me to read them.")
+}
+
+/// A walk's answer: the unread count, whether the walk stopped short of the
+/// end of the mailbox, and the distinct senders in arrival order.
+type AgyUnread = (usize, bool, Vec<String>);
+
+/// Whether an inbox page may start `elapsed` into the hook: a full request
+/// deadline and 100 ms of margin must still fit inside [`HOOK_LIMIT`].
+fn agy_fits(elapsed: Duration) -> bool {
+    elapsed + LIMIT + Duration::from_millis(100) <= HOOK_LIMIT
+}
+
+/// Walks `me`'s unread mail one page at a time and returns the count, whether
+/// it stopped short of the end, and the distinct senders in arrival order.
+/// A page starts only while a full request deadline still fits inside the
+/// hook bound measured from `start`. `None` when not even the first page
+/// answered.
+fn agy_unread(lookup: Lookup, me: &str, start: Instant) -> Option<AgyUnread> {
+    agy_walk(lookup, me, || agy_fits(start.elapsed()))
+}
+
+/// The walk behind [`agy_unread`]. `fits` is asked before each page and a
+/// page starts only while it answers true; tests pass a simulated clock.
+fn agy_walk(lookup: Lookup, me: &str, fits: impl Fn() -> bool) -> Option<AgyUnread> {
+    let mut count = 0;
+    let mut senders: Vec<String> = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        if count >= AGY_DIGEST_MAX || !fits() {
+            return (count > 0 || after.is_some()).then_some((count, true, senders));
+        }
+        let Ok(batch) = inbox_after(lookup, me, after.as_deref()) else {
+            return after.is_some().then_some((count, true, senders));
+        };
+        let messages = batch
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for message in &messages {
+            count += 1;
+            let sender = id_text(message.get("from").and_then(Value::as_str).unwrap_or(""));
+            let sender = if sender.is_empty() {
+                "unknown".to_owned()
+            } else {
+                sender
+            };
+            if !senders.contains(&sender) {
+                senders.push(sender);
+            }
+        }
+        match batch.get("next_after").and_then(Value::as_str) {
+            Some(next) if !messages.is_empty() => after = Some(next.to_owned()),
+            _ => return Some((count, false, senders)),
+        }
+    }
+}
+
+/// One agy hook: `input` is the hook's stdin. Returns what to print, if
+/// anything. Never ends the session and never answers with a decision.
+fn hook_agy(lookup: Lookup, event: AgyEvent, input: &[u8], start: Instant) -> Option<String> {
+    let fallback = event.fallback();
+    if input.len() > 65536 {
+        return fallback;
+    }
+    let Ok(input) = serde_json::from_slice::<Value>(input) else {
+        return fallback;
+    };
+    let Some(session_id) = agy_session_id(&input) else {
+        return fallback;
+    };
+    // The harness is the argument, never SWB_HARNESS (SWB-R76).
+    let Ok(identity) = register_with(lookup, AGY, session_id) else {
+        return fallback;
+    };
+    let _ = save_token(lookup, &identity);
+    let _ = save_session_token(lookup, &identity);
+    if event != AgyEvent::PreInvocation {
+        return fallback;
+    }
+    let Some(me) = identity.get("agent_id").and_then(Value::as_str) else {
+        return fallback;
+    };
+    match agy_unread(lookup, me, start) {
+        Some((count, capped, senders)) if count > 0 => {
+            Some(agy_output(&agy_digest(count, capped, &senders)))
+        }
+        _ => fallback,
+    }
+}
+
+/// `swb hook agy <verb>`: reads stdin and runs [`hook_agy`] inside
+/// [`HOOK_LIMIT`], then prints its answer, or the verb's fallback when the
+/// bound ran out. An unknown verb prints nothing and reads nothing.
+fn run_hook_agy(verb: &str) {
+    let Some(event) = AgyEvent::parse(verb) else {
+        return;
+    };
+    let start = Instant::now();
+    let answer = bounded(HOOK_LIMIT, move || {
+        let mut input = Vec::new();
+        if std::io::stdin()
+            .take(65537)
+            .read_to_end(&mut input)
+            .is_err()
+        {
+            return Ok(event.fallback());
+        }
+        Ok(hook_agy(&process_env, event, &input, start))
+    })
+    .unwrap_or_else(|_| event.fallback());
+    if let Some(answer) = answer {
+        println!("{answer}");
+    }
+}
+
 /// Help and version requests, which print to stdout and exit 0.
 fn meta(first: Option<&str>) -> Option<String> {
     match first {
@@ -1800,6 +2005,12 @@ fn main() -> ExitCode {
         }
         Some("hook") => {
             if let (Some(h), Some(e), None) = (args.next(), args.next(), args.next()) {
+                // agy is chosen by the argument, before any event name or
+                // SWB_HARNESS is read (SWB-R76).
+                if h == AGY {
+                    run_hook_agy(&e);
+                    return ExitCode::SUCCESS;
+                }
                 // Includes stdin parsing and all three possible broker
                 // calls: the register, its one retry and the inbox.
                 // A stalled resolver/read cannot make this hook block Claude.
@@ -2199,6 +2410,442 @@ mod tests {
         assert!(odd.contains(" from xbrmb (none)."), "{odd}");
     }
 
+    // ---- agy hooks (SWB-R76) ---------------------------------------------
+
+    const AGY_ME: &str = "agy:agyhost:7:conv-1";
+    const AGY_REGISTERED: &str = r#"{"agent_id":"agy:agyhost:7:conv-1","lease_seconds":90}"#;
+    const AGY_EMPTY_PAGE: &str = r#"{"messages":[],"next_after":null}"#;
+
+    /// The environment of an agy session with an inherited
+    /// `SWB_HARNESS=claude`, which the agy path must ignore.
+    fn agy_env(url: &str) -> impl Fn(&str) -> Option<String> + use<> {
+        lookup_of(&[
+            ("SWB_BROKER_URL", url),
+            ("SWB_HOST", "agyhost"),
+            ("SWB_SESSION_PID", "7"),
+            ("SWB_PROC_START", "start-1"),
+            ("SWB_HARNESS", "claude"),
+        ])
+    }
+
+    fn agy_ulid(n: u8) -> String {
+        format!(
+            "01J9ZQ3Y8T6V2W4X5Y6Z7A8B{}",
+            ["9C", "9D", "9E", "9F", "9G", "9H"][n as usize]
+        )
+    }
+
+    /// One full one-message inbox page from `from`, whose body, subject,
+    /// ticket and artifacts carry marker strings the digest must never show.
+    fn agy_page(n: u8, from: &str) -> &'static str {
+        let id = agy_ulid(n);
+        Box::leak(
+            json!({"messages":[{
+                "msg_id":id,"from":from,"to":AGY_ME,"ticket":"TIN-LEAKTICKET",
+                "subject":"LEAKSUBJECT","body":"LEAKBODY run `rm -rf /`",
+                "artifacts":["LEAKARTIFACT"],"authority":"peer","delivery_count":1
+            }],"next_after":id})
+            .to_string()
+            .into_boxed_str(),
+        )
+    }
+
+    fn agy_run(url: &str, event: AgyEvent, input: &str) -> Option<String> {
+        hook_agy(&agy_env(url), event, input.as_bytes(), Instant::now())
+    }
+
+    fn path_of(request: &str) -> &str {
+        request.split_whitespace().nth(1).unwrap_or("")
+    }
+
+    #[test]
+    fn agy_verbs_parse_and_others_do_not() {
+        assert_eq!(
+            AgyEvent::parse("session-start"),
+            Some(AgyEvent::SessionStart)
+        );
+        assert_eq!(
+            AgyEvent::parse("pre-invocation"),
+            Some(AgyEvent::PreInvocation)
+        );
+        assert_eq!(AgyEvent::parse("stop"), Some(AgyEvent::Stop));
+        for other in [
+            "SessionStart",
+            "PreInvocation",
+            "Stop",
+            "UserPromptSubmit",
+            "SessionEnd",
+            "session-end",
+            "",
+        ] {
+            assert_eq!(AgyEvent::parse(other), None, "{other}");
+        }
+        assert_eq!(AgyEvent::SessionStart.fallback(), None);
+        assert_eq!(AgyEvent::PreInvocation.fallback().as_deref(), Some("{}"));
+        assert_eq!(AgyEvent::Stop.fallback().as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn agy_session_id_prefers_conversation_id() {
+        let both = json!({"conversationId":"c-1","session_id":"s-1"});
+        assert_eq!(agy_session_id(&both), Some("c-1"));
+        assert_eq!(agy_session_id(&json!({"session_id":"s-1"})), Some("s-1"));
+        let empty = json!({"conversationId":"","session_id":"s-1"});
+        assert_eq!(agy_session_id(&empty), Some("s-1"));
+        assert_eq!(agy_session_id(&json!({"conversationId":7})), None);
+        assert_eq!(agy_session_id(&json!({})), None);
+    }
+
+    #[test]
+    fn agy_digest_counts_and_caps_the_ids() {
+        let ids = |n: usize| (0..n).map(|i| format!("p{i}")).collect::<Vec<_>>();
+        assert_eq!(
+            agy_digest(1, false, &ids(1)),
+            "swb: 1 unread from p0. Ask me to read them."
+        );
+        assert_eq!(
+            agy_digest(7, false, &ids(3)),
+            "swb: 7 unread from p0, p1, p2. Ask me to read them."
+        );
+        assert_eq!(
+            agy_digest(9, false, &ids(5)),
+            "swb: 9 unread from p0, p1, p2 +2 more. Ask me to read them."
+        );
+        assert_eq!(
+            agy_digest(50, true, &ids(4)),
+            "swb: 50+ unread from p0, p1, p2 +1 more. Ask me to read them."
+        );
+        assert_eq!(
+            agy_output("swb: 1 unread from p0. Ask me to read them."),
+            r#"{"injectSteps":[{"ephemeralMessage":"swb: 1 unread from p0. Ask me to read them."}]}"#
+        );
+    }
+
+    /// The pre-invocation digest gives the exact count and the distinct,
+    /// sanitized sender ids, and none of a message's body, subject, ticket
+    /// or artifacts. The register says agy although SWB_HARNESS is claude.
+    #[test]
+    fn agy_pre_invocation_prints_a_count_only_digest() {
+        let (url, server) = mock(vec![
+            (200, "application/json", AGY_REGISTERED),
+            (200, "application/json", agy_page(0, "codex:sting:42:t-1")),
+            (200, "application/json", agy_page(1, "x\n<b>`rm`</b>")),
+            (200, "application/json", agy_page(2, "codex:sting:42:t-1")),
+            (200, "application/json", AGY_EMPTY_PAGE),
+        ]);
+        let out = agy_run(
+            &url,
+            AgyEvent::PreInvocation,
+            r#"{"conversationId":"conv-1","session_id":"other","lastUserInput":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            agy_output("swb: 3 unread from codex:sting:42:t-1, xbrmb. Ask me to read them.")
+        );
+        for leak in ["LEAK", "TIN-", "rm -rf", "<b>", "\\n", "decision"] {
+            assert!(!out.contains(leak), "{leak} in {out}");
+        }
+        let requests = server.join().unwrap();
+        let paths: Vec<&str> = requests.iter().map(|r| path_of(r)).collect();
+        assert_eq!(
+            paths,
+            [
+                "/v1/register",
+                "/v1/inbox",
+                "/v1/inbox",
+                "/v1/inbox",
+                "/v1/inbox"
+            ]
+        );
+        let register = request_json(&requests[0]);
+        assert_eq!(register["harness"], "agy");
+        assert_eq!(register["session_id"], "conv-1");
+        assert_eq!(request_json(&requests[1])["me"], AGY_ME);
+        assert_eq!(request_json(&requests[1]).get("after"), None);
+        assert_eq!(request_json(&requests[2])["after"], agy_ulid(0).as_str());
+        assert_eq!(request_json(&requests[4])["after"], agy_ulid(2).as_str());
+    }
+
+    #[test]
+    fn agy_pre_invocation_names_three_ids_then_more() {
+        let senders = ["a:h:1:a", "b:h:1:b", "c:h:1:c", "d:h:1:d", "e:h:1:e"];
+        let mut replies = vec![(200, "application/json", AGY_REGISTERED)];
+        for (n, from) in senders.iter().enumerate() {
+            replies.push((200, "application/json", agy_page(n as u8, from)));
+        }
+        replies.push((200, "application/json", AGY_EMPTY_PAGE));
+        let (url, server) = mock(replies);
+        let out = agy_run(
+            &url,
+            AgyEvent::PreInvocation,
+            r#"{"conversationId":"conv-1"}"#,
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some(
+                agy_output(
+                    "swb: 5 unread from a:h:1:a, b:h:1:b, c:h:1:c +2 more. Ask me to read them."
+                )
+                .as_str()
+            )
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agy_pre_invocation_with_no_mail_prints_empty_object() {
+        let (url, server) = mock(vec![
+            (200, "application/json", AGY_REGISTERED),
+            (200, "application/json", AGY_EMPTY_PAGE),
+        ]);
+        let out = agy_run(&url, AgyEvent::PreInvocation, r#"{"session_id":"conv-1"}"#);
+        assert_eq!(out.as_deref(), Some("{}"));
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn agy_pre_invocation_inbox_error_prints_only_empty_object() {
+        let (url, server) = mock(vec![
+            (200, "application/json", AGY_REGISTERED),
+            (500, "application/json", r#"{"error":"LEAKERROR"}"#),
+        ]);
+        let out = agy_run(
+            &url,
+            AgyEvent::PreInvocation,
+            r#"{"conversationId":"conv-1"}"#,
+        );
+        assert_eq!(out.as_deref(), Some("{}"));
+        server.join().unwrap();
+    }
+
+    /// An inbox error after the first page keeps the count so far, marked
+    /// as a lower bound.
+    #[test]
+    fn agy_pre_invocation_error_mid_walk_keeps_a_lower_bound() {
+        let (url, server) = mock(vec![
+            (200, "application/json", AGY_REGISTERED),
+            (200, "application/json", agy_page(0, "codex:sting:42:t-1")),
+            (500, "application/json", r#"{"error":"boom"}"#),
+        ]);
+        let out = agy_run(
+            &url,
+            AgyEvent::PreInvocation,
+            r#"{"conversationId":"conv-1"}"#,
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some(
+                agy_output("swb: 1+ unread from codex:sting:42:t-1. Ask me to read them.").as_str()
+            )
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agy_register_error_falls_back_per_verb() {
+        let (url, server) = mock(vec![
+            (500, "application/json", r#"{"error":"down"}"#),
+            (500, "application/json", r#"{"error":"down"}"#),
+            (500, "application/json", r#"{"error":"down"}"#),
+        ]);
+        let input = r#"{"conversationId":"conv-1"}"#;
+        assert_eq!(
+            agy_run(&url, AgyEvent::PreInvocation, input).as_deref(),
+            Some("{}")
+        );
+        assert_eq!(agy_run(&url, AgyEvent::Stop, input).as_deref(), Some("{}"));
+        assert_eq!(agy_run(&url, AgyEvent::SessionStart, input), None);
+        server.join().unwrap();
+    }
+
+    /// Stop only heartbeats: one register, never `/v1/end`, never a
+    /// continue decision, and `{}` on stdout (Jess, "Lease lapse",
+    /// TIN-4655 comment 0c2bfb83).
+    #[test]
+    fn agy_stop_only_heartbeats() {
+        let (url, server) = mock(vec![(200, "application/json", AGY_REGISTERED)]);
+        let out = agy_run(
+            &url,
+            AgyEvent::Stop,
+            r#"{"conversationId":"conv-1","fullyIdle":true}"#,
+        );
+        assert_eq!(out.as_deref(), Some("{}"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(path_of(&requests[0]), "/v1/register");
+        assert_eq!(request_json(&requests[0])["harness"], "agy");
+    }
+
+    #[test]
+    fn agy_session_start_registers_and_prints_nothing() {
+        let (url, server) = mock(vec![(200, "application/json", AGY_REGISTERED)]);
+        let out = agy_run(
+            &url,
+            AgyEvent::SessionStart,
+            r#"{"conversationId":"conv-1"}"#,
+        );
+        assert_eq!(out, None);
+        let requests = server.join().unwrap();
+        assert_eq!(path_of(&requests[0]), "/v1/register");
+        assert_eq!(request_json(&requests[0])["harness"], "agy");
+    }
+
+    /// Bad stdin reaches no broker: no URL is needed and nothing is sent.
+    #[test]
+    fn agy_bad_input_falls_back_without_a_request() {
+        let none = lookup_of(&[]);
+        for input in [
+            "",
+            "not json",
+            r#"{"conversationId":""}"#,
+            r#"{"other":"x"}"#,
+        ] {
+            for (event, want) in [
+                (AgyEvent::PreInvocation, Some("{}")),
+                (AgyEvent::Stop, Some("{}")),
+                (AgyEvent::SessionStart, None),
+            ] {
+                let out = hook_agy(&none, event, input.as_bytes(), Instant::now());
+                assert_eq!(out.as_deref(), want, "{event:?} {input:?}");
+            }
+        }
+        let big = vec![b' '; 65537];
+        let out = hook_agy(&none, AgyEvent::PreInvocation, &big, Instant::now());
+        assert_eq!(out.as_deref(), Some("{}"));
+    }
+
+    /// A broker whose mailbox holds `full` unread messages, one per page:
+    /// it answers every inbox request with the next full page, then with
+    /// empty pages, until the returned flag is set. The handle returns
+    /// every request it read.
+    fn agy_mailbox(
+        full: usize,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<Vec<String>>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        listener.set_nonblocking(true).unwrap();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = done.clone();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop.load(Ordering::SeqCst) {
+                            return seen;
+                        }
+                        assert!(Instant::now() < deadline, "the walk never finished");
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                };
+                seen.push(read_request(&mut stream));
+                let n = seen.len() - 1;
+                let body = if n < full {
+                    let id = format!("01J9ZQ3Y8T6V2W4X5Y6Z7A{n:04}");
+                    json!({"messages":[{
+                        "msg_id":id,"from":format!("p{n}:h:1:s"),"to":AGY_ME,
+                        "ticket":"none","subject":"s","body":"b","authority":"peer",
+                        "delivery_count":1
+                    }],"next_after":id})
+                    .to_string()
+                } else {
+                    AGY_EMPTY_PAGE.to_owned()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (url, done, server)
+    }
+
+    /// Runs [`agy_walk`] against `agy_mailbox(full)` and returns its answer
+    /// and the inbox requests the broker saw.
+    fn agy_walk_against(full: usize, fits: impl Fn() -> bool) -> (Option<AgyUnread>, Vec<String>) {
+        let (url, done, server) = agy_mailbox(full);
+        let walked = agy_walk(&agy_env(&url), AGY_ME, fits);
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let requests = server.join().unwrap();
+        assert!(requests.iter().all(|r| path_of(r) == "/v1/inbox"));
+        (walked, requests)
+    }
+
+    /// The page budget: a page starts only while a full request deadline
+    /// and 100 ms of margin fit inside the hook bound.
+    #[test]
+    fn agy_fits_leaves_a_full_deadline() {
+        let last = HOOK_LIMIT - LIMIT - Duration::from_millis(100);
+        assert!(agy_fits(Duration::ZERO));
+        assert!(agy_fits(last));
+        assert!(!agy_fits(last + Duration::from_millis(1)));
+        assert!(!agy_fits(HOOK_LIMIT));
+    }
+
+    /// With the hook bound already spent, the walk sends no inbox request
+    /// although the broker holds full pages, so pre-invocation prints `{}`.
+    #[test]
+    fn agy_walk_starts_no_page_past_the_bound() {
+        let (walked, requests) = agy_walk_against(60, || agy_fits(HOOK_LIMIT));
+        assert_eq!(walked, None);
+        assert!(requests.is_empty(), "{} inbox requests", requests.len());
+    }
+
+    /// Time runs out partway: on a clock that moves 400 ms per page, pages
+    /// start at 0, 400, 800, 1200 and 1600 ms, and the sixth, due at
+    /// 2000 ms, would end past the bound. The digest keeps `5+`.
+    #[test]
+    fn agy_walk_stops_partway_when_time_runs_out() {
+        let pages = std::cell::Cell::new(0u32);
+        let clock = || {
+            let elapsed = Duration::from_millis(400) * pages.get();
+            pages.set(pages.get() + 1);
+            agy_fits(elapsed)
+        };
+        let (walked, requests) = agy_walk_against(60, clock);
+        let (count, capped, senders) = walked.unwrap();
+        assert_eq!((count, capped), (5, true));
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            agy_digest(count, capped, &senders),
+            "swb: 5+ unread from p0:h:1:s, p1:h:1:s, p2:h:1:s +2 more. Ask me to read them."
+        );
+    }
+
+    /// With more than 50 unread and time to spare, the walk stops after 50
+    /// inbox requests and reads `50+`.
+    #[test]
+    fn agy_walk_stops_at_the_cap() {
+        let (walked, requests) = agy_walk_against(60, || true);
+        let (count, capped, senders) = walked.unwrap();
+        assert_eq!((count, capped), (AGY_DIGEST_MAX, true));
+        assert_eq!(requests.len(), AGY_DIGEST_MAX);
+        assert_eq!(senders.len(), AGY_DIGEST_MAX);
+        assert!(agy_digest(count, capped, &senders).starts_with("swb: 50+ unread from "));
+    }
+
+    /// Exactly 50 unread also reads `50+`: the walk stops at the cap
+    /// without fetching a 51st page, so `50+` is a lower bound.
+    #[test]
+    fn agy_walk_reads_exactly_fifty_as_a_lower_bound() {
+        let (walked, requests) = agy_walk_against(AGY_DIGEST_MAX, || true);
+        assert_eq!(requests.len(), AGY_DIGEST_MAX);
+        let (count, capped, _) = walked.unwrap();
+        assert_eq!((count, capped), (AGY_DIGEST_MAX, true));
+    }
+
     /// TIN-7577: a multi-line body reaches `swb inbox` and `swb thread`
     /// output with its lines, and that output stays one JSON line, so a
     /// body line cannot pass for another message or a header line.
@@ -2341,30 +2988,7 @@ mod tests {
                         Err(e) => panic!("accept: {e}"),
                     }
                 };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0u8; 4096];
-                    let n = stream.read(&mut chunk).unwrap();
-                    assert!(n > 0, "client closed early");
-                    request.extend_from_slice(&chunk[..n]);
-                    if let Some(split) = request.windows(4).position(|b| b == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&request[..split]).to_string();
-                        let length: usize = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("Content-Length: "))
-                            .unwrap()
-                            .parse()
-                            .unwrap();
-                        if request.len() >= split + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                seen.push(String::from_utf8_lossy(&request).into_owned());
+                seen.push(read_request(&mut stream));
                 write!(
                     stream,
                     "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2375,6 +2999,33 @@ mod tests {
             seen
         });
         (url, server)
+    }
+
+    /// Reads one HTTP request, head and body, from an accepted connection.
+    fn read_request(stream: &mut TcpStream) -> String {
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0, "client closed early");
+            request.extend_from_slice(&chunk[..n]);
+            if let Some(split) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&request[..split]).to_string();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if request.len() >= split + 4 + length {
+                    return String::from_utf8_lossy(&request).into_owned();
+                }
+            }
+        }
     }
 
     pub(crate) fn request_json(request: &str) -> Value {
@@ -3045,30 +3696,7 @@ mod tests {
             let mut seen = Vec::new();
             for step in plan {
                 let mut stream = accept(Duration::from_secs(5)).expect("request never came");
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0u8; 4096];
-                    let n = stream.read(&mut chunk).unwrap();
-                    assert!(n > 0, "client closed early");
-                    request.extend_from_slice(&chunk[..n]);
-                    if let Some(split) = request.windows(4).position(|b| b == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&request[..split]).to_string();
-                        let length: usize = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("Content-Length: "))
-                            .unwrap()
-                            .parse()
-                            .unwrap();
-                        if request.len() >= split + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                seen.push(String::from_utf8_lossy(&request).into_owned());
+                seen.push(read_request(&mut stream));
                 match step {
                     None => std::thread::sleep(LIMIT + Duration::from_millis(300)),
                     Some(body) => write!(
