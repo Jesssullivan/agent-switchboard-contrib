@@ -7,7 +7,8 @@ envelope v3 and fixes delivery: `inbox` pages, a send reports
 binding and a per-sender send rate limit (see
 [Sender binding](#sender-binding-v050)). v0.4.0 added the harness kinds
 `hermes` and `kimicode`, which a v0.3.0 broker or client refuses (see
-[Harness kinds](#harness-kinds)). v0.3.0 broke the v0.2 wire
+[Harness kinds](#harness-kinds)). The next release adds the kind `agy`
+(SWB-R75), which a v0.5.1 broker or client refuses. v0.3.0 broke the v0.2 wire
 format; what changed from v0.2.2 and the upgrade order are in
 [releases/v0.3.0-migration.md](releases/v0.3.0-migration.md). The design and
 its rulings are in [ADR-0001](adr/0001-agent-switchboard.md); a walkthrough
@@ -101,7 +102,8 @@ paging at a `next_cursor` that names one, and a v0.3.0 broker refuses to
 register them. `schemas/envelope-v3.schema.json` gained `hermes` and
 `kimicode` in its `agent_id` pattern without a version change, because
 ADR-0001 marks it a draft. A validator pinned to the older copy rejects the
-new kinds.
+new kinds. `agy` was added the same way under SWB-R75 (TIN-4655 comment
+`29c25fd9`); a v0.5.1 broker or client refuses it.
 
 | Kind | Harness |
 | --- | --- |
@@ -113,6 +115,7 @@ new kinds.
 | `pi` | Pi |
 | `hermes` | a Hermes agent |
 | `kimicode` | the Kimi Code CLI |
+| `agy` | Google Antigravity, a full peer (SWB-R75) |
 
 ## Settings
 
@@ -129,7 +132,7 @@ new kinds.
 | `SWB_HOST` | `hook`, `whoami`, `doctor` | none | host part of the agent id |
 | `SWB_SESSION_PID` | `hook`, `whoami`, `doctor` | none | nonzero integer |
 | `SWB_PROC_START` | `hook`, `whoami`, `doctor`, `channel` | none | process start stamp; `channel` filters its own row on it. `/v1/end` checks the end token, not this (v0.3.0) |
-| `SWB_HARNESS` | `hook`, `whoami`, `doctor`, `channel` | hook: its argument | `claude`, `kimi`, `codex`, `junie`, `opencode`, `pi`, `hermes` or `kimicode` (see [Harness kinds](#harness-kinds)). `channel --tools full` pushes only when it is `claude` |
+| `SWB_HARNESS` | `hook`, `whoami`, `doctor`, `channel` | hook: its argument | `claude`, `kimi`, `codex`, `junie`, `opencode`, `pi`, `hermes`, `kimicode` or `agy` (see [Harness kinds](#harness-kinds)). `channel --tools full` pushes only when it is `claude` |
 | `SWB_HOOK_FORMAT` | `hook` | JSON | `text` prints the UserPromptSubmit notice as plain text for a harness that adds a hook's stdout to its context. Any other value keeps the Claude Code `hookSpecificOutput` JSON |
 | `SWB_STATE_DIR` | `hook`, `whoami --register`, `doctor --register`, every acting verb, `channel` | `$XDG_STATE_HOME/swb`, then `$HOME/.local/state/swb` | where end tokens are kept (`sessions/<agent_id>.token`, dir 0700, file 0600); files not rewritten for 7 days are pruned. A bound session's token is in `bindings/<harness>:<host>:<session_id>.token` (dir 0700, file 0600), rewritten on every register and never pruned by age |
 | `SWB_BIND` | `hook`, `whoami --register` | unset | `1` or `true` asks `register` to bind the session (v0.5.0, ADR-0003) |

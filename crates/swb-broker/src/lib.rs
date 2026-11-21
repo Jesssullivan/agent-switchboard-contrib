@@ -1816,7 +1816,7 @@ mod tests {
             register.input_schema["properties"]["harness"]["enum"],
             json!(HARNESS_KINDS)
         );
-        for kind in ["hermes", "kimicode", "kimi", "claude"] {
+        for kind in ["hermes", "kimicode", "kimi", "claude", "agy"] {
             assert!(HARNESS_KINDS.contains(&kind), "{kind}");
         }
         // Every agent id description names every kind.

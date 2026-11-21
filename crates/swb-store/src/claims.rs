@@ -1338,6 +1338,61 @@ mod tests {
         );
     }
 
+    /// SWB-R75 (TIN-4655 comment `29c25fd9`, "Full peer"): an agy session
+    /// is listed, receives mail, holds claims and is a handoff target in
+    /// both directions, like a Claude or Codex session.
+    #[test]
+    fn an_agy_session_is_a_full_peer() {
+        const AGY: &str = "agy:sting:7:conv-1";
+        let (s, _) = clocked();
+        reg(&s, AGY);
+        let peers = s.peers(&PeersQuery::default()).unwrap();
+        let row = peers["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["agent_id"] == AGY)
+            .expect("agy listed in peers")
+            .clone();
+        assert_eq!(row["harness"], "agy");
+        assert_eq!(row["state"], "live");
+        // Mail reaches it and it can answer.
+        s.send(&json!({"from":A,"to":AGY,"ticket":"TIN-7375","body":"ping"}))
+            .unwrap();
+        let inbox = s.inbox(AGY, 10).unwrap();
+        assert_eq!(inbox["messages"][0]["from"], A);
+        s.send(&json!({"from":AGY,"to":A,"ticket":"TIN-7375","body":"pong"}))
+            .unwrap();
+        // A Claude session hands a claim to agy, and agy accepts it.
+        let held = claim(&s, A, "TIN-7375", true);
+        let source = held["claim_id"].as_str().unwrap();
+        let offer = s
+            .handoff(&json!({"me":A,"claim_id":source,"to":AGY}))
+            .unwrap();
+        assert_eq!(offer["state"], "offered");
+        let hid = offer["handoff_id"].as_str().unwrap();
+        let accepted = s
+            .claim(&json!({"me":AGY,"handoff_id":hid,"exclusive":true}))
+            .unwrap();
+        assert_eq!(accepted["outcome"], "recorded");
+        assert_eq!(listed(&s, "TIN-7375")[0]["holder"], AGY);
+        // agy hands it on to a Codex session.
+        let mine = accepted["claim_id"].as_str().unwrap();
+        let onward = s
+            .handoff(&json!({"me":AGY,"claim_id":mine,"to":C}))
+            .unwrap();
+        let hid = onward["handoff_id"].as_str().unwrap();
+        s.claim(&json!({"me":C,"handoff_id":hid})).unwrap();
+        assert_eq!(listed(&s, "TIN-7375")[0]["holder"], C);
+        // A near-miss kind is not a handoff target.
+        let own = claim(&s, A, "TIN-4655", false);
+        let refused = s
+            .handoff(&json!({"me":A,"claim_id":own["claim_id"],
+                "to":"antigravity:sting:7:conv-1"}))
+            .unwrap_err();
+        assert_eq!(refused.to_string(), "invalid to");
+    }
+
     #[test]
     fn a_refused_acceptance_leaves_the_source_claim_in_place() {
         let (s, _) = clocked();

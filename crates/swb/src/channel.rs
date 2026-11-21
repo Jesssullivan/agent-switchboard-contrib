@@ -2290,6 +2290,16 @@ mod tests {
         assert!(mode(&[("SWB_AGENT_ID", ME)]).push);
         assert!(!mode(&[("SWB_HARNESS", "hermes")]).push);
         assert!(!mode(&[("SWB_HARNESS", "kimicode")]).push);
+        // SWB-R75: agy is a full peer for mail and claims, not for push.
+        assert!(!mode(&[("SWB_HARNESS", "agy")]).push);
+        assert!(!mode(&[("SWB_AGENT_ID", "agy:host-a:7:conv-1")]).push);
+        assert!(
+            !mode(&[
+                ("SWB_HARNESS", "claude"),
+                ("SWB_AGENT_ID", "agy:host-a:7:conv-1")
+            ])
+            .push
+        );
         // kimi is Claude Code on Kimi, but its push is not claimed here.
         assert!(!mode(&[("SWB_AGENT_ID", "kimi:host-a:7:k-1")]).push);
         assert!(!mode(&[("SWB_AGENT_ID", HERMES)]).push);

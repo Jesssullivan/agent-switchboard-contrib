@@ -2167,10 +2167,21 @@ mod tests {
 
     #[test]
     fn cli_accepts_the_new_harness_kinds_and_keeps_kimi() {
-        for kind in ["hermes", "kimicode", "kimi"] {
+        for kind in ["hermes", "kimicode", "kimi", "agy"] {
             assert!(valid_agent_id(&format!("{kind}:host-a:7:s-1")), "{kind}");
         }
         assert!(!valid_agent_id("kimi-code:host-a:7:s-1"));
+        // SWB-R75: agy is a kind; near misses and bad shapes are not ids.
+        for bad in [
+            "antigravity:host-a:7:s-1",
+            "AGY:host-a:7:s-1",
+            "agy::7:s-1",
+            "agy:host-a:x:s-1",
+            "agy:host-a:7:",
+            "agy:host-a:7",
+        ] {
+            assert!(!valid_agent_id(bad), "{bad}");
+        }
     }
 
     #[test]
