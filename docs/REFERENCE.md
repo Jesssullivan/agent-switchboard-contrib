@@ -318,7 +318,7 @@ tokens and strip them before the model sees them.
 
 ## CLI verbs
 
-`serve`, `hook <harness> <event>`, `hook agy <session-start|pre-invocation|stop>`, `whoami [--register]` (plain `whoami`
+`serve`, `hook <harness> <event>`, `hook agy <session-start|pre-invocation|stop>` (or `SessionStart`, `UserPromptSubmit`, `Stop`), `whoami [--register]` (plain `whoami`
 makes no broker call), `inbox [--after ULID]`,
 `send <to> <ticket> [--ruling ID] [--operator-directed] [--in-reply-to ULID]
 [--thread ULID] [--msg-id ULID] [--no-ack] < body`, `ack <msg_id>`,
@@ -477,6 +477,13 @@ heartbeats and prints `{}`; an agy session ends when its lease lapses. The
 pre-invocation walk fetches each unread message once, which counts a delivery
 on it, as `swb inbox` does. The `injectSteps` keys come from Google's agy
 documentation and are unproven until a real agy session reads them.
+
+The Claude Code event names select the same verbs (SWB-R77):
+`SessionStart` runs session-start, `UserPromptSubmit` runs pre-invocation and
+`Stop` runs stop, so one hook table can carry both harnesses. The match is
+exact. `SessionEnd` is an unknown verb and prints nothing, because agy has no
+SessionEnd. agy's own `PreInvocation` spelling is also unknown and prints
+nothing; an agy config names `pre-invocation` or `UserPromptSubmit`.
 
 ## Known gaps
 

@@ -26,7 +26,8 @@ commands:
                             SWB_HOOK_FORMAT=text prints the unread-mail notice as plain text
   hook agy <session-start|pre-invocation|stop>
                             agy hook: pre-invocation prints a count-only unread digest,
-                            stop only heartbeats; always exits 0
+                            stop only heartbeats; always exits 0; SessionStart,
+                            UserPromptSubmit and Stop name the same three verbs
   whoami [--register]       print this session's agent id from the SWB_* environment;
                             --register also registers it and saves its end token;
                             with SWB_BIND=1 it binds the session and saves its
@@ -1702,6 +1703,12 @@ fn notice(me: &str, sender: &str, ticket: &str) -> String {
 // after every turn and agy has no SessionEnd, so Stop only heartbeats and an
 // agy session ends when its lease lapses (Jess, "Lease lapse", TIN-4655
 // comment `0c2bfb83`).
+//
+// SWB-R77 (Jess, "Release; map the names", 2026-11-21): the Claude Code
+// event names SessionStart, UserPromptSubmit and Stop also select the three
+// verbs, so one hook table can serve both harnesses. SessionEnd stays
+// unknown, because agy has no SessionEnd, and so does agy's own
+// PreInvocation spelling.
 
 /// The harness argument that selects the agy hook path.
 const AGY: &str = "agy";
@@ -1726,9 +1733,9 @@ enum AgyEvent {
 impl AgyEvent {
     fn parse(verb: &str) -> Option<Self> {
         match verb {
-            "session-start" => Some(Self::SessionStart),
-            "pre-invocation" => Some(Self::PreInvocation),
-            "stop" => Some(Self::Stop),
+            "session-start" | "SessionStart" => Some(Self::SessionStart),
+            "pre-invocation" | "UserPromptSubmit" => Some(Self::PreInvocation),
+            "stop" | "Stop" => Some(Self::Stop),
             _ => None,
         }
     }
@@ -2477,13 +2484,25 @@ mod tests {
             Some(AgyEvent::PreInvocation)
         );
         assert_eq!(AgyEvent::parse("stop"), Some(AgyEvent::Stop));
+        // SWB-R77: the Claude Code event names select the same verbs.
+        assert_eq!(
+            AgyEvent::parse("SessionStart"),
+            Some(AgyEvent::SessionStart)
+        );
+        assert_eq!(
+            AgyEvent::parse("UserPromptSubmit"),
+            Some(AgyEvent::PreInvocation)
+        );
+        assert_eq!(AgyEvent::parse("Stop"), Some(AgyEvent::Stop));
+        // agy has no SessionEnd, PreInvocation stays unmapped under SWB-R77,
+        // and the match is exact.
         for other in [
-            "SessionStart",
             "PreInvocation",
-            "Stop",
-            "UserPromptSubmit",
             "SessionEnd",
             "session-end",
+            "sessionstart",
+            "STOP",
+            "userpromptsubmit",
             "",
         ] {
             assert_eq!(AgyEvent::parse(other), None, "{other}");
@@ -2809,6 +2828,31 @@ mod tests {
         let (walked, requests) = agy_walk_against(60, || agy_fits(HOOK_LIMIT));
         assert_eq!(walked, None);
         assert!(requests.is_empty(), "{} inbox requests", requests.len());
+    }
+
+    /// The production clock: [`agy_unread`] measures the bound from `start`.
+    /// With `start` one full hook bound in the past, it reads no
+    /// environment, sends no inbox request and answers `None`, although the
+    /// broker holds full pages. This pins the `agy_fits(start.elapsed())`
+    /// closure: a clock that always fits would walk 50 messages here.
+    #[test]
+    fn agy_unread_starts_no_page_once_the_bound_is_spent() {
+        let start = Instant::now()
+            .checked_sub(HOOK_LIMIT)
+            .expect("host uptime is shorter than HOOK_LIMIT; rerun later");
+        let (url, done, server) = agy_mailbox(60);
+        let env = agy_env(&url);
+        let read = std::cell::Cell::new(0u32);
+        let lookup = |name: &str| {
+            read.set(read.get() + 1);
+            env(name)
+        };
+        let walked = agy_unread(&lookup, AGY_ME, start);
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let requests = server.join().unwrap();
+        assert_eq!(walked, None);
+        assert!(requests.is_empty(), "{} inbox requests", requests.len());
+        assert_eq!(read.get(), 0, "the walk read the environment");
     }
 
     /// Time runs out partway: on a clock that moves 400 ms per page, pages

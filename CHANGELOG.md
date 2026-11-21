@@ -13,6 +13,15 @@ registry tag; the approved digest and its publication receipt are in
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-21
+
+Tracking issue TIN-7375. The agy rulings are SWB-R75 (TIN-4655 comment
+`29c25fd9`), SWB-R76 (TIN-4655 comment `0c2bfb83`) and SWB-R77 (Jess,
+"Release; map the names", 2026-11-21). The workspace version is 0.6.0. As
+for v0.5.1, the release record, its source and the approved image digest
+follow two clean builds of the merge that carries this version
+(SWB-R73).
+
 ### Upgrade notes
 
 - **Upgrade the broker and every client together.** A v0.5.1 broker
@@ -33,6 +42,11 @@ registry tag; the approved digest and its publication receipt are in
   digest as agy `injectSteps` JSON; stop only heartbeats, and an agy session
   ends when its lease lapses. The agy output keys are unproven until a real
   agy session reads them.
+- `swb hook agy` also accepts the Claude Code event names (SWB-R77, Jess,
+  "Release; map the names", 2026-11-21, TIN-7375): `SessionStart` runs
+  session-start, `UserPromptSubmit` runs pre-invocation and `Stop` runs
+  stop. `SessionEnd` and agy's own `PreInvocation` stay unknown verbs and
+  print nothing.
 
 ### Fixed
 
