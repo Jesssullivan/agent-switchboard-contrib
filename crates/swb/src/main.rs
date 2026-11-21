@@ -1650,7 +1650,13 @@ fn hook(harness_arg: &str, event: &str) {
         .and_then(Value::as_str)
         .unwrap_or("none");
     let context = notice(me, sender, ticket);
-    println!("{}", hook_output(&process_env, &context));
+    // A harness that closed its end of the pipe gets nothing; `println!`
+    // would panic on EPIPE instead (TIN-7375).
+    let _ = writeln!(
+        std::io::stdout().lock(),
+        "{}",
+        hook_output(&process_env, &context)
+    );
 }
 
 /// The UserPromptSubmit hook's stdout. Claude Code (and Kimi through it)
@@ -1885,7 +1891,9 @@ fn run_hook_agy(verb: &str) {
     })
     .unwrap_or_else(|_| event.fallback());
     if let Some(answer) = answer {
-        println!("{answer}");
+        // A closed stdout pipe is ignored, so the hook still exits 0
+        // (SWB-R10); `println!` panicked there with exit 101 (TIN-7375).
+        let _ = writeln!(std::io::stdout().lock(), "{answer}");
     }
 }
 

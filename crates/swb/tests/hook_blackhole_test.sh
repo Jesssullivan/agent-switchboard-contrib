@@ -201,6 +201,28 @@ done
 case_expect=""
 run_case "swb hook agy PreInvocation (unknown verb)" closed \
   env SWB_HARNESS=claude "$swb" hook agy PreInvocation
+# Broken pipe (TIN-7375): the stdout reader is gone before the hook writes.
+# stdin stays open for 1 s, so `true` has exited before the hook reads EOF
+# and prints. The hook must still exit 0 and must not panic; before the fix
+# `println!` panicked with exit 101. `>&-` does not reproduce this, because
+# Rust reopens a closed stdout on /dev/null at startup.
+for verb in pre-invocation stop; do
+  name="swb hook agy $verb (stdout reader gone)"
+  err="$scratch/err"
+  set +e
+  { sleep 1; printf '%s' "$agy_payload"; } \
+    | env SWB_HARNESS=claude "$swb" hook agy "$verb" 2>"$err" \
+    | true
+  statuses=("${PIPESTATUS[@]}")
+  set -e
+  pipe_status="${statuses[1]}"
+  if [ "$pipe_status" -ne 0 ] || grep -q panicked "$err"; then
+    failures=$((failures + 1))
+    printf 'FAIL  %-47s exit=%s stderr=%s\n' "$name" "$pipe_status" "$(head -c 200 "$err" | tr '\n' ' ')"
+  else
+    printf 'ok    %-47s exit=0\n' "$name"
+  fi
+done
 case_payload="$claude_payload"
 case_expect=""
 # The bound cases run last, after the unbound closed-stdin cases have shown
