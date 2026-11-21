@@ -469,8 +469,10 @@ and the session id is the payload's `conversationId`, then `session_id`.
 session-start registers and prints nothing. pre-invocation registers and,
 when mail is waiting, prints `{"injectSteps":[{"ephemeralMessage":"swb: <n>
 unread from <ids>. Ask me to read them."}]}`: a count, at most three sender ids
-and then `+N more`, never a body, subject or ticket. A count cut short by the
-hook bound reads `<n>+`. With no mail or on an error it prints `{}`. stop only
+and then `+N more`, never a body, subject or ticket. The walk counts at most
+50 messages. A count cut short by that cap, by the hook bound or by a later
+page error reads `<n>+`, a lower bound, so exactly 50 unread also reads
+`50+`. With no mail or on an error it prints `{}`. stop only
 heartbeats and prints `{}`; an agy session ends when its lease lapses. The
 pre-invocation walk fetches each unread message once, which counts a delivery
 on it, as `swb inbox` does. The `injectSteps` keys come from Google's agy
