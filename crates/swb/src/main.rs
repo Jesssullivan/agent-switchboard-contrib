@@ -2811,6 +2811,31 @@ mod tests {
         assert!(requests.is_empty(), "{} inbox requests", requests.len());
     }
 
+    /// The production clock: [`agy_unread`] measures the bound from `start`.
+    /// With `start` one full hook bound in the past, it reads no
+    /// environment, sends no inbox request and answers `None`, although the
+    /// broker holds full pages. This pins the `agy_fits(start.elapsed())`
+    /// closure: a clock that always fits would walk 50 messages here.
+    #[test]
+    fn agy_unread_starts_no_page_once_the_bound_is_spent() {
+        let start = Instant::now()
+            .checked_sub(HOOK_LIMIT)
+            .expect("host uptime is shorter than HOOK_LIMIT; rerun later");
+        let (url, done, server) = agy_mailbox(60);
+        let env = agy_env(&url);
+        let read = std::cell::Cell::new(0u32);
+        let lookup = |name: &str| {
+            read.set(read.get() + 1);
+            env(name)
+        };
+        let walked = agy_unread(&lookup, AGY_ME, start);
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let requests = server.join().unwrap();
+        assert_eq!(walked, None);
+        assert!(requests.is_empty(), "{} inbox requests", requests.len());
+        assert_eq!(read.get(), 0, "the walk read the environment");
+    }
+
     /// Time runs out partway: on a clock that moves 400 ms per page, pages
     /// start at 0, 400, 800, 1200 and 1600 ms, and the sixth, due at
     /// 2000 ms, would end past the bound. The digest keeps `5+`.
